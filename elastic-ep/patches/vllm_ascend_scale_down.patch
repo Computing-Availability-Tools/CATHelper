@@ -1,0 +1,3049 @@
+Subject: [PATCH] [Bugfix] Set the gloo timeout after pg initialization in retry. (#83)
+avoid using npu-smi in check_health when fault tolerance is enabled (#82)
+[Bugfix] Set gloo timeout in npu_worker_sentinel (#80)
+[Bugfix] Refactor MTP model global expert map collection using FusedMoE modules (#79)
+[Bugfix] fix retry destroy bug (#77)
+[Bugfix] fix bugs in MTP when scaling down. (#73)
+adapted for dynamic eplb is false and enable fault tolerance is true scenarios (#76)
+[Bugfix]: fix the number of moe_expert_num in scale down to support eager mode (#70)
+[BugFix] Update gloo timeout (#69)
+ensure the successful return of pause state (#68)
+Refactor the clean of worker state into a class (#67)
+check pause event before allreduce and synchronization to prevent hang (#66)
+Save weights_name in the initialization for later reload in recovery  (#49)
+Demo fault tolerance scale down  (#63)
+---
+Index: examples/Fault-Tolerance-scale/README.md
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/examples/Fault-Tolerance-scale/README.md b/examples/Fault-Tolerance-scale/README.md
+new file mode 100644
+--- /dev/null	(revision f357a12dd15e2dae4891cf5d26c452cc5df46641)
++++ b/examples/Fault-Tolerance-scale/README.md	(revision f357a12dd15e2dae4891cf5d26c452cc5df46641)
+@@ -0,0 +1,112 @@
++# Instructions for using the vllm scale_down script
++
++This directory contains example scripts for vLLM Ascend Fault Tolerance feature, demonstrating how to start the vLLM service and monitor/handle NPU faults
++
++## File Description
++
++- `serve_qwen.sh` - Launch vLLM service with fault tolerance
++- `scale_down.sh` -Monitor NPU status and send scale-down commands
++
++## Prerequisites
++
++1. **Hardware Requirements**
++    - huawei Ascend NPU devices
++    - DCMI library installed (default path: `/usr/local/dcmi/libdcmi.so`)
++
++2. **Software Requirements**
++    - vLLM Ascend installed
++
++## Quick Start
++
++### 1.Start vLLM Service
++
++```bash
++# using default configuration(4 DP ranks)
++bash serve_qwen.sh
++
++# Custom parameters
++bash serve_qwen.sh --dp 8 --re 48 --port 8006
++```
++
++**Parameters:**
++
++| Parameter Variable | Default Value               | Description                               |
++|--------------------|-----------------------------|-------------------------------------------|
++| HOST               | 0.0.0.0                     | Set host address                          |
++| PORT               | 8006                        | vLLM API service port                     |
++| DATA_PARALLEL_SIZE | 4                           | Data Parallel (DP) size                   |
++| REDUNDANT_EXPERTS  | 0                           | Number of redundant experts               |
++| FAULT_PORT         | 22867                       | The port to use for external fault notify |
++| LOCAL_MODEL_PATH   | nytopop/Qwen3-30B-A3B.w8a8  | Local model file path                     |
++| MODEL_NAME         | /qwen-ai/Qwen3-30B-A3B-W8A8 | Model name                                |
++| GLOO_TIMEOUT       | 30                          | Gloo communication group timeout          |
++
++### 2. Start Scale-Down Monitor
++```bash
++# Using default configuration
++python scale_down.py
++
++# Custom parameters
++python scale_down.py --host localhost --port 8006 --npu-ids 0,1,2,3 --interval-time 3
++```
++
++**Parameters:**
++
++| Parameter Variable         | Default Value | Description                               |
++|----------------------------|---------------|-------------------------------------------|
++| host                       | 0.0.0.0       | Vllm serveAPI server host                 |
++| port                       | 8006          | VLLM API service port                     |
++| recovery_timeout           | 30            | Fault recovery timeout (seconds)          |
++| interval_time              | 3             | Interval for polling NPU status (seconds) |
++| external-fault-notify-port | 22867         | The port to use for external fault notify |
++| npu-ids                    | 0-15          | Comma-separated list of NPU IDS to use    |
++
++## How It Works
++
++### Monitoring Mechanism
++
++`scale_down.py` runs two monitoring threads simultaneously:
++
++1. **vLLM Fault ListenerThread** (`start_monitor_engine_status`)
++    - Subscribes to vLLM fault events via ZMQ
++    - Sends scale-down command immediately when engine faults are detected
++
++2. **Hardware Fault Detection Thread** (`monitor_machine_fault`)
++    - Polls NPU hardware status via DCMI interface
++    - Triggers scale-down when fault codes detected (e.g., `0X40f84e00` for card drop)
++
++### Scale-Down Flow
++
++```text
++Fault Detected
++    ↓
++Send pause command (pause request processing for fault DP ranks)
++    ↓
++Send scale-down command (notify vLLM to remove fault DP ranks)
++    ↓
++Update active_npus list (remove fault NPUS from available list)
++```
++
++
++## Complete Example
++
++**Scenario: 8 NPUS deployment, tolerating up to NPU failure**
++
++```bash
++# Terminal 1: Start service
++bash serve_qwen.sh --dp 8 --re 48 --fault-port 22876
++
++# Terminal 2: Start monitor
++python scale_down.py --npu-ids 0,1,2,3,4,5,6,7 --interval-time 3
++```
++
++## Important Notes
++
++1. **NPU ID Consistency**
++   - The `--dp` parameter in `serve_qwen.sh` specifies the number of NPUs used
++   - The `--npu-ids` in `serve_qwen.sh` must match `--dp`, e.g., `--dp 8` corresponds to `--npu-ids 0,1,2,3,4,5,6,7`
++   
++2. **Port Consistency**
++   - The `--fault_port` in `serve_qwen.sh` must match `--external-fault-notify-port` in `scale_down.py` 
++
++   
+\ No newline at end of file
+Index: examples/Fault-Tolerance-scale/scale_down.py
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/examples/Fault-Tolerance-scale/scale_down.py b/examples/Fault-Tolerance-scale/scale_down.py
+new file mode 100644
+--- /dev/null	(revision f357a12dd15e2dae4891cf5d26c452cc5df46641)
++++ b/examples/Fault-Tolerance-scale/scale_down.py	(revision f357a12dd15e2dae4891cf5d26c452cc5df46641)
+@@ -0,0 +1,327 @@
++#!/usr/bin/env python3
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++import argparse
++import ctypes
++import json
++import os
++import sys
++import threading
++import time
++from contextlib import suppress
++from ctypes import POINTER, byref, c_int, c_uint, cdll
++
++import requests
++import zmq
++
++DCMI_LIB_PATH = os.environ.get("DCMI_LIB_PATH", "/usr/local/dcmi/libdcmi.so")
++try:
++    lib = cdll.LoadLibrary(DCMI_LIB_PATH)
++except OSError as exc:
++    sys.stderr.write(
++        "Error: Failed to load DCMI library. Ensure the DCMI library is installed\n"
++        f"and that DCMI_LIB_PATH is set correctly (current value: {DCMI_LIB_PATH}).\n"
++        f"Original error: {exc}\n"
++    )
++    raise SystemExit(1)
++
++DeviceNotReadyErrCode = -8012
++CardDropFaultCode = "0x40f84e00"
++Per_device_card = 2
++lib.dcmi_init.restype = ctypes.c_int
++
++lib.dcmi_get_card_list.argtypes = [POINTER(c_int), POINTER(c_int), c_int]
++lib.dcmi_get_card_list.restype = ctypes.c_int
++
++lib.dcmi_get_device_num_in_card.argtypes = [
++    c_int,
++    POINTER(c_int),
++]
++lib.dcmi_get_device_num_in_card.restype = ctypes.c_int
++lib.dcmi_get_device_errorcode_v2.argtypes = [
++    ctypes.c_int,
++    ctypes.c_int,
++    ctypes.POINTER(ctypes.c_int),
++    ctypes.POINTER(ctypes.c_uint),
++    ctypes.c_int,
++]
++
++lib.dcmi_get_device_errorcode_v2.restype = ctypes.c_int
++
++lib.dcmi_get_device_health.argtypes = [
++    c_int,
++    c_int,
++    POINTER(c_uint),
++]
++lib.dcmi_get_device_health.restype = c_int
++
++ALL_NPUS = []
++active_npus = []
++active_npus_lock = threading.Lock()
++
++
++def get_npu_by_dp(dp_rank):
++    return active_npus[dp_rank]
++
++
++def get_dp_by_npu(npu_id):
++    with active_npus_lock:
++        try:
++            return active_npus.index(npu_id)
++        except ValueError:
++            return -1
++
++
++def is_valid_card_id(card_id):
++    return 0 <= card_id < 2147483647
++
++
++def is_valid_device_id(device_id):
++    return 0 <= device_id < 4
++
++
++def is_valid_card_id_and_device_id(card_id, device_id):
++    return is_valid_card_id(card_id) and is_valid_device_id(device_id)
++
++
++def get_device_list():
++    card_num = c_int(0)
++    card_list_len = 16
++    card_list = (ctypes.c_int * card_list_len)()
++    card_list_ret_code = lib.dcmi_get_card_list(
++        byref(card_num),
++        card_list,
++        c_int(card_list_len),
++    )
++    if card_list_ret_code != 0:
++        raise Exception(f"ERROR: Failed to get card list,error_code is {card_list_ret_code}")
++
++    if not all(x > 0 for x in card_list):
++        card_list = [i for i in range(card_num.value)]
++    device_num = c_int(0)
++    n = 0
++    while device_num.value == 0 and n < card_num.value:
++        lib.dcmi_get_device_num_in_card(
++            c_int(n),
++            byref(device_num),
++        )
++        n += 1
++
++    device_list = []
++    for i in range(card_num.value):
++        for j in range(device_num.value):
++            device_list.append([card_list[i], j])
++    return device_list
++
++
++def get_device_all_error_code(card_id, device_id):
++    if not is_valid_card_id_and_device_id(card_id, device_id):
++        print(f"ERROR: invalid card_id and device_id: {card_id}, {device_id}")
++        return -1, -1
++
++    list_len = 128
++    error_count = c_int(0)
++    error_code_list = (ctypes.c_uint * list_len)()
++
++    ret_code = lib.dcmi_get_device_errorcode_v2(
++        c_int(card_id),
++        c_int(device_id),
++        byref(error_count),
++        error_code_list,
++        c_int(list_len),
++    )
++
++    health = c_uint(0)
++    health_ret_code = lib.dcmi_get_device_health(
++        c_int(card_id),
++        c_int(device_id),
++        byref(health),
++    )
++
++    if ret_code != 0 and health_ret_code != DeviceNotReadyErrCode:
++        return -1, -1
++
++    error_codes = [code for code in error_code_list if code != 0]
++    error_codes_hex = [hex(code) for code in error_codes]
++
++    if health_ret_code == DeviceNotReadyErrCode:
++        error_count.value += 1
++        error_codes_hex.append(CardDropFaultCode)
++
++    if error_count.value < 0 or error_count.value > 128:
++        print("ERROR: invalid error count")
++        return -1, -1
++
++    return error_codes_hex, health
++
++
++_fault_event_context = None
++_fault_event_socket = None
++_fault_event_endpoint = None
++
++
++def listen_fault_event(host, port):
++    global _fault_event_context, _fault_event_socket, _fault_event_endpoint
++    if _fault_event_context is None:
++        _fault_event_context = zmq.Context()
++    if _fault_event_socket is None:
++        _fault_event_socket = _fault_event_context.socket(zmq.SUB)
++        _fault_event_socket.setsockopt_string(zmq.SUBSCRIBE, "vllm_fault")
++    endpoint = f"tcp://{host}:{port}"
++    # Connect only when the endpoint changes to avoid repeated connects.
++    if _fault_event_endpoint != endpoint:
++        if _fault_event_endpoint is not None:
++            with suppress(zmq.ZMQError):
++                _fault_event_socket.disconnect(_fault_event_endpoint)
++
++        _fault_event_socket.connect(endpoint)
++        _fault_event_endpoint = endpoint
++    message = _fault_event_socket.recv_string()
++    json_part = message.split("|")[1]
++    status_dict = json.loads(json_part)
++    dead_engine = [int(idx) for idx, status in status_dict.items() if status == "Dead"]
++    return dead_engine
++
++
++def pause(host, port, timeout, exclude_dp_rank=None):
++    url = f"http://{host}:{port}/fault_tolerance/apply"
++    payload = {
++        "fault_tolerance_instruction": "pause",
++        "fault_tolerance_timeout": timeout,
++        "fault_tolerance_params": {"soft_pause": False, "exclude_index": exclude_dp_rank},
++    }
++
++    headers = {"Content-Type": "application/json"}
++
++    print(f"Sending pause request to {url}")
++    print(f"Payload: {json.dumps(payload, indent=2)}")
++
++    try:
++        response = requests.post(url, json=payload, headers=headers, timeout=300)
++
++        print(f"Status Code: {response.status_code}")
++        print(f"Response: {response.text}")
++
++        if response.status_code == 200:
++            print("Pause request successful!")
++            return True
++        else:
++            print("Pause request failed!")
++            return False
++
++    except requests.exceptions.RequestException as e:
++        print(f"Request failed: {e}")
++        return False
++
++
++def scale(host, port, timeout, exclude_dp_ranks):
++    url = f"http://{host}:{port}/fault_tolerance/apply"
++    payload = {
++        "fault_tolerance_instruction": "scale_down",
++        "fault_tolerance_timeout": timeout,
++        "fault_tolerance_params": {"exclude_dp_ranks": exclude_dp_ranks},
++    }
++    headers = {"Content-Type": "application/json"}
++
++    print(f"Sending scale request to {url}")
++    print(f"Payload: {json.dumps(payload, indent=2)}")
++
++    try:
++        response = requests.post(url, json=payload, headers=headers, timeout=300)
++
++        print(f"Status Code: {response.status_code}")
++        print(f"Response: {response.text}")
++
++        if response.status_code == 200:
++            print("Scale down request successful!")
++            return True
++        else:
++            print("Scale down request failed!")
++            return False
++
++    except requests.exceptions.RequestException as e:
++        print(f"Request failed: {e}")
++        return False
++
++
++def start_monitor_engine_status(host, port, timeout, external_fault_notify_port):
++    global active_npus
++    while True:
++        exclude_dp_ranks = listen_fault_event(host, external_fault_notify_port)
++        scale(host, port, timeout, exclude_dp_ranks)
++        with active_npus_lock:
++            npus_to_remove = {get_npu_by_dp(dp_rank) for dp_rank in exclude_dp_ranks}
++            active_npus = [npu for npu in active_npus if npu not in npus_to_remove]
++
++
++def monitor_machine_fault(host, port, recover_timeout, interval_time):
++    lib.dcmi_init()
++    device_list = get_device_list()
++    print(device_list)
++    global ALL_NPUS, active_npus
++
++    while True:
++        exclude_dp_ranks = set()
++        failed_npus = set()
++        for device in device_list:
++            with active_npus_lock:
++                current_active_npus = set(active_npus)
++            result = get_device_all_error_code(device[0], device[1])
++            if (
++                not result
++                or not isinstance(result, tuple)
++                or len(result) < 1
++                or not isinstance(result[0], (list, tuple, set))
++            ):
++                # Skip this device for this iteration if the result is not in the expected format.
++                continue
++            if CardDropFaultCode in result[0]:
++                error_npu = [Per_device_card * device[0] + card_id for card_id in range(Per_device_card)]
++                failed_npus.update([npu for npu in error_npu if npu in current_active_npus])
++                print(f"device id: {device[0]} card_id: {device[1]} CardDropFault")
++
++        exclude_dp_ranks.update([get_dp_by_npu(npu) for npu in failed_npus])
++        exclude_dp_ranks.discard(-1)
++
++        if exclude_dp_ranks:
++            pause(host, port, recover_timeout, list(exclude_dp_ranks))
++            scale(host, port, recover_timeout, list(exclude_dp_ranks))
++            with active_npus_lock:
++                active_npus = [x for x in active_npus if x not in failed_npus]
++        time.sleep(interval_time)
++
++
++def main():
++    parser = argparse.ArgumentParser(description="Test scale down functionality")
++    parser.add_argument("--host", default="localhost", help="API server host")
++    parser.add_argument("--port", type=int, default=8006, help="API server port")
++    parser.add_argument("--recovery-timeout", type=int, default=30, help="Fault recovery timeout")
++    parser.add_argument("--interval-time", type=int, default=3, help="Fault code polling time")
++    parser.add_argument(
++        "--external-fault-notify-port", type=int, default=22867, help="The port to use for external fault notify"
++    )
++    parser.add_argument(
++        "--npu-ids",
++        type=lambda s: [int(item) for item in s.split(",")],
++        default=list(range(16)),
++        help="The card number used to launch vllm",
++    )
++
++    args = parser.parse_args()
++    global ALL_NPUS, active_npus
++    ALL_NPUS = args.npu_ids
++    active_npus = ALL_NPUS.copy()
++
++    monitor_thread = threading.Thread(
++        target=start_monitor_engine_status,
++        daemon=True,
++        args=(args.host, args.port, args.recovery_timeout, args.external_fault_notify_port),
++        name="MonitorThread",
++    )
++    monitor_thread.start()
++    monitor_machine_fault(args.host, args.port, args.recovery_timeout, args.interval_time)
++
++
++if __name__ == "__main__":
++    main()
+Index: examples/Fault-Tolerance-scale/serve_qwen.sh
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/examples/Fault-Tolerance-scale/serve_qwen.sh b/examples/Fault-Tolerance-scale/serve_qwen.sh
+new file mode 100644
+--- /dev/null	(revision f357a12dd15e2dae4891cf5d26c452cc5df46641)
++++ b/examples/Fault-Tolerance-scale/serve_qwen.sh	(revision f357a12dd15e2dae4891cf5d26c452cc5df46641)
+@@ -0,0 +1,87 @@
++#!/bin/bash
++
++HOST="0.0.0.0"
++PORT=8006
++DATA_PARALLEL_SIZE=4
++REDUNDANT_EXPERTS=0
++FAULT_PORT=22867
++LOCAL_MODEL_PATH="nytopop/Qwen3-30B-A3B.w8a8"
++MODEL_NAME="/qwen-ai/Qwen3-30B-A3B-W8A8"
++GLOO_TIMEOUT=15
++
++while [[ $# -gt 0 ]]; do
++    case $1 in
++        --dp)
++            DATA_PARALLEL_SIZE="$2"
++            shift 2
++            ;;
++        --re)
++            REDUNDANT_EXPERTS="$2"
++            shift 2
++            ;;
++        --host)
++            HOST="$2"
++            shift 2
++            ;;
++        --port)
++            PORT="$2"
++            shift 2
++            ;;
++        --fault-port)
++            FAULT_PORT="$2"
++            shift 2
++            ;;
++        --model-name)
++            MODEL_NAME="$2"
++            shift 2
++            ;;
++        --local-model)
++            LOCAL_MODEL_PATH="$2"
++            shift 2
++            ;;
++          --gloo-timeout)
++            GLOO_TIMEOUT="$2"
++            shift 2
++            ;;
++        -h|--help)
++            echo "Usage: $0 [OPTIONS]"
++            echo "Options:"
++            echo "  --dp SIZE                      Set data parallel size (default: 4)"
++            echo "  --re SIZE                      Set redundant experts (default: 0)"
++            echo "  --host HOST                    Set host address (default: 0.0.0.0)"
++            echo "  --port PORT                    Set port number (default: 8006)"
++            echo "  --fault-port FAULT_PORT        Set external fault notify port (default: 22867)"
++            echo "  --gloo-timeout GLOO_TIMEOUT    gloo communication group timeout"
++            echo "  --model-name MODEL_NAME        Set model name or path"
++            echo "  --local-model LOCAL_MODEL_PATH Use local model at $LOCAL_MODEL_PATH"
++            echo "  -h, --help                     Show this help message"
++            exit 0
++            ;;
++        *)
++            echo "Unknown option: $1"
++            echo "Use -h or --help for usage information"
++            exit 1
++            ;;
++    esac
++done
++
++echo "Starting vLLM server for $MODEL_NAME with data parallel size: $DATA_PARALLEL_SIZE and redundant experts: $REDUNDANT_EXPERTS"
++
++export DYNAMIC_EPLB="true"
++
++vllm serve $LOCAL_MODEL_PATH \
++    --served-model-name $MODEL_NAME \
++    --data-parallel-size $DATA_PARALLEL_SIZE \
++    --data-parallel-size-local $DATA_PARALLEL_SIZE \
++    --external_fault_notify_port $FAULT_PORT \
++    --enable-expert-parallel \
++    --enable-fault-tolerance \
++    --api-server-count 1 \
++    --trust-remote-code \
++    --gloo-comm-timeout $GLOO_TIMEOUT \
++    --enable-auto-tool-choice \
++    --tool-call-parser hermes \
++    --additional-config '{"eplb_config":{"dynamic_eplb": true, "num_redundant_experts":'${REDUNDANT_EXPERTS}'}}' \
++    --quantization ascend \
++    --host $HOST \
++    --port $PORT
+Index: vllm_ascend/compilation/acl_graph.py
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/vllm_ascend/compilation/acl_graph.py b/vllm_ascend/compilation/acl_graph.py
+--- a/vllm_ascend/compilation/acl_graph.py	(revision 4a533861c9fcd6e181b67d7c75a037eb2898c5e0)
++++ b/vllm_ascend/compilation/acl_graph.py	(revision f357a12dd15e2dae4891cf5d26c452cc5df46641)
+@@ -92,6 +92,10 @@
+         self.enable_enpu = enable_enpu
+         self.use_eagle = use_eagle
+ 
++        if not hasattr(self.vllm_config.compilation_config, "concrete_aclgraph_entry_list"):
++            self.vllm_config.compilation_config.concrete_aclgraph_entry_list = []
++        self.vllm_config.compilation_config.concrete_aclgraph_entry_list.append(self.concrete_aclgraph_entries)
++
+     def __getattr__(self, key: str):
+         # allow accessing the attributes of the runnable.
+         if hasattr(self.runnable, key):
+Index: vllm_ascend/distributed/parallel_state.py
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/vllm_ascend/distributed/parallel_state.py b/vllm_ascend/distributed/parallel_state.py
+--- a/vllm_ascend/distributed/parallel_state.py	(revision 4a533861c9fcd6e181b67d7c75a037eb2898c5e0)
++++ b/vllm_ascend/distributed/parallel_state.py	(revision f357a12dd15e2dae4891cf5d26c452cc5df46641)
+@@ -26,6 +26,21 @@
+ 
+ _DYNAMIC_EPLB: GroupCoordinator | None = None
+ 
++_ELASTIC_INFO: torch.Tensor | None = None
++
++
++def get_elastic_info():
++    return _ELASTIC_INFO
++
++
++def set_elastic_info(elastic_info):
++    global _ELASTIC_INFO
++    if _ELASTIC_INFO is None or elastic_info is None:
++        _ELASTIC_INFO = elastic_info
++    else:
++        assert _ELASTIC_INFO.shape == elastic_info.shape
++        _ELASTIC_INFO.copy_(elastic_info)
++
+ 
+ def init_ascend_model_parallel(
+     parallel_config: ParallelConfig,
+Index: vllm_ascend/eplb/adaptor/vllm_adaptor.py
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/vllm_ascend/eplb/adaptor/vllm_adaptor.py b/vllm_ascend/eplb/adaptor/vllm_adaptor.py
+--- a/vllm_ascend/eplb/adaptor/vllm_adaptor.py	(revision 4a533861c9fcd6e181b67d7c75a037eb2898c5e0)
++++ b/vllm_ascend/eplb/adaptor/vllm_adaptor.py	(revision f357a12dd15e2dae4891cf5d26c452cc5df46641)
+@@ -123,6 +123,9 @@
+     def do_update_expert_map(self, layer_id, updated_expert_map):
+         self.expert_map_per_layer_cpu[layer_id].copy_(updated_expert_map)
+ 
++    def do_clone_update_expert_map(self, layer_id, updated_expert_map):
++        self.expert_map_per_layer_cpu[layer_id] = updated_expert_map.clone()
++
+     def do_update_expert_weight(self, layer_id, local_expert_to_replace, buffer_tensor_id):
+         for expert_tensor, buffer_tensor in zip(
+             self.expert_param_per_layer[layer_id][local_expert_to_replace], self.buffer_tensor_list[buffer_tensor_id]
+Index: vllm_ascend/eplb/core/eplb_utils.py
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/vllm_ascend/eplb/core/eplb_utils.py b/vllm_ascend/eplb/core/eplb_utils.py
+--- a/vllm_ascend/eplb/core/eplb_utils.py	(revision 4a533861c9fcd6e181b67d7c75a037eb2898c5e0)
++++ b/vllm_ascend/eplb/core/eplb_utils.py	(revision f357a12dd15e2dae4891cf5d26c452cc5df46641)
+@@ -17,12 +17,10 @@
+ # Todo: Once https://github.com/vllm-project/vllm/issues/22246 is merged in vllm. Remove eplb utils.
+ import json
+ import os.path
+-from collections import defaultdict
+ 
+ import numpy as np
+ import torch
+ from vllm.logger import logger
+-from vllm.model_executor.layers.fused_moe.layer import determine_expert_map
+ 
+ 
+ def expert_file_to_tensor(expert_map_path, layer_id):
+@@ -60,7 +58,7 @@
+     ep_size = moe_config.ep_size
+     global_placement = None
+     eplb_enable = eplb_config.dynamic_eplb
+-    n_redundant = eplb_config.num_redundant_experts if eplb_enable else 0
++    n_redundant = eplb_config.num_redundant_experts
+ 
+     if ep_size == 1:
+         assert not eplb_enable, "EPLB must used in expert parallelism."
+@@ -69,17 +67,12 @@
+     if expert_map_path:
+         if not (os.path.exists(expert_map_path) and os.access(expert_map_path, os.R_OK)):
+             raise ValueError("Invalid EPLB path")
+-        eplb_enable = True
++
+         global_placement, physical_count = expert_file_to_tensor(expert_map_path, layer_id)
+         if physical_count is not None:
+             n_redundant = physical_count - n_experts
+             if not moe_config.supports_eplb:
+                 raise ValueError("Eplb supports only w8a8_dynamic quantization.")
+-        else:
+-            eplb_enable = False
+-    elif not eplb_enable:
+-        _, expert_map, _ = determine_expert_map(ep_size, moe_config.ep_rank, n_experts)
+-        return None, expert_map, None, 0
+ 
+     if global_placement is None:
+         global_placement = generate_global_placement(n_experts, ep_size, n_redundant)
+@@ -92,29 +85,34 @@
+         global_expert_map.append(expert_map)
+         if rankid == moe_config.ep_rank:
+             local_expert_map = expert_map
+-    log2phy = generate_log2phy_map(global_expert_map, moe_config.ep_rank).npu() if eplb_enable else None
++    global_expert_map = torch.stack(global_expert_map)
++    log2phy = generate_log2phy_map(global_expert_map, moe_config.ep_rank).npu()
++
++    return global_expert_map, local_expert_map, log2phy, n_redundant
+ 
+-    return torch.stack(global_expert_map), local_expert_map, log2phy, n_redundant
+ 
++def generate_log2phy_map(global_expert_map: torch.Tensor, ep_rank: int):
++    G, E = global_expert_map.shape
++    device = global_expert_map.device
+ 
+-def generate_log2phy_map(global_expert_map, ep_rank):
+-    log2phy_map = defaultdict(list)
+-    valid_count = torch.sum(global_expert_map[0] != -1)
+-    for rankid, map_per_rank in enumerate(global_expert_map):
+-        for idx, val in enumerate(map_per_rank):
+-            val = val.item()
+-            if val != -1:
+-                log2phy_map[idx].append(val + rankid * valid_count)
++    valid_count = (global_expert_map[0] >= 0).sum()
+ 
+-    for key in log2phy_map:
+-        num_of_duplications = len(log2phy_map[key])
+-        log2phy_map[key] = log2phy_map[key][ep_rank % num_of_duplications]
++    valid_mask = global_expert_map >= 0
++    ranks, experts = valid_mask.nonzero(as_tuple=True)
++    slots = global_expert_map[valid_mask]
+ 
+-    log2phy_map = torch.scatter(
+-        torch.zeros(len(log2phy_map), dtype=torch.int32),
+-        0,
+-        torch.tensor(list(log2phy_map), dtype=torch.int64),
+-        torch.tensor(list(log2phy_map.values()), dtype=torch.int32),
+-    )
++    phy_ids = slots + ranks * valid_count
+ 
+-    return log2phy_map
++    experts_sorted, sort_ids = experts.sort()
++    phy_ids_sorted = phy_ids[sort_ids]
++
++    unique_experts, counts = torch.unique_consecutive(experts_sorted, return_counts=True)
++
++    offsets = ep_rank % counts
++    cumsum_counts = torch.cat([torch.zeros(1, dtype=torch.long, device=device), counts[:-1]]).cumsum(0)
++    target_indices = cumsum_counts + offsets
++
++    result = torch.zeros(E, dtype=torch.int32, device=device)
++    result[unique_experts] = phy_ids_sorted[target_indices].to(torch.int32)
++
++    return result
+Index: vllm_ascend/eplb/core/eplb_worker.py
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/vllm_ascend/eplb/core/eplb_worker.py b/vllm_ascend/eplb/core/eplb_worker.py
+--- a/vllm_ascend/eplb/core/eplb_worker.py	(revision 4a533861c9fcd6e181b67d7c75a037eb2898c5e0)
++++ b/vllm_ascend/eplb/core/eplb_worker.py	(revision f357a12dd15e2dae4891cf5d26c452cc5df46641)
+@@ -36,6 +36,11 @@
+         self.rank_id = dist.get_rank()
+         self.multi_stage = policy_type == 3
+ 
++        n_total_ranks = dist.get_world_size()
++        n_ranks_per_node = torch.npu.device_count()
++        self.rank_id_to_initial_global = list(range(n_total_ranks))
++        self.rank_id_to_node_id = [rank_id // n_ranks_per_node for rank_id in range(n_total_ranks)]
++
+     def do_update(self):
+         # put data in to queue
+         # in process self.policy.generate_policy()
+@@ -55,25 +60,26 @@
+ 
+         # Get MOE load information
+         load_info = self.fetch_and_sum_load_info()
+-        if load_info is None:
++        if load_info is None and not self.shared_dict["scale_down"]:
+             return
+ 
+         # Get the updated expert table based on the workload information
+         old_placement = self.global2local(self.old_expert_maps, self.num_local_experts)
+-        _, _, new_placement = self.calculate_rebalance_experts(load_info, old_placement)
+-
+-        if self.rank_id == 0:
+-            if self.multi_stage:
+-                hotness = self._calculate_hotness(old_placement, load_info.sum(0))
+-            else:
+-                hotness = self._calculate_hotness(old_placement, load_info)
+-            current_mean, current_max = self._compute_imbalance(old_placement, hotness)
+-            update_mean, update_max = self._compute_imbalance(new_placement, hotness)
+-            logger.info(
+-                "[Expert Hotness] Current: mean={:.3f}, max={:.3f}, Updated: mean={:.3f}, max={:.3f}".format(
+-                    current_mean, current_max, update_mean, update_max
+-                )
+-            )
++        if self.shared_dict["scale_down"]:
++            exclude_dp_ranks = self.shared_dict["excluded_dp_ranks"]
++            enable_d2d_after_failure = self.shared_dict["enable_d2d_after_failure"]
++            self.update_rank_id(exclude_dp_ranks)
++            new_placement, old_deployment, need_load_h2d, num_add_experts_per_rank = self.trigger_fault_redeployment(
++                load_info, old_placement, exclude_dp_ranks, enable_d2d_after_failure
++            )
++            if not torch.is_tensor(old_deployment):
++                old_placement = torch.tensor(old_deployment)
++            self.old_expert_maps = self.local2global(old_placement)
++            self.shared_dict["need_load_h2d"] = need_load_h2d
++            self.shared_dict["num_add_experts_per_rank"] = num_add_experts_per_rank
++        else:
++            num_add_experts_per_rank = 0
++            _, _, new_placement = self.calculate_rebalance_experts(load_info, old_placement)
+ 
+         if not torch.is_tensor(new_placement):
+             new_placement = torch.tensor(new_placement)
+@@ -85,7 +91,14 @@
+         self.old_expert_maps = new_expert_maps
+         logger.debug("EPLB Process compute complete")
+ 
+-        packed_update_info = self.pack_update_info(update_info)
++        if self.shared_dict["scale_down"] and not self.shared_dict["enable_d2d_after_failure"]:
++            packed_update_info = []
++        else:
++            packed_update_info = self.pack_update_info(update_info)
++        self.shared_dict["scale_down"] = False
++
++        if num_add_experts_per_rank > 0:
++            self.rank_id_to_initial_global = list(range(len(self.rank_id_to_initial_global)))
+ 
+         return packed_update_info
+ 
+@@ -170,8 +183,10 @@
+                 if src_rank_id not in expert_send_info_this_layer:
+                     expert_send_info_this_layer[src_rank_id] = []
+ 
+-                expert_send_info_this_layer[src_rank_id].append((dst_rank_id, expert_id))
+-                expert_recv_info_this_layer[dst_rank_id].append((src_rank_id, expert_id))
++                dst_global_rank_id = self.rank_id_to_initial_global[dst_rank_id]
++                src_global_rank_id = self.rank_id_to_initial_global[src_rank_id]
++                expert_send_info_this_layer[src_rank_id].append((dst_global_rank_id, expert_id))
++                expert_recv_info_this_layer[dst_rank_id].append((src_global_rank_id, expert_id))
+ 
+             yield (
+                 expert_send_info_this_layer,
+@@ -266,6 +281,35 @@
+ 
+         return list(zip(send_all, recv_all, maps, log2phy_all, layer_ids))
+ 
++    def trigger_fault_redeployment(self, load_info, old_placement, exclude_dp_ranks, enable_d2d_after_failure):
++        policy = PolicyFactory.generate_policy(4, DynamicConfig())
++        policy.failed_cards = exclude_dp_ranks
++        policy.enable_d2d_after_failure = enable_d2d_after_failure
++        policy.rank_id_to_node_id = self.rank_id_to_node_id
++
++        new_deployment, old_deployment, need_load_h2d, num_add_experts_per_rank = policy.rebalance_experts(
++            old_placement, load_info
++        )
++
++        return new_deployment, old_deployment, need_load_h2d, num_add_experts_per_rank
++
++    def update_rank_id(self, exclude_dp_ranks: list[int]):
++        unique_fault_ids = sorted(list(set(exclude_dp_ranks)))
++        fault_count = 0
++        for fault_id in unique_fault_ids:
++            if fault_id <= self.rank_id:
++                fault_count += 1
++            else:
++                break
++        self.rank_id = self.rank_id - fault_count
++        for i in reversed(unique_fault_ids):
++            self.rank_id_to_initial_global.pop(i)
++            self.rank_id_to_node_id.pop(i)
++
++    def warm_up_shared_dict(self):
++        old_expert_maps = self.get_init_expert_maps()
++        _ = old_expert_maps.max()
++
+     @staticmethod
+     def _compute_imbalance(deployment_all_layer, hotness_all_layer: np.ndarray):
+         imbalance_list = []
+@@ -313,6 +357,8 @@
+ 
+         # Create EplbWorker instance
+         self.worker = EplbWorker(self.shared_dict, self.policy_type, self.enable_d2d)
++        warm_maps = torch.zeros((1, 1, 1), dtype=torch.int32)
++        self.shared_dict["expert_maps"] = warm_maps
+ 
+     def worker_process(self, planner_q, block_update_q):
+         """
+@@ -323,6 +369,7 @@
+             from vllm_ascend.eplb.core.policy.policy_flashlb import warm_up
+ 
+             warm_up()
++        self.worker.warm_up_shared_dict()
+         while True:
+             try:
+                 planner_q.get()
+Index: vllm_ascend/eplb/core/policy/policy_default_eplb.py
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/vllm_ascend/eplb/core/policy/policy_default_eplb.py b/vllm_ascend/eplb/core/policy/policy_default_eplb.py
+--- a/vllm_ascend/eplb/core/policy/policy_default_eplb.py	(revision 4a533861c9fcd6e181b67d7c75a037eb2898c5e0)
++++ b/vllm_ascend/eplb/core/policy/policy_default_eplb.py	(revision f357a12dd15e2dae4891cf5d26c452cc5df46641)
+@@ -53,11 +53,14 @@
+         for i in range(num_redundancy_expert):
+             sorted_indices = np.argsort([t[1] for t in origin_weights], kind="stable")[::-1]
+             weights = [origin_weights[idx] for idx in sorted_indices]
+-            tmp_raw_weight = weights[0][1] * (len(route_expert_redundancy[weights[0][0]]) + 1)
+-            route_expert_redundancy[weights[0][0]].append(route_expert_num + i)
+-            avg_weight = tmp_raw_weight / (len(route_expert_redundancy[weights[0][0]]) + 1)
+-            weights[0] = (weights[0][0], avg_weight)
+-            origin_weights = weights
++            for index in range(len(weights)):
++                if len(route_expert_redundancy[weights[index][0]]) < card_num - 1:
++                    tmp_raw_weight = weights[index][1] * (len(route_expert_redundancy[weights[index][0]]) + 1)
++                    route_expert_redundancy[weights[index][0]].append(route_expert_num + i)
++                    avg_weight = tmp_raw_weight / (len(route_expert_redundancy[weights[index][0]]) + 1)
++                    weights[index] = (weights[index][0], avg_weight)
++                    origin_weights = weights
++                    break
+ 
+         # Step 2: Calculate the number of items per box
+         expert_num = route_expert_num + num_redundancy_expert
+@@ -82,7 +85,7 @@
+                 boxes_weights[index].append(cur_weight)
+                 box_weights[index] += cur_weight
+                 box_counts[index] += 1
+-                index += 1
++                index = (index + 1) % card_num
+ 
+         sorted_indices = np.argsort([t[1] for t in origin_weights], kind="stable")[::-1]
+         origin_weights = [origin_weights[idx] for idx in sorted_indices]
+@@ -311,13 +314,6 @@
+         if num_npus <= 0:
+             raise ValueError("the number of NPUs must be greater than 0")
+ 
+-        if num_npus < num_redundancy_expert:
+-            raise ValueError(
+-                "the number of NPUs "
+-                f"{num_npus} must be greater than or equal to the number of redundant experts "
+-                f"{num_redundancy_expert}"
+-            )
+-
+         # Number of experts deployed on each card includes one redundant expert
+         global_deployment: list[list[list[int]]] = [[[] for _ in range(num_npus)] for _ in range(layer_num)]
+         # Iterate to obtain the placement strategy for each layer, taking computational balance into account
+Index: vllm_ascend/eplb/core/policy/policy_factory.py
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/vllm_ascend/eplb/core/policy/policy_factory.py b/vllm_ascend/eplb/core/policy/policy_factory.py
+--- a/vllm_ascend/eplb/core/policy/policy_factory.py	(revision 4a533861c9fcd6e181b67d7c75a037eb2898c5e0)
++++ b/vllm_ascend/eplb/core/policy/policy_factory.py	(revision f357a12dd15e2dae4891cf5d26c452cc5df46641)
+@@ -2,6 +2,7 @@
+ # Todo: Once https://github.com/vllm-project/vllm/pull/24069 is merged in vllm. Remove this factory.
+ from .policy_abstract import DynamicConfig, EplbPolicy
+ from .policy_default_eplb import DefaultEplb
++from .policy_fault_rearrangement import FaultRearrangement
+ from .policy_flashlb import FlashLB, warm_up
+ from .policy_random import RandomLoadBalance
+ from .policy_swift_balancer import SwiftBalanceEplb
+@@ -22,6 +23,8 @@
+             # FlashLB EPLB policy: expert replacement based on Joint Optimization,
+             # Multi-Shot Enhancement and Incremental Adjustment
+             3: FlashLB,
++            # Redistribute expert weights on the xPU via H2D and D2D after a card failure.
++            4: FaultRearrangement,
+         }
+         policy_class = policy.get(policy_type, RandomLoadBalance)
+         policy_instance = policy_class(config)
+Index: vllm_ascend/eplb/core/policy/policy_fault_rearrangement.py
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/vllm_ascend/eplb/core/policy/policy_fault_rearrangement.py b/vllm_ascend/eplb/core/policy/policy_fault_rearrangement.py
+new file mode 100644
+--- /dev/null	(revision d8b50c77cdd78c2cf18389b13266def0ea38abe4)
++++ b/vllm_ascend/eplb/core/policy/policy_fault_rearrangement.py	(revision d8b50c77cdd78c2cf18389b13266def0ea38abe4)
+@@ -0,0 +1,569 @@
++import math
++from collections import defaultdict
++
++import numpy as np
++import torch
++
++from .policy_abstract import DynamicConfig, EplbPolicy
++
++
++class DynamicTable:
++    # workload_table:
++    # 3D matrix: [layer, gpus, experts_per_gpu_per_layer] -> value: workload (heat) at the corresponding position
++    # Size: number of layers * number of GPUs * number of experts per GPU per layer
++    # The element at (i, j, k) represents the workload (heat) of the k-th expert on the j-th GPU in the i-th layer
++    # For experts that are not available or collected, the value is set to -1
++    workload_table = None
++
++    # placement_table:
++    # 3D matrix: [layer, gpus, experts_per_gpu_per_layer] -> value: physical expert ID at the corresponding position
++    # Size: number of layers * number of GPUs * number of experts per GPU per layer
++    # The element at (i, j, k) represents the physical expert ID of the k-th expert on the j-th GPU in the i-th layer
++    # For experts that are not available or collected, the value is set to -1
++    placement_table = None
++
++
++class FaultRearrangement(EplbPolicy):
++    def __init__(self, config: DynamicConfig):
++        super().__init__(config)
++
++        self.n_experts = None
++        self.k_replicas = None
++        self.max_swap_times = 100
++        self.num_max_com = 1
++        self.swap_threshold = 0
++        self.n_cards_per_nodes = 8
++        self.n_add_expert_per_card = 0
++        self.failed_cards = []
++        self.enable_d2d_after_failure = False
++        self.rank_id_to_node_id = None
++
++    def get_original_workload(self) -> np.ndarray:
++        workload_new = np.zeros((self.n_layer, self.n_experts))
++        if self.enable_d2d_after_failure:
++            for layer_idx in range(self.n_layer):
++                workload_dict: dict[int, int] = defaultdict(int)
++
++                placement_layer = self.org_deployment[layer_idx].copy()
++                workload_layer = self.org_workload[layer_idx].copy()
++                for card_idx in range(self.n_org_cards):
++                    for index in range(self.n_experts_per_card):
++                        workload_dict[int(placement_layer[card_idx][index])] += workload_layer[card_idx][index]
++                for expert_idx in range(self.n_experts):
++                    workload_new[layer_idx][expert_idx] = workload_dict[expert_idx]
++
++        return workload_new
++
++    def constraint_expert_local_exchange(
++        self, old_deployment: np.ndarray, new_deployment: np.ndarray
++    ) -> tuple[list[list[int]], list[list[int]]]:
++        new_deployment_list = []
++        old_deployment_list = []
++
++        for card_id in range(self.n_remain_cards):
++            current_list = [int(x) for x in old_deployment[card_id]]
++            new_list = [int(x) for x in new_deployment[card_id]]
++            num = len(new_list)
++
++            new_index = [-1] * num
++            new_result = [-1] * num
++            remaining_elements = []
++
++            for i in range(num):
++                flag = True
++                for j in range(num):
++                    if new_list[i] == current_list[j] and new_index[j] == -1:
++                        new_index[j] = 0
++                        new_result[j] = current_list[j]
++                        flag = False
++                        break
++                if flag:
++                    remaining_elements.append(new_list[i])
++
++            index = 0
++            for k in range(num):
++                if new_result[k] == -1:
++                    new_result[k] = remaining_elements[index]
++                    index += 1
++
++            new_deployment_list.append(new_result.copy())
++            old_deployment_list.append(current_list.copy())
++
++        return new_deployment_list, old_deployment_list
++
++    def rebalance_experts(
++        self, current_expert_table: torch.Tensor, expert_workload: torch.Tensor
++    ) -> tuple[list[list[list[int]]], list[list[list[int]]], list[defaultdict[int, list[tuple[int, int]]]], int]:
++        if expert_workload is not None:
++            self.org_workload = expert_workload.numpy()
++
++        self.org_deployment = current_expert_table.numpy()
++
++        self.n_layer, self.n_org_cards, self.n_experts_per_card = self.org_deployment.shape
++        self.n_experts = self.org_deployment.max() + 1
++
++        rank_indices = np.arange(self.n_org_cards)
++        mask = ~np.isin(rank_indices, self.failed_cards)
++        self.remain_deployment = self.org_deployment[:, mask, :]
++        self.n_remain_cards = self.remain_deployment.shape[1]
++
++        layer_workload = self.get_original_workload()
++
++        if self.n_remain_cards == 0:
++            raise ValueError("All cards are faulty, no available cards.")
++
++        self.org_expert_per_card = math.ceil(self.n_experts / self.n_remain_cards)
++        if self.n_experts_per_card < self.org_expert_per_card:
++            self.n_add_expert_per_card = self.org_expert_per_card - self.n_experts_per_card
++            raise NotImplementedError(
++                "The number of expert slots is insufficient for the requested scale-down"
++                " operation. Expansion is not currently supported."
++            )
++
++        redistributed_experts = []
++        old_deployment_after_h2d = []
++        all_layer_need_load_h2d = []
++
++        for layer_id in range(self.n_layer):
++            cur_layer_deployment = self.remain_deployment[layer_id]
++            cur_workload = layer_workload[layer_id]
++
++            new_deployment, old_deployment, need_load_h2d = self._execute_allocation(cur_layer_deployment, cur_workload)
++
++            new_deployment_list, old_deployment_list = self.constraint_expert_local_exchange(
++                old_deployment, new_deployment
++            )
++
++            redistributed_experts.append(new_deployment_list)
++            old_deployment_after_h2d.append(old_deployment_list)
++            all_layer_need_load_h2d.append(need_load_h2d)
++
++        return (
++            np.array(redistributed_experts).tolist(),
++            np.array(old_deployment_after_h2d).tolist(),
++            all_layer_need_load_h2d,
++            self.n_add_expert_per_card,
++        )
++
++    def expert_exchange_between_ranks(
++        self,
++        rank_assignments: np.ndarray,
++        rank_loads: np.ndarray,
++        num_com_between_rank: np.ndarray,
++        rev_expert_per_rank: defaultdict[int, set[int]],
++        updated_weights: np.ndarray,
++    ) -> tuple[np.ndarray, float]:
++        rank_deploy_sets = []
++        for rank_id in range(self.n_remain_cards):
++            rank_deploy_sets.append(set(rank_assignments[rank_id]))
++
++        max_swap_times = self.max_swap_times
++        max_rank_load = 0.0
++        exchange = True
++        while max_swap_times > 0:
++            max_swap_times -= 1
++            sorted_rank_idx = np.argsort(rank_loads, kind="stable")
++            max_load_rank_id = int(sorted_rank_idx[-1])
++            max_rank_load = float(rank_loads[max_load_rank_id])
++
++            if not exchange:
++                break
++
++            exchange = False
++            for swap_rank_id in sorted_rank_idx[:-1]:
++                if (
++                    num_com_between_rank[swap_rank_id][max_load_rank_id] < self.num_max_com
++                    and num_com_between_rank[max_load_rank_id][swap_rank_id] < self.num_max_com
++                ):
++                    swap_rank_load = rank_loads[swap_rank_id]
++
++                    max_rank_expert, swap_rank_expert, max_weight = self.swap_experts_between_ranks(
++                        rank_deploy_sets[max_load_rank_id],
++                        rank_deploy_sets[swap_rank_id],
++                        rev_expert_per_rank[max_load_rank_id],
++                        rev_expert_per_rank[swap_rank_id],
++                        updated_weights,
++                        max_rank_load,
++                        swap_rank_load,
++                    )
++
++                    if max_rank_load - max_weight < self.swap_threshold or max_rank_expert == -1:
++                        continue
++
++                    rank_deploy_sets[max_load_rank_id].remove(max_rank_expert)
++                    rank_deploy_sets[swap_rank_id].remove(swap_rank_expert)
++                    rank_deploy_sets[max_load_rank_id].add(swap_rank_expert)
++                    rank_deploy_sets[swap_rank_id].add(max_rank_expert)
++
++                    rank_loads[max_load_rank_id] += updated_weights[swap_rank_expert] - updated_weights[max_rank_expert]
++                    rank_loads[swap_rank_id] += updated_weights[max_rank_expert] - updated_weights[swap_rank_expert]
++
++                    rev_expert_per_rank[max_load_rank_id].add(swap_rank_expert)
++                    rev_expert_per_rank[swap_rank_id].add(max_rank_expert)
++
++                    num_com_between_rank[swap_rank_id][max_load_rank_id] += 1
++                    num_com_between_rank[max_load_rank_id][swap_rank_id] += 1
++
++                    exchange = True
++                    break
++
++        ranks_deployment_after_swap = [list(s) for s in rank_deploy_sets]
++
++        return np.array(ranks_deployment_after_swap), max_rank_load
++
++    def swap_experts_between_ranks(
++        self,
++        max_rank_deployment_set: set[int],
++        swap_rank_deployment_set: set[int],
++        max_rank_rev_expert: set[int],
++        swap_rank_rev_expert: set[int],
++        workload: np.ndarray,
++        max_rank_load: float,
++        swap_rank_load: float,
++    ) -> tuple[int, int, float]:
++        max_rank_expert = -1
++        swap_rank_expert = -1
++        max_weight = max_rank_load
++
++        for cur_expert_id in max_rank_deployment_set:
++            if cur_expert_id in swap_rank_deployment_set or cur_expert_id in max_rank_rev_expert:
++                continue
++
++            cur_weight = float(workload[cur_expert_id])
++
++            for next_expert_id in swap_rank_deployment_set:
++                if next_expert_id in max_rank_deployment_set or next_expert_id in swap_rank_rev_expert:
++                    continue
++
++                next_weight = float(workload[next_expert_id])
++
++                cur_load_after_swap = max_rank_load - cur_weight + next_weight
++                next_load_after_swap = swap_rank_load - next_weight + cur_weight
++                max_load_after_swap = max(cur_load_after_swap, next_load_after_swap)
++                if max_load_after_swap < max_weight:
++                    max_weight = max_load_after_swap
++                    max_rank_expert = cur_expert_id
++                    swap_rank_expert = next_expert_id
++
++        return max_rank_expert, swap_rank_expert, max_weight
++
++    def _load_no_backup_experts(
++        self,
++        old_deployment,
++        redundant_expert_pos,
++        no_backup_experts,
++        expert_from_rank,
++    ) -> defaultdict[int, list[tuple[int, int]]]:
++        if self.rank_id_to_node_id is None:
++            raise ValueError("self.rank_id_to_node_id was not assigned before calling this function")
++
++        node_cards = defaultdict(list)
++        for card_id in range(self.n_remain_cards):
++            if redundant_expert_pos[card_id]:
++                node_id = self.rank_id_to_node_id[card_id]
++                node_cards[node_id].append(card_id)
++
++        for cards in node_cards.values():
++            cards.sort(key=lambda c: len(redundant_expert_pos[c]), reverse=True)
++
++        active_nodes = sorted(
++            node_cards.keys(), key=lambda n: sum(len(redundant_expert_pos[c]) for c in node_cards[n]), reverse=True
++        )
++        node_idx = 0
++
++        need_load_h2d = defaultdict(list)
++
++        while no_backup_experts and active_nodes:
++            node_id = active_nodes[node_idx]
++            cards = node_cards[node_id]
++
++            card_id = cards[0]
++
++            expert_id = no_backup_experts.pop()
++            pos = redundant_expert_pos[card_id].pop()
++            old_deployment[card_id][pos] = int(expert_id)
++            expert_from_rank[expert_id] = card_id
++            need_load_h2d[card_id].append((pos, int(expert_id)))
++
++            if not redundant_expert_pos[card_id]:
++                cards.pop(0)
++                if not cards:
++                    active_nodes.pop(node_idx)
++                    if not active_nodes:
++                        break
++                    node_idx %= len(active_nodes)
++                    continue
++            node_idx = (node_idx + 1) % len(active_nodes)
++
++        if no_backup_experts:
++            raise ValueError(
++                f"Insufficient redundant expert capacity to place all no-backup experts;"
++                f"{len(no_backup_experts)} expert remain undeployed"
++            )
++
++        return need_load_h2d
++
++    def recomputing_workload(
++        self, rank_assignments: np.ndarray, org_workload: np.ndarray
++    ) -> tuple[np.ndarray, np.ndarray]:
++        num_per_existing_expert = np.zeros(self.n_experts, dtype=np.int64)
++
++        for rank in rank_assignments:
++            for expert_id in rank:
++                if expert_id != -1:
++                    num_per_existing_expert[expert_id] += 1
++
++        for n in num_per_existing_expert:
++            if n == 0:
++                raise ValueError(f"Currently fewer than {self.n_experts} experts are deployed")
++
++        update_workload = org_workload / num_per_existing_expert
++
++        return update_workload, num_per_existing_expert
++
++    def fill_in_undeployed_ranks(
++        self, rank_assignments: np.ndarray, org_workload: np.ndarray, redundant_expert_pos: list[list[int]]
++    ):
++        update_workload, num_per_existing_expert = self.recomputing_workload(rank_assignments, org_workload)
++
++        for card_id in range(self.n_remain_cards):
++            need_redundancy = len(redundant_expert_pos[card_id])
++
++            if need_redundancy > 0:
++                sorted_expert_ids = np.argsort(-update_workload, kind="stable")
++
++                for i in range(len(sorted_expert_ids)):
++                    expert_id = sorted_expert_ids[i]
++                    if expert_id not in rank_assignments[card_id]:
++                        index = redundant_expert_pos[card_id].pop()
++                        rank_assignments[card_id][index] = expert_id
++                        num_per_existing_expert[expert_id] += 1
++                        update_workload[expert_id] = org_workload[expert_id] / num_per_existing_expert[expert_id]
++                        need_redundancy -= 1
++                        if need_redundancy <= 0:
++                            break
++
++        rank_loads = np.zeros(len(rank_assignments), dtype=np.float32)
++        for rank_id in range(self.n_remain_cards):
++            for expert_id in rank_assignments[rank_id]:
++                rank_loads[rank_id] += update_workload[expert_id]
++
++        return update_workload, rank_loads
++
++    def find_min_rank(self, rank_ids, n_expert_per_rank):
++        if len(rank_ids) == 1:
++            return rank_ids[0]
++
++        min_rank_id = rank_ids[0]
++        min_val = n_expert_per_rank[min_rank_id]
++
++        for cur_rank_id in rank_ids[1:]:
++            current_val = n_expert_per_rank[cur_rank_id]
++
++            if current_val < min_val:
++                min_val = current_val
++                min_rank_id = cur_rank_id
++
++        return min_rank_id
++
++    def statistics_expert_distribution(
++        self, single_layer_deployment: np.ndarray
++    ) -> tuple[list[list[int]], list[int], list[int], int]:
++        expert_to_rank = defaultdict(list)
++        n_exist_experts = np.zeros(self.n_experts, dtype=np.int64)
++        for rank_id in range(self.n_remain_cards):
++            for expert_id in single_layer_deployment[rank_id]:
++                if expert_id != -1:
++                    expert_to_rank[expert_id].append(rank_id)
++                    n_exist_experts[expert_id] += 1
++
++        num_redundant_experts = int(np.sum(np.maximum(n_exist_experts - 1, 0)))
++        sorted_expert_ids = np.argsort(n_exist_experts)
++
++        rank_route_expert = defaultdict(set)
++        n_expert_per_rank = np.zeros(self.n_experts)
++        no_backup_experts = []
++        expert_from_rank = [-1] * self.n_experts
++        for expert_id in sorted_expert_ids:
++            if expert_to_rank[expert_id]:
++                min_rank = self.find_min_rank(expert_to_rank[expert_id], n_expert_per_rank)
++                rank_route_expert[min_rank].add(expert_id)
++                n_expert_per_rank[min_rank] += 1
++                expert_from_rank[expert_id] = min_rank
++            else:
++                no_backup_experts.append(expert_id)
++
++        redundant_expert_pos: list[list[int]] = [[] for _ in range(self.n_remain_cards)]
++
++        for rank_id in range(self.n_remain_cards):
++            for index, expert_id in enumerate(single_layer_deployment[rank_id]):
++                if expert_id not in rank_route_expert[rank_id]:
++                    redundant_expert_pos[rank_id].append(index)
++
++        return redundant_expert_pos, expert_from_rank, no_backup_experts, num_redundant_experts
++
++    def compute_redundant_assignments(
++        self,
++        org_workload: np.ndarray,
++        num_redundant_experts: int,
++    ) -> tuple[list[tuple[int, float]], np.ndarray]:
++        current_weights = []
++        for expert_id in range(self.n_experts):
++            current_weights.append((expert_id, org_workload[expert_id]))
++
++        redundant_assignments = [0] * self.n_experts
++
++        for i in range(num_redundant_experts):
++            sorted_indices = np.argsort([w for _, w in current_weights], kind="stable")[::-1]
++            for index in sorted_indices:
++                target_expert = current_weights[index]
++                expert_id, original_weight = target_expert
++
++                current_redundancy = redundant_assignments[expert_id] + 1
++                if current_redundancy < self.n_remain_cards:
++                    new_avg_weight = (original_weight * current_redundancy) / (current_redundancy + 1)
++                    redundant_assignments[expert_id] += 1
++                    current_weights[index] = (expert_id, new_avg_weight)
++                    break
++
++        update_weight = np.zeros(self.n_experts, dtype=np.float32)
++        for expert_id, expert_weight in current_weights:
++            update_weight[expert_id] = expert_weight
++
++        redundant_expert_list = []
++        if num_redundant_experts > 0:
++            for expert_id in range(self.n_experts):
++                for _ in range(redundant_assignments[expert_id]):
++                    redundant_expert_list.append((expert_id, float(update_weight[expert_id])))
++
++            redundant_expert_list.sort(key=lambda x: x[1], reverse=True)
++
++        return redundant_expert_list, update_weight
++
++    def non_redundant_expert_information(
++        self,
++        origin_deployment: np.ndarray,
++        updated_weights: np.ndarray,
++        redundant_expert_pos: list[list[int]],
++    ) -> tuple[np.ndarray, np.ndarray]:
++        rank_assignments = np.full((self.n_remain_cards, self.n_experts_per_card), fill_value=-1, dtype=np.int64)
++        rank_loads = np.zeros(self.n_remain_cards, dtype=np.float32)
++
++        for rank_id in range(self.n_remain_cards):
++            for index, expert_id in enumerate(origin_deployment[rank_id]):
++                if index in redundant_expert_pos[rank_id]:
++                    continue
++                rank_assignments[rank_id][index] = expert_id
++                rank_loads[rank_id] += updated_weights[expert_id]
++
++        return rank_assignments, rank_loads
++
++    def expand_deployment_table(
++        self,
++        deployment: np.ndarray,
++        redundant_expert_pos: list[list[int]],
++        n_add_expert_per_card: int,
++    ) -> np.ndarray:
++        expanded_deployment = deployment.tolist()
++        for card_id in range(self.n_remain_cards):
++            for _ in range(n_add_expert_per_card):
++                expanded_deployment[card_id].append(-1)
++
++        for rank_id in range(self.n_remain_cards):
++            for i in range(n_add_expert_per_card):
++                redundant_expert_pos[rank_id].append(i + self.n_experts_per_card)
++
++        self.n_experts_per_card += self.n_add_expert_per_card
++
++        return np.array(expanded_deployment)
++
++    def distribute_redundant_experts(
++        self,
++        rank_assignments: np.ndarray,
++        rank_loads: np.ndarray,
++        redundant_expert_list: list[tuple[int, float]],
++        expert_from_rank: list[int],
++        redundant_expert_pos: list[list[int]],
++    ) -> tuple[np.ndarray, defaultdict[int, set[int]], list[int]]:
++        rev_expert_per_rank = defaultdict(set)
++        num_com_between_rank = np.zeros((self.n_remain_cards, self.n_remain_cards), dtype=np.int64)
++
++        for expert_id, weight in redundant_expert_list:
++            candidate = -1
++            send_rank = expert_from_rank[expert_id]
++            for rank_id in range(self.n_remain_cards):
++                if len(redundant_expert_pos[rank_id]) == 0:
++                    continue
++                if expert_id in rank_assignments[rank_id]:
++                    continue
++                if num_com_between_rank[send_rank][rank_id] >= self.num_max_com:
++                    continue
++                if candidate == -1 or rank_loads[rank_id] < rank_loads[candidate]:
++                    candidate = rank_id
++
++            if candidate != -1:
++                pos = redundant_expert_pos[candidate].pop()
++                rank_assignments[candidate][pos] = expert_id
++                rank_loads[candidate] += weight
++
++                num_com_between_rank[send_rank][candidate] += 1
++                rev_expert_per_rank[candidate].add(expert_id)
++
++        undeployed_ranks = []
++        for rank_id in range(self.n_remain_cards):
++            if len(redundant_expert_pos[rank_id]) > 0:
++                undeployed_ranks.append(rank_id)
++
++        return num_com_between_rank, rev_expert_per_rank, undeployed_ranks
++
++    def _execute_allocation(
++        self,
++        cur_layer_deployment: np.ndarray,
++        org_workload: np.ndarray,
++    ) -> tuple[np.ndarray, np.ndarray, defaultdict[int, list[tuple[int, int]]]]:
++        redundant_expert_pos, expert_from_rank, no_backup_experts, num_redundant_experts = (
++            self.statistics_expert_distribution(cur_layer_deployment)
++        )
++
++        if self.n_add_expert_per_card > 0:
++            raise ValueError("Capacity expansion is not supported.")
++            # cur_layer_deployment = self.expand_deployment_table(
++            #     cur_layer_deployment,
++            #     redundant_expert_pos,
++            #     self.n_add_expert_per_card
++            # )
++
++        if no_backup_experts:
++            num_no_backup_experts = len(no_backup_experts)
++            need_load_h2d = self._load_no_backup_experts(
++                cur_layer_deployment, redundant_expert_pos, no_backup_experts, expert_from_rank
++            )
++            num_redundant_experts -= num_no_backup_experts
++        else:
++            need_load_h2d = defaultdict(list)
++
++        if self.enable_d2d_after_failure:
++            redundant_expert_list, update_weight = self.compute_redundant_assignments(
++                org_workload, num_redundant_experts
++            )
++
++            rank_assignments, rank_loads = self.non_redundant_expert_information(
++                cur_layer_deployment, update_weight, redundant_expert_pos
++            )
++
++            num_com_between_rank, rev_expert_per_rank, undeployed_ranks = self.distribute_redundant_experts(
++                rank_assignments, rank_loads, redundant_expert_list, expert_from_rank, redundant_expert_pos
++            )
++
++            if len(undeployed_ranks) > 0:
++                update_weight, rank_loads = self.fill_in_undeployed_ranks(
++                    rank_assignments, org_workload, redundant_expert_pos
++                )
++
++            new_deployment, after_swap_max_load = self.expert_exchange_between_ranks(
++                rank_assignments, rank_loads, num_com_between_rank, rev_expert_per_rank, update_weight
++            )
++        else:
++            new_deployment = cur_layer_deployment
++
++        return new_deployment, cur_layer_deployment, need_load_h2d
+Index: vllm_ascend/eplb/eplb_updator.py
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/vllm_ascend/eplb/eplb_updator.py b/vllm_ascend/eplb/eplb_updator.py
+--- a/vllm_ascend/eplb/eplb_updator.py	(revision 4a533861c9fcd6e181b67d7c75a037eb2898c5e0)
++++ b/vllm_ascend/eplb/eplb_updator.py	(revision f357a12dd15e2dae4891cf5d26c452cc5df46641)
+@@ -35,7 +35,6 @@
+         self.eplb_loader = loader
+         self.eplb_process = eplb_process
+         self.shared_dict = self.eplb_process.shared_dict
+-        self.comm_group = get_dynamic_eplb_group()
+ 
+     def set_adaptor(self, adaptor: VllmEplbAdaptor):
+         self.adaptor = adaptor
+@@ -131,12 +130,23 @@
+         self.update_iteration()
+ 
+     def compute_and_set_moe_load(self):
+-        local_load = self.adaptor.get_rank_expert_workload().unsqueeze(1)
+-        moe_load = self.comm_group.all_gather(local_load, dim=1).cpu()
+-
+-        if self.multi_stage:
+-            moe_load = moe_load.permute(2, 0, 1, 3)
+-
++        # local_load = self.adaptor.get_rank_expert_workload().unsqueeze(1)
++        # moe_load = self.comm_group.all_gather(local_load, dim=1).cpu()
++        #
++        # if self.multi_stage:
++        #     moe_load = moe_load.permute(2, 0, 1, 3)
++        #
++        # self.shared_dict["moe_load"] = moe_load
++        local_load = self.adaptor.get_rank_expert_workload().cpu()
++        self.comm_group = get_dynamic_eplb_group()
++        self.world_size = dist.get_world_size(group=self.comm_group.cpu_group)
++        gather_list = [torch.empty_like(local_load) for _ in range(self.world_size)]
++        dist.all_gather(
++            tensor_list=gather_list,
++            tensor=local_load,
++            group=self.comm_group.cpu_group,
++        )
++        moe_load = torch.stack(gather_list, dim=0).permute(1, 0, 2)
+         self.shared_dict["moe_load"] = moe_load
+         logger.debug(f"[ModelRunner] Updated shared_dict['moe_load'] shape={moe_load.shape}")
+ 
+Index: vllm_ascend/ops/fused_moe/token_dispatcher.py
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/vllm_ascend/ops/fused_moe/token_dispatcher.py b/vllm_ascend/ops/fused_moe/token_dispatcher.py
+--- a/vllm_ascend/ops/fused_moe/token_dispatcher.py	(revision 4a533861c9fcd6e181b67d7c75a037eb2898c5e0)
++++ b/vllm_ascend/ops/fused_moe/token_dispatcher.py	(revision e68ef281c8563747d40db81424bf3fa2c87b7703)
+@@ -30,7 +30,7 @@
+ 
+ from vllm_ascend.ascend_config import get_ascend_config
+ from vllm_ascend.device.device_op import DeviceOperator
+-from vllm_ascend.distributed.parallel_state import get_mc2_group
++from vllm_ascend.distributed.parallel_state import get_elastic_info, get_mc2_group
+ from vllm_ascend.ops.fused_moe.comm_utils import async_all_to_all, gather_from_sequence_parallel_region
+ from vllm_ascend.ops.fused_moe.moe_runtime_args import (
+     MoEAllGatherCombineMetadata,
+@@ -135,6 +135,8 @@
+             raise RuntimeError(
+                 "PTA and CANN version is too old to support mc2 hierarchy comm, please upgrade your version."
+             )
++        self.elastic_info = None
++        self._initial_moe_expert_num = None
+ 
+     def get_dispatch_mc2_kwargs(
+         self,
+@@ -157,7 +159,14 @@
+             quant_mode = 4 if self.a5_need_extra_args and token_dispatch_input.quant.is_mxfp else 2
+         else:
+             quant_mode = 0
+-        self.moe_expert_num = len(expert_map) + global_redundant_expert_num
++        if self._initial_moe_expert_num is None:
++            self._initial_moe_expert_num = len(expert_map) + global_redundant_expert_num
++        # Fault tolerance enabled(self.elastic_info is not None)
++        # Scaling down via MC2 Mask does not update self.moe_expert_num
++        if self.elastic_info is not None:
++            self.moe_expert_num = self._initial_moe_expert_num
++        else:
++            self.moe_expert_num = len(expert_map) + global_redundant_expert_num
+         kwargs_mc2 = {
+             "x": hidden_states,
+             "expert_ids": topk_ids,
+@@ -166,6 +175,7 @@
+             "moe_expert_num": self.moe_expert_num,
+             "global_bs": self.global_bs,
+             "expert_token_nums_type": 0,
++            "elastic_info": self.elastic_info,
+         }
+         if self.global_bs == 0:
+             kwargs_mc2["x_active_mask"] = token_dispatch_input.routing.mc2_mask
+@@ -209,6 +219,7 @@
+         self,
+         token_dispatch_input: MoETokenDispatchInput,
+     ):
++        self.elastic_info = get_elastic_info()
+         kwargs_mc2 = self.get_dispatch_mc2_kwargs(token_dispatch_input)
+         output = (
+             torch_npu.npu_moe_distribute_dispatch_v2(**kwargs_mc2)
+@@ -264,6 +275,7 @@
+             "shared_expert_rank_num": 0,
+             "moe_expert_num": self.moe_expert_num,
+             "global_bs": self.global_bs,
++            "elastic_info": self.elastic_info,
+         }
+         if self.global_bs == 0:
+             kwargs_mc2["x_active_mask"] = combine_metadata.mc2_mask
+Index: vllm_ascend/patch/worker/patch_distributed.py
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/vllm_ascend/patch/worker/patch_distributed.py b/vllm_ascend/patch/worker/patch_distributed.py
+--- a/vllm_ascend/patch/worker/patch_distributed.py	(revision 4a533861c9fcd6e181b67d7c75a037eb2898c5e0)
++++ b/vllm_ascend/patch/worker/patch_distributed.py	(revision f357a12dd15e2dae4891cf5d26c452cc5df46641)
+@@ -34,6 +34,7 @@
+         use_device_communicator: bool,  # whether to use device communicator
+         use_message_queue_broadcaster: bool = False,
+         group_name: str | None = None,
++        gloo_timeout_seconds: int | None = None,
+     ):
+         group_name = group_name or "anonymous"
+         self.unique_name = _get_unique_name(group_name)
+@@ -86,6 +87,7 @@
+ 
+         self.use_custom_op_call = True
+         self.use_cpu_custom_send_recv = False
++        self.group_type = "normal"
+ 
+     def all_to_all(
+         self,
+Index: vllm_ascend/worker/model_runner_v1.py
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/vllm_ascend/worker/model_runner_v1.py b/vllm_ascend/worker/model_runner_v1.py
+--- a/vllm_ascend/worker/model_runner_v1.py	(revision 4a533861c9fcd6e181b67d7c75a037eb2898c5e0)
++++ b/vllm_ascend/worker/model_runner_v1.py	(revision 150cda7a7adbb33d8917be2434f3387586128842)
+@@ -142,6 +142,8 @@
+ )
+ from vllm.model_executor.layers.fused_moe.routed_experts_capturer import RoutedExpertsCapturer
+ 
++from vllm_ascend.worker.sentinel.npu_worker_sentinel import evaluate_pause_condition
++
+ if TYPE_CHECKING:
+     import xgrammar as xgr  # type: ignore[import-untyped]
+     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
+@@ -364,12 +366,14 @@
+         eplb_config = self.ascend_config.eplb_config
+         self.dynamic_eplb = eplb_config.dynamic_eplb
+         self.eplb_enable = self.dynamic_eplb or (eplb_config.expert_map_path is not None)
+-        if self.dynamic_eplb:
++        self.fault_tolerance = vllm_config.parallel_config.enable_fault_tolerance
++        if self.dynamic_eplb or self.fault_tolerance:
+             self.is_eplb_warmuped = False
+             self.policy_type = eplb_config.eplb_policy_type
+             self.eplb_loader = D2DExpertWeightLoader()
+             self.manager = Manager()
+-            self.shared_dict = self.manager.dict({"expert_map": None, "moe_load": None, "expert_maps": None})
++            self.shared_dict = self.manager.dict(
++                {"expert_map": None, "moe_load": None, "expert_maps": None, "scale_down": False})
+             self.eplb_process = EplbProcess(shared_dict=self.shared_dict, policy_type=self.policy_type, enable_d2d=True)
+             self.process = self.eplb_process._launch_process()
+             self.eplb_updator = EplbUpdator(eplb_config, self.eplb_loader, self.eplb_process, self.process)
+@@ -491,6 +495,9 @@
+         if self.dp_size == 1:
+             return num_tokens, None, with_prefill
+ 
++        if self.fault_tolerance:
++            evaluate_pause_condition()
++
+         if should_skip_allreduce_across_dp_group(self.vllm_config, is_draft_model):
+             num_tokens_after_padding = torch.tensor([num_tokens] * self.dp_size, device="cpu", dtype=torch.int32)
+             return num_tokens, num_tokens_after_padding, with_prefill
+@@ -1130,6 +1137,8 @@
+         ):
+             scheduler_output = deepcopy(scheduler_output)
+         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
++        if self.fault_tolerance:
++            evaluate_pause_condition()
+         with record_function_or_nullcontext("prepare input"):
+             with self.synchronize_input_prep():
+                 # Update persistent batch states.
+@@ -1914,10 +1923,22 @@
+             num_tokens_after_padding = torch.tensor([num_tokens_padded] * self.dp_size, device="cpu", dtype=torch.int32)
+             return False, num_tokens_after_padding, cudagraph_mode
+ 
++        if self.fault_tolerance:
++            evaluate_pause_condition()
+         tensor = torch.zeros(2, self.dp_size, device="cpu", dtype=torch.int32)
+         tensor[0][self.dp_rank] = num_tokens_padded
+         tensor[1][self.dp_rank] = cudagraph_mode
+-        dist.all_reduce(tensor, group=get_dp_group().cpu_group)
++        try:
++            dist.all_reduce(tensor, group=get_dp_group().cpu_group)
++        except RuntimeError as e:
++            from vllm.v1.engine.exceptions import EngineLoopPausedError
++            if self.fault_tolerance:
++                raise EngineLoopPausedError(
++                    'All-reduce across DP ranks failed, likely due to a rank failure. '
++                    'Pausing the engine loop to allow for recovery.'
++                ) from e
++            else:
++                raise
+ 
+         num_tokens_across_dp = tensor[0, :]
+         max_num_tokens = int(num_tokens_across_dp.max().item())
+Index: vllm_ascend/worker/sentinel/npu_worker_sentinel.py
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/vllm_ascend/worker/sentinel/npu_worker_sentinel.py b/vllm_ascend/worker/sentinel/npu_worker_sentinel.py
+new file mode 100644
+--- /dev/null	(revision b7284352234c9b17ddb9ac231434e1c3889164cb)
++++ b/vllm_ascend/worker/sentinel/npu_worker_sentinel.py	(revision b7284352234c9b17ddb9ac231434e1c3889164cb)
+@@ -0,0 +1,251 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++import threading
++from datetime import timedelta
++
++import msgspec
++import torch
++import torch_npu
++import zmq
++from torch.distributed.distributed_c10d import _set_pg_timeout
++from vllm.config import ParallelConfig, set_current_vllm_config
++from vllm.distributed import get_pp_group, get_tp_group
++from vllm.distributed.parallel_state import _get_unique_name, get_dp_group
++from vllm.distributed.utils import get_cached_tcp_store_client, stateless_init_torch_distributed_process_group
++from vllm.logger import logger
++from vllm.utils.network_utils import close_sockets, make_zmq_socket
++from vllm.v1.engine.exceptions import EngineLoopPausedError
++from vllm.v1.fault_tolerance import BaseSentinel
++from vllm.v1.fault_tolerance.utils import FaultToleranceRequest, FaultToleranceResult
++from vllm.v1.worker.worker_base import WorkerBase
++
++from vllm_ascend.ascend_config import get_ascend_config
++from vllm_ascend.distributed.parallel_state import get_elastic_info
++from vllm_ascend.platform import NPUPlatform
++from vllm_ascend.worker.sentinel.scale_down import ScaleDownHelper
++
++_GLOBAL_PAUSE_EVENT = threading.Event()
++
++
++def get_pause_event() -> threading.Event:
++    global _GLOBAL_PAUSE_EVENT
++    return _GLOBAL_PAUSE_EVENT
++
++
++def evaluate_pause_condition() -> None:
++    if get_pause_event().is_set():
++        raise EngineLoopPausedError("Worker is paused as a fault was detected on another rank.")
++
++
++class NPUWorkerSentinel(BaseSentinel):
++    def __init__(
++        self,
++        parallel_config: ParallelConfig,
++        device: torch.device,
++        worker_cmd_addr: str,
++        worker: WorkerBase,
++    ):
++        self.worker = worker
++        self.dp_rank = parallel_config.data_parallel_rank
++        tp_rank = get_tp_group().rank_in_group
++        pp_rank = get_pp_group().rank_in_group
++        identity_str = f"PP{pp_rank}_TP{tp_rank}"
++        super().__init__(parallel_config, f"{self.dp_rank}_{identity_str}", identity_str.encode())
++        self.device = device
++        self.data_parallel_master_ip = parallel_config.data_parallel_master_ip
++        self.data_parallel_master_port = parallel_config.data_parallel_master_port
++        self.dp_size = parallel_config.data_parallel_size
++        torch.accelerator.set_device_index(self.device)
++        self.set_dp_gloo_timeout(parallel_config)
++        self.engine_core_cmd_socket = make_zmq_socket(
++            self.ctx,
++            worker_cmd_addr,
++            zmq.DEALER,
++            bind=False,
++            identity=self.identity,
++        )
++
++        threading.Thread(target=self.run, daemon=True, name="WorkerSentinelThread").start()
++
++    def set_dp_gloo_timeout(self, parallel_config: ParallelConfig) -> None:
++        timeout = timedelta(seconds=parallel_config.gloo_timeout_seconds)
++        dp_cpu_group = get_dp_group()
++        _set_pg_timeout(timeout=timeout, group=dp_cpu_group.cpu_group)
++
++    def run(self):
++        # Wait for fault tolerance instructions from EngineCoreSentinel
++        while not self.sentinel_dead:
++            self.poll_and_execute_upstream_cmd()
++
++    def poll_and_execute_upstream_cmd(self):
++        """
++        Receive and execute a command from upstream sentinel and send back
++        the execution result.
++        """
++        try:
++            _, msg = self.engine_core_cmd_socket.recv_multipart()
++            ft_request = msgspec.msgpack.decode(msg, type=FaultToleranceRequest)
++            ft_result = self._execute_cmd(ft_request)
++            msg_bytes = msgspec.msgpack.encode(ft_result)
++            self.engine_core_cmd_socket.send_multipart([b"", msg_bytes])
++        except zmq.ZMQError:
++            logger.info("Socket closed, terminating.")
++            self.sentinel_dead = True
++
++    def pause(self, ft_request: FaultToleranceRequest) -> FaultToleranceResult:
++        get_pause_event().set()
++        NPUPlatform.set_device(self.device)
++        result = torch_npu.npu.stop_device(self.device.index)
++        if result == 0:
++            logger.info("npu stop device %s succeeded", self.device.index)
++            return FaultToleranceResult(ft_request.request_id, True)
++        elif result == 1:
++            logger.info("npu stop device %s failed", self.device.index)
++            return FaultToleranceResult(ft_request.request_id, False)
++        else:
++            raise ValueError(f"Unexpected return value from stop_device: {result}")
++
++    def retry(self, ft_request: FaultToleranceRequest) -> FaultToleranceResult:
++        self.clean_states()
++        get_dp_group().cpu_group = stateless_init_torch_distributed_process_group(
++            self.data_parallel_master_ip,
++            ft_request.params["new_stateless_dp_group_port"],
++            self.dp_rank,
++            self.dp_size,
++            backend="gloo",
++            group_name=_get_unique_name("dp_group"),
++        )
++        timeout = timedelta(seconds=self.worker.parallel_config.gloo_timeout_seconds)
++        _set_pg_timeout(timeout=timeout, group=get_dp_group().cpu_group)
++        return FaultToleranceResult(ft_request.request_id, True)
++
++    def shutdown(self):
++        close_sockets([self.engine_core_cmd_socket])
++        super().shutdown()
++
++    def scale_down(self, ft_request: FaultToleranceRequest) -> FaultToleranceResult:
++        self.clean_states()
++        exclude_ep_ranks = ft_request.params["exclude_ep_ranks"]
++        vllm_config_update_dict = ft_request.params["vllm_config_update_dict"]
++        self._coord_store_port = ft_request.params["coord_store_port"]
++        store = get_cached_tcp_store_client(self.data_parallel_master_ip, self._coord_store_port)
++        self.scale_down_worker(exclude_ep_ranks, vllm_config_update_dict, store)
++        self.worker.execute_dummy_batch()
++        torch.npu.synchronize()
++        return FaultToleranceResult(ft_request.request_id, True)
++
++    def scale_down_worker(self, excluded_ep_ranks: list[int], scale_down_config, coord_store):
++        """
++        Reconfigure data-parallel (DP) layout and MoE expert placement after
++        excluding one or more DP ranks (e.g., due to failure).
++
++        Args:
++            excluded_ep_ranks: EP ranks to exclude from service.
++            scale_down_config: Dict containing rank_mapping and new parallel config.
++            coord_store: TCP store for coordinating group reinitialization.
++        """
++        assert self.worker.vllm_config.parallel_config.enable_fault_tolerance is True, "enable_fault_tolerance is False"
++        if not self.worker.model_loaded:
++            raise RuntimeError("model has not been loaded yet")
++
++        rank_mapping = scale_down_config.get("rank_mapping")
++        assert rank_mapping is not None
++        assert isinstance(rank_mapping, dict)
++
++        new_dp_rank = rank_mapping[self.worker.parallel_config.data_parallel_rank]
++
++        num_logical_expert = self.worker.num_logical_expert
++
++        enable_d2d_rebalance = (
++            self.worker.vllm_config.parallel_config.fault_tolerance_config.enable_fault_tolerance_rebalance
++        )
++        if self.worker.model_runner.shared_dict["moe_load"] is None or torch.all(
++            self.worker.model_runner.shared_dict["moe_load"][0] == 0
++        ):
++            enable_d2d_rebalance = False
++
++        scale_down_helper = ScaleDownHelper(self.worker.vllm_config, self.worker.model_runner, self.worker.quant)
++        # Currently,only TP=1 is supported.Therefore excluded_dp_ranks = excluded_ep_ranks
++        # TODO: In scenarios TP>1,the logic for converting from
++        #  excluded_ep_ranks to excluded_dp_ranks needs to be added
++        excluded_dp_ranks = excluded_ep_ranks
++
++        # Phase 1: Expert distribution recalculation
++        experts_to_load = scale_down_helper.get_expert_distribution_after_scale_down(
++            excluded_dp_ranks, enable_d2d_rebalance, new_dp_rank
++        )
++        num_add_experts_per_rank = self.worker.model_runner.shared_dict["num_add_experts_per_rank"]
++
++        if num_add_experts_per_rank > 0:
++            # use_mask_mc2 is False
++            raise RuntimeError("only support mask mc2")
++
++        # Phase 2: Expert weight reloading
++        saved_weights = scale_down_helper.load_expert_weights_to_cpu(experts_to_load, self.worker.weight_name_to_tensor)
++        scale_down_helper.reload_expert_weights(experts_to_load, saved_weights)
++
++        # Phase 3：EPLB adaptor update
++        if get_ascend_config().eplb_config.dynamic_eplb:
++            scale_down_helper.update_eplb_adaptor_info(num_add_experts_per_rank, new_dp_rank)
++
++        # Phase 4: Log2phy map generation
++        if enable_d2d_rebalance:
++            all_layer_log2phy = scale_down_helper.d2d_transmission_for_scaling_down()
++        else:
++            all_layer_log2phy = scale_down_helper.gen_all_layer_log2phy(new_dp_rank)
++
++        self.worker.global_experts_distribution = self.worker.model_runner.eplb_process.worker.local2global(
++            self.worker.model_runner.shared_dict["expert_maps"]
++        )
++
++        # Phase 5: Configuration and state update
++        old_ep_size = len(self.worker.ep2dp_map)
++        scale_down_helper.update_parallel_config(scale_down_config)
++        self.dp_size = self.worker.vllm_config.parallel_config.data_parallel_size
++        self.dp_rank = self.worker.vllm_config.parallel_config.data_parallel_rank
++        self.worker.model_runner.dp_size = self.dp_size
++        self.worker.model_runner.dp_rank = self.dp_rank
++        logger.info(
++            f"ep2dp_map is {self.worker.ep2dp_map} "
++            f"excluded_dp_ranks is {excluded_dp_ranks} "
++            f"rank_mapping is {rank_mapping}"
++        )
++        self.worker.ep2dp_map = scale_down_helper.update_ep2dp_map(
++            self.worker.ep2dp_map, excluded_dp_ranks, rank_mapping
++        )
++        elastic_info = get_elastic_info()
++        num_new_phy_experts = (self.worker.model_runner.shared_dict["expert_maps"][0] != -1).sum().item()
++        scale_down_helper.update_elastic_info(elastic_info, num_new_phy_experts, old_ep_size, self.worker.ep2dp_map)
++
++        # Phase 6: Communication group reinitialization
++        scale_down_helper.destroy_comm_group()
++        with set_current_vllm_config(self.worker.vllm_config):
++            scale_down_helper.init_dp_cpu_group(coord_store, "stateless")
++
++        # Phase 7: MoE reconfiguration
++        scale_down_helper.reconfigure_moe(num_logical_expert, num_new_phy_experts, all_layer_log2phy)
++
++    def clean_states(self):
++        get_pause_event().clear()
++        # clean device states
++        NPUPlatform.set_device(self.device)
++        torch_npu.npu.stop_device(self.device.index)
++        torch_npu.npu.restart_device(self.device.index)
++        torch_npu.distributed.reinit_process_group(None, False)
++        torch.npu.synchronize()
++
++        # clean worker states
++        self.worker.model_runner.execute_model_state = None
++        self.worker.model_runner.kv_connector_output = None
++        input_batch = self.worker.model_runner.input_batch
++        cached_req_ids = input_batch.req_id_to_index.keys()
++        for req_id in list(cached_req_ids):
++            input_batch.remove_request(req_id)
++        input_batch.condense()
++        input_batch.refresh_metadata()
++        input_batch.req_prompt_embeds.clear()
++        self.worker.model_runner.async_output_copy_stream = torch.cuda.Stream()
++        self.worker.model_runner.prepare_inputs_event = torch.Event()
++
++        torch.npu.synchronize()
++        logger.info("Device and worker states are cleaned.")
+Index: vllm_ascend/worker/sentinel/scale_down.py
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/vllm_ascend/worker/sentinel/scale_down.py b/vllm_ascend/worker/sentinel/scale_down.py
+new file mode 100644
+--- /dev/null	(revision b7284352234c9b17ddb9ac231434e1c3889164cb)
++++ b/vllm_ascend/worker/sentinel/scale_down.py	(revision b7284352234c9b17ddb9ac231434e1c3889164cb)
+@@ -0,0 +1,777 @@
++import contextlib
++import socket
++import struct
++from contextlib import contextmanager
++from copy import copy
++from datetime import timedelta
++from typing import TYPE_CHECKING
++
++import numpy as np
++import torch
++import torch_npu
++from torch.distributed.distributed_c10d import _set_pg_timeout
++from vllm.config import VllmConfig
++from vllm.distributed import (
++    get_dp_group,
++    get_pcp_group,
++    get_tp_group,
++    stateless_init_torch_distributed_process_group,
++)
++from vllm.distributed.parallel_state import _get_unique_name
++from vllm.logger import logger
++from vllm.model_executor.layers.fused_moe import FusedMoE
++from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig, FusedMoEParallelConfig
++from vllm.model_executor.model_loader import get_model_loader
++
++from vllm_ascend.ascend_config import get_ascend_config
++from vllm_ascend.distributed.parallel_state import (
++    get_dynamic_eplb_group,
++    set_elastic_info,
++)
++from vllm_ascend.eplb.core.eplb_utils import generate_log2phy_map
++
++if TYPE_CHECKING:
++    from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
++else:
++    NPUModelRunner = None
++
++_PORTS_FMT = "!2I"
++# TODO: Refactor scale_down.py - use descaler object instead of NpuWorker attrs to streamline code
++STORE_KEY = "vllm_ascend_fault_tolerance_ports"
++
++BASE_WEIGHT_SUFFIXES = {"down_proj.weight", "up_proj.weight", "gate_proj.weight"}
++QUANT_WEIGHT_SUFFIXES = {
++    "down_proj.weight_offset",
++    "up_proj.weight_offset",
++    "gate_proj.weight_offset",
++    "down_proj.weight_scale",
++    "up_proj.weight_scale",
++    "gate_proj.weight_scale",
++}
++# model_type → MTP weight path template mapping
++_MTP_WEIGHT_PATH_TEMPLATES: dict[frozenset[str], str] = {
++    frozenset(
++        {
++            "nemotron_h",
++            "nemotron_h_mtp",
++            "qwen3_next",
++            "qwen3_next_mtp",
++            "qwen3_5",
++            "qwen3_5_moe",
++            "qwen3_5_mtp",
++            "exaone_moe",
++            "exaone_moe_mtp",
++        }
++    ): "mtp.layers.{idx}.mlp.experts.{eid}.{suffix}",
++    frozenset({"glm_moe_dsa"}): "model.layers.{layer_id}.mlp.experts.{eid}.{suffix}",
++    frozenset({"longcat_flash", "longcat_flash_mtp"}): (
++        "model.mtp.layers.{idx}.transformer_layer.mlp.experts.{eid}.{suffix}"
++    ),
++    frozenset({"ernie4_5_moe", "ernie_mtp"}): "model.mtp_block.0.mlp.experts.{eid}.{suffix}",
++}
++
++
++def _append_mtp_copies(main_list: list, num_mtp_layers: int) -> None:
++    """Append MTP layer copies to main_list by cyclic modulo indexing."""
++    if num_mtp_layers <= 0 or not main_list:
++        return
++    num_main = len(main_list)
++    for mtp_idx in range(num_mtp_layers):
++        main_idx = mtp_idx % num_main
++        item = main_list[main_idx]
++        main_list.append(item.clone() if hasattr(item, "clone") else copy(item))
++
++
++def _resolve_mtp_weight_prefix(prefix: str, experts_saved_weights: dict[str, torch.Tensor], probe_key: str) -> str:
++    """Resolve GLM-5 MTP mtp_block prefix mismatch.
++
++    The checkpoint raw weight names and module.layer_name may differ;
++    automatically toggle between prefix with/without mtp_block.
++    """
++    if probe_key in experts_saved_weights:
++        return prefix
++    if "mtp_block" in prefix:
++        return prefix.replace(".mtp_block.mlp.", ".mlp.", 1)
++    return prefix.replace(".mlp.", ".mtp_block.mlp.", 1)
++
++
++def _get_mtp_weight_path(
++    model_type: str,
++    mtp_local_idx: int,
++    layer_id: int,
++    expert_id: int,
++    suffix: str,
++) -> str:
++    """Look up the MTP weight path template for the given model_type."""
++    for model_types, template in _MTP_WEIGHT_PATH_TEMPLATES.items():
++        if model_type in model_types:
++            return template.format(
++                idx=mtp_local_idx,
++                layer_id=layer_id,
++                eid=expert_id,
++                suffix=suffix,
++            )
++    return f"model.layers.{layer_id}.mlp.experts.{expert_id}.{suffix}"
++
++
++def distribute_experts(global_num_expert: int, ep_size: int) -> dict[int, list[int]]:
++    distribution = {}
++    base = global_num_expert // ep_size
++    remainder = global_num_expert % ep_size
++
++    start_index = 0
++    for rank in range(ep_size):
++        num = base + (1 if rank < remainder else 0)
++        expert_ids = list(range(start_index, start_index + num))
++        distribution[rank] = expert_ids
++        start_index += num
++    return distribution
++
++
++def gen_global_log2phy_map(
++    num_logical_experts: int, num_npu: int, redundant_expert_list: list[int]
++) -> dict[int, list[int]]:
++    num_redundant_experts = len(redundant_expert_list)
++    assert (num_logical_experts + num_redundant_experts) % num_npu == 0, (
++        "the physical expert count must evenly divide across NPUs"
++    )
++    num_phy_exp_per_npu = (num_logical_experts + num_redundant_experts) // num_npu
++
++    # How many physical experts per NPU after placing redundancy
++    exp_distribution_without_redundancy = distribute_experts(num_logical_experts, num_npu)
++    num_routed_experts_list = []
++    num_redundant_experts_list = []
++    for rank in range(num_npu):
++        num_routed_experts_list.append(len(exp_distribution_without_redundancy[rank]))
++        num_redundant_experts_list.append(num_phy_exp_per_npu - len(exp_distribution_without_redundancy[rank]))
++
++    # Mapping: logical expert -> list of physical expert IDs assigned
++    global_log2phy_map: dict[int, list[int]] = {log_expert_id: [] for log_expert_id in range(num_logical_experts)}
++    log_experts_iter = iter(range(num_logical_experts))
++
++    global_pos = 0
++    re_exp_assign_map = [[exp_id, False] for exp_id in redundant_expert_list]
++
++    for rank in range(num_npu):
++        local_expert_map = []
++        for _ in range(num_routed_experts_list[rank]):
++            expert_id = next(log_experts_iter)
++            global_log2phy_map[expert_id].insert(0, global_pos)
++            global_pos += 1
++            local_expert_map.append(expert_id)
++
++        for _ in range(num_redundant_experts_list[rank]):
++            success = False
++            for i in range(len(re_exp_assign_map)):
++                eid, assigned = re_exp_assign_map[i]
++                if assigned:
++                    continue
++                if eid in local_expert_map:
++                    continue
++                global_log2phy_map[eid].append(global_pos)
++                global_pos += 1
++                local_expert_map.append(eid)
++                re_exp_assign_map[i][1] = True
++                success = True
++                break
++            if not success:
++                raise RuntimeError(
++                    "expert placement aborted. The distribution of redundant experts cannot"
++                    "satisfy the requirement that physical replicas of each logical expert are properly replicated."
++                )
++    return global_log2phy_map
++
++
++def init_global_expert_distribution(global_log2phy_map: dict[int, list[int]], ep_size: int) -> dict[int, list[int]]:
++    num_phy_experts = sum(map(len, global_log2phy_map.values()))
++    num_phy_exp_per_npu = num_phy_experts // ep_size
++    global_expert_distribution = {i: [-1 for _ in range(num_phy_exp_per_npu)] for i in range(ep_size)}
++    for log_eid, phy_expert_pos in global_log2phy_map.items():
++        for pos in phy_expert_pos:
++            rank = pos // num_phy_exp_per_npu
++            local_pos = pos - rank * num_phy_exp_per_npu
++            global_expert_distribution[rank][local_pos] = log_eid
++    return global_expert_distribution
++
++
++def generate_redundant_expert_ids(num_experts: int, ep_size: int, num_redundant_experts: int) -> list[int]:
++    assert num_redundant_experts % ep_size == 0
++    experts_per_ep_group = num_experts // ep_size
++    redundant_per_group = num_redundant_experts // ep_size
++    redundant_ids = []
++    for rank in range(ep_size):
++        start_id = rank * experts_per_ep_group
++        for i in range(redundant_per_group):
++            redundant_ids.append(start_id + i)
++    return redundant_ids
++
++
++def init_ep2dp_map(dp_size: int, tp_size: int) -> dict[int, int]:
++    ep2dp_map = {}
++    for dp_rank in range(dp_size):
++        ep_start = dp_rank * tp_size
++        ep_end = (dp_rank + 1) * tp_size
++        for ep_rank in range(ep_start, ep_end):
++            ep2dp_map[ep_rank] = dp_rank
++    return ep2dp_map
++
++
++def update_ep2dp_map(
++    ep2dp_map: dict[int, int],
++    excluded_dp_ranks: list[int],
++    rank_mapping: dict[int, int],
++) -> dict[int, int]:
++    for old_ep_rank, dp_rank in ep2dp_map.items():
++        if dp_rank != -1:
++            if dp_rank in excluded_dp_ranks:
++                ep2dp_map[old_ep_rank] = -1
++            else:
++                ep2dp_map[old_ep_rank] = rank_mapping[dp_rank]
++    return ep2dp_map
++
++
++def update_parallel_config(original_config: VllmConfig, update_config: dict[str, int]) -> None:
++    required_keys = {
++        "data_parallel_size",
++        "data_parallel_size_local",
++        "data_parallel_rank",
++        "data_parallel_master_port",
++    }
++    missing_keys = required_keys - set(update_config.keys())
++    if missing_keys:
++        raise ValueError(f"update parallel config failed missing keys: {missing_keys}")
++
++    original_config.parallel_config.data_parallel_size = update_config["data_parallel_size"]
++    original_config.parallel_config.data_parallel_size_local = update_config["data_parallel_size_local"]
++    original_config.parallel_config.data_parallel_rank = update_config["data_parallel_rank"]
++    original_config.parallel_config.data_parallel_master_port = update_config["data_parallel_master_port"]
++
++
++def init_elastic_info(
++    ep_size: int,
++    phy_experts_num: int,
++    share_expert_rank_num: int = 0,
++):
++    # Basic configuration (first 4 parameters)
++    # Meaning: whether to scale down (0 = no scale down), actual number of ranks after scale down
++    # reduction (=ep_size), number of ranks for shared experts,number of MoE experts
++    is_scaled_down = 0
++    base_config = torch.tensor([is_scaled_down, ep_size, share_expert_rank_num, phy_experts_num], dtype=torch.int32)
++
++    # Table1: epRankID -> localEpRankId(-1 indicates invalid）
++    table1 = torch.arange(0, ep_size, dtype=torch.int32)
++    # Table2: localEpRankId -> epRankID(-1 indicates padding）
++    table2 = torch.arange(0, ep_size, dtype=torch.int32)
++
++    elastic_info = torch.cat([base_config, table1, table2], dim=0).npu().contiguous()
++    elastic_info.requires_grad_(False)
++    set_elastic_info(elastic_info)
++
++
++def update_elastic_info(
++    elastic_info: torch.Tensor,
++    expert_num: int,
++    raw_ep_size: int,
++    ep2dp: dict[int, int],
++    share_expert_num: int = 0,
++) -> None:
++    if elastic_info is None:
++        elastic_info = torch.full((4 + 2 * raw_ep_size,), -1, dtype=torch.int32).npu().contiguous()
++    raw_ep_ranks = sorted(ep2dp.keys())
++    valid_ep_ranks = [ep for ep in raw_ep_ranks if ep2dp[ep] != -1]
++    scaled_down_ep_size = len(valid_ep_ranks)
++    is_scaled_down = 1 if scaled_down_ep_size < raw_ep_size else 0
++
++    # Table1: epRankID -> localEpRankId(-1 indicates invalid）
++    table1 = torch.full((raw_ep_size,), -1, dtype=torch.int32, device="cpu")
++    for local_ep_rank, ep_rank in enumerate(valid_ep_ranks):
++        table1[ep_rank] = local_ep_rank
++
++    # Table2: localEpRankId -> epRankID(-1 indicates padding）
++    table2 = torch.full((raw_ep_size,), -1, dtype=torch.int32, device="cpu")
++    for local_ep_rank, ep_rank in enumerate(valid_ep_ranks):
++        if local_ep_rank < scaled_down_ep_size:
++            table2[local_ep_rank] = ep_rank
++
++    # update elastic_info
++    new_elastic_info_cpu = torch.cat(
++        [
++            torch.tensor([is_scaled_down, scaled_down_ep_size, share_expert_num, expert_num], dtype=torch.int32),
++            table1,
++            table2,
++        ],
++        dim=0,
++    )
++    elastic_info.copy_(new_elastic_info_cpu)
++    set_elastic_info(elastic_info)
++
++
++def dynamic_merge_view(
++    target_tensor: torch.Tensor, tensor1: torch.Tensor, tensor2: torch.Tensor, dim: int = 0
++) -> torch.Tensor:
++    dim_size1 = tensor1.shape[dim]
++    dim_size2 = tensor2.shape[dim]
++    total_dim_size = dim_size1 + dim_size2
++
++    non_dim_shapes = [s for i, s in enumerate(tensor1.shape) if i != dim]
++    for i, s in enumerate(tensor2.shape):
++        if i != dim and s != non_dim_shapes[i if i < dim else i - 1]:
++            expected = non_dim_shapes[i if i < dim else i - 1]
++            raise ValueError(f"size mismatch on non merged dimension {i}：tensor1={expected} vs tensor2={s}")
++    if target_tensor.shape[dim] != total_dim_size:
++        raise ValueError(f"target tensor on dim {dim} must be {dim_size1}+{dim_size2}={total_dim_size}")
++
++    top_view = target_tensor.narrow(dim, 0, dim_size1)
++    bottom_view = target_tensor.narrow(dim, dim_size1, dim_size2)
++
++    top_view.copy_(tensor1)
++    bottom_view.copy_(tensor2)
++
++    return target_tensor
++
++
++class ScaleDownHelper:
++    """Orchestrates the full scale-down workflow for fault tolerance.
++
++    Encapsulates: expert distribution recalculation, weight reloading,
++    communication group reinitialization, MoE reconfiguration, and
++    elastic info updates.
++    """
++
++    def __init__(self, vllm_config: VllmConfig, model_runner, quant: bool):
++        self.vllm_config = vllm_config
++        self.model_runner = model_runner
++        self.quant = quant
++
++    def get_expert_distribution_after_scale_down(self, excluded_dp_ranks, enable_d2d_rebalance, rank):
++        """Wake up EPLB worker and get the new expert distribution for this rank."""
++        model_runner = self.model_runner
++        eplb_updator = model_runner.eplb_updator
++        model_runner.shared_dict["scale_down"] = True
++        model_runner.shared_dict["enable_d2d_after_failure"] = enable_d2d_rebalance
++        model_runner.shared_dict["excluded_dp_ranks"] = excluded_dp_ranks
++        expert_maps = model_runner.shared_dict["expert_maps"]
++        if expert_maps is None or (expert_maps.shape == (1, 1, 1) and not expert_maps.any()):
++            model_runner.shared_dict["expert_maps"] = self._get_global_expert_map()
++
++        eplb_updator.wakeup_eplb_worker()
++        eplb_updator.update_info_all = eplb_updator.eplb_process.block_update_q.get()
++        need_load_h2d = model_runner.shared_dict["need_load_h2d"]
++
++        experts_to_load = []
++        for layer_id in range(len(need_load_h2d)):
++            per_layer = need_load_h2d[layer_id][rank].copy()
++            experts_to_load.append(per_layer)
++
++        return experts_to_load
++
++    def _get_global_expert_map(self):
++        """Collect global expert maps from all model layers."""
++        model_runner = self.model_runner
++        model = model_runner.get_model()
++        num_dense_layers = getattr(model.config, "first_k_dense_replace", 0)
++        num_moe_layers = model.config.num_hidden_layers - num_dense_layers
++        all_layer_global_expert_map = []
++        for layer_id in range(num_moe_layers):
++            map_cpu = model.model.layers[num_dense_layers + layer_id].mlp.experts.global_expert_map.cpu()
++            all_layer_global_expert_map.append(map_cpu)
++        num_mtp_layers = self._get_mtp_num_layers()
++        if num_mtp_layers > 0:
++            drafter = getattr(model_runner, "drafter", None)
++            if drafter is not None and hasattr(drafter, "model"):
++                mtp_model = drafter.model
++                for module in mtp_model.modules():
++                    if isinstance(module, FusedMoE):
++                        all_layer_global_expert_map.append(module.global_expert_map.cpu())
++        return torch.stack(all_layer_global_expert_map)
++
++    def _get_mtp_num_layers(self) -> int:
++        if not self._is_mtp_speculative():
++            return 0
++
++        draft = getattr(self.vllm_config.speculative_config, "draft_model_config", None)
++        if draft is not None:
++            num = draft.get_total_num_hidden_layers()
++            if num > 0:
++                return num
++
++        hf = self.vllm_config.model_config.hf_config
++        for attr in ("num_nextn_predict_layers", "mtp_num_hidden_layers", "n_predict"):
++            num = getattr(hf, attr, None)
++            if num:
++                return num
++
++        raise RuntimeError("MTP layer count not found in model config; unsupported model configuration.")
++
++    def _is_mtp_speculative(self) -> bool:
++        spec_config = getattr(self.vllm_config, "speculative_config", None)
++        if spec_config is None:
++            return False
++        method = getattr(spec_config, "method", None)
++        return method == "mtp" or (isinstance(method, str) and method.endswith("_mtp"))
++
++    def load_expert_weights_to_cpu(self, experts_to_load, weight_name_to_tensor) -> dict[str, torch.Tensor]:
++        """Load specified expert weights from disk into CPU memory"""
++
++        weight_suffixes = BASE_WEIGHT_SUFFIXES.union(QUANT_WEIGHT_SUFFIXES) if self.quant else BASE_WEIGHT_SUFFIXES
++
++        def _generate_expert_weight_name(layer_id: int, expert_id: int, suffix: str) -> str:
++            """Generate the full parameter name for a single expert weight."""
++            if layer_id < num_hidden_layers:
++                return f"model.layers.{layer_id}.mlp.experts.{expert_id}.{suffix}"
++
++            mtp_local_idx = layer_id - num_hidden_layers
++            if mtp_local_idx >= num_mtp_layers:
++                raise RuntimeError(
++                    f"MTP layer index out of range: layer_id={layer_id}, "
++                    f"mtp_local_idx={mtp_local_idx}, num_mtp_layers={num_mtp_layers}"
++                )
++
++            model_type = getattr(self.vllm_config.model_config.hf_config, "model_type", "")
++            return _get_mtp_weight_path(model_type, mtp_local_idx, layer_id, expert_id, suffix)
++
++        num_dense_layers = getattr(self.model_runner.get_model().config, "first_k_dense_replace", 0)
++        num_hidden_layers = getattr(self.model_runner.get_model().config, "num_hidden_layers", 0)
++        num_mtp_layers = self._get_mtp_num_layers()
++        num_main_moe_layers = num_hidden_layers - num_dense_layers
++
++        weights_to_save = set()
++        for index, per_layer_experts in enumerate(experts_to_load):
++            layer_id = index + num_dense_layers
++            if per_layer_experts:
++                for pos, expert_id in per_layer_experts:
++                    for suffix in weight_suffixes:
++                        weights_to_save.add(_generate_expert_weight_name(layer_id, expert_id, suffix))
++
++        # MTP layers
++        if num_mtp_layers > 0:
++            for mtp_idx in range(num_mtp_layers):
++                layer_id = num_hidden_layers + mtp_idx
++                data_idx = num_main_moe_layers + mtp_idx
++                if data_idx < len(experts_to_load) and experts_to_load[data_idx]:
++                    for pos, expert_id in experts_to_load[data_idx]:
++                        for suffix in weight_suffixes:
++                            weights_to_save.add(_generate_expert_weight_name(layer_id, expert_id, suffix))
++
++        saved_expert_weights = {}
++        for weight_name in weights_to_save:
++            weight_tensor = weight_name_to_tensor[weight_name]
++            if weight_tensor.ndim >= 2:
++                weight_tensor = weight_tensor.transpose(0, 1).contiguous()
++            if any(weight_name.endswith(suffix) for suffix in QUANT_WEIGHT_SUFFIXES):
++                weight_tensor = torch.squeeze(weight_tensor)
++            saved_expert_weights[weight_name] = weight_tensor
++
++        return saved_expert_weights
++
++    def reload_expert_weights(self, experts_to_load, saved_weights: dict[str, torch.Tensor]) -> None:
++        """Load saved expert weights from CPU into the FusedMoE modules."""
++
++        def _load_single_expert(expert_id: int, target_index: int):
++            raw_prefix = f"{module.layer_name}.{expert_id}"
++            prefix = _resolve_mtp_weight_prefix(raw_prefix, saved_weights, f"{raw_prefix}.gate_proj.weight")
++            w1_key = f"{prefix}.gate_proj.weight"
++            w2_key = f"{prefix}.down_proj.weight"
++            w3_key = f"{prefix}.up_proj.weight"
++            w1_weight = saved_weights[w1_key]
++            w2_weight = saved_weights[w2_key]
++            w3_weight = saved_weights[w3_key]
++            if get_ascend_config().eplb_config.dynamic_eplb:
++                device = module.w2_weight_list[target_index].device
++                w2_expert_data = module.w2_weight_list[target_index]
++                w13_expert_data = module.w13_weight_list[target_index]
++            else:
++                device = module.w2_weight.device
++                w2_expert_data = module.w2_weight[target_index]
++                w13_expert_data = module.w13_weight[target_index]
++            module._load_w2(
++                expert_data=w2_expert_data,
++                shard_dim=1,
++                loaded_weight=w2_weight.to(device),
++                tp_rank=module.tp_rank,
++            )
++            module._load_w13(
++                expert_data=w13_expert_data,
++                shard_dim=1,
++                shard_id="w1",
++                loaded_weight=w1_weight.to(device),
++                tp_rank=module.tp_rank,
++            )
++            module._load_w13(
++                expert_data=w13_expert_data,
++                shard_dim=1,
++                shard_id="w3",
++                loaded_weight=w3_weight.to(device),
++                tp_rank=module.tp_rank,
++            )
++
++            if self.quant:
++                prefix = _resolve_mtp_weight_prefix(raw_prefix, saved_weights, f"{raw_prefix}.gate_proj.weight_scale")
++                s1_key = f"{prefix}.gate_proj.weight_scale"
++                s2_key = f"{prefix}.down_proj.weight_scale"
++                s3_key = f"{prefix}.up_proj.weight_scale"
++                o1_key = f"{prefix}.gate_proj.weight_offset"
++                o2_key = f"{prefix}.down_proj.weight_offset"
++                o3_key = f"{prefix}.up_proj.weight_offset"
++                w1_weight_scale = saved_weights[s1_key].to(device)
++                w2_weight_scale = saved_weights[s2_key].to(device)
++                w3_weight_scale = saved_weights[s3_key].to(device)
++                w1_weight_offset = saved_weights[o1_key].to(device)
++                w2_weight_offset = saved_weights[o2_key].to(device)
++                w3_weight_offset = saved_weights[o3_key].to(device)
++                module.w2_weight_offset.data[target_index].copy_(w2_weight_offset)
++                dynamic_merge_view(module.w13_weight_offset.data[target_index], w1_weight_offset, w3_weight_offset)
++                if get_ascend_config().eplb_config.dynamic_eplb:
++                    module.w2_weight_scale_list[target_index].copy_(w2_weight_scale)
++                    dynamic_merge_view(
++                        module.w13_weight_scale_fp32_list[target_index], w1_weight_scale, w3_weight_scale
++                    )
++                else:
++                    module.w2_weight_scale[target_index].copy_(w2_weight_scale)
++                    dynamic_merge_view(module.w13_weight_scale_fp32[target_index], w1_weight_scale, w3_weight_scale)
++
++        cur_layer_id = 0
++        for module in self.model_runner.get_model().modules():
++            if isinstance(module, FusedMoE):
++                if experts_to_load[cur_layer_id] is not None:
++                    for slot_pos, expert_id in experts_to_load[cur_layer_id]:
++                        _load_single_expert(expert_id=expert_id, target_index=slot_pos)
++
++                cur_layer_id += 1
++
++        draft_model = getattr(getattr(self.model_runner, "drafter", None), "model", None)
++        if draft_model is not None:
++            for module in draft_model.modules():
++                if isinstance(module, FusedMoE):
++                    if cur_layer_id < len(experts_to_load) and experts_to_load[cur_layer_id] is not None:
++                        for slot_pos, expert_id in experts_to_load[cur_layer_id]:
++                            _load_single_expert(expert_id=expert_id, target_index=slot_pos)
++                    cur_layer_id += 1
++
++    def update_eplb_adaptor_info(self, num_add_experts_per_rank, rank):
++        model_runner = self.model_runner
++        model_runner.eplb_adaptor.rank_id = rank
++        model_runner.eplb_adaptor.model.clear_all_moe_loads()
++        model_runner.shared_dict["moe_load"] = None
++        model_runner.eplb_updator.cur_iterations = 0
++
++        if num_add_experts_per_rank > 0:
++            model_runner.eplb_adaptor.init_buffer_tensor(num_add_experts_per_rank)
++
++        model_runner.eplb_adaptor.init_expert_param_per_layer()
++        cur_deployment = model_runner.shared_dict["expert_maps"]
++        for layer_id in range(cur_deployment.shape[0]):
++            model_runner.eplb_adaptor.do_clone_update_expert_map(layer_id, cur_deployment[layer_id][rank])
++
++    def gen_all_layer_log2phy(self, rank):
++        all_layer_log2phy = []
++        cur_deployment = self.model_runner.shared_dict["expert_maps"]
++        for layer_id in range(cur_deployment.shape[0]):
++            cur_layer_log2phy_map = generate_log2phy_map(cur_deployment[layer_id], rank)
++            all_layer_log2phy.append(cur_layer_log2phy_map)
++
++        num_mtp_layers = self._get_mtp_num_layers() or 0
++        _append_mtp_copies(all_layer_log2phy, num_mtp_layers)
++
++        return all_layer_log2phy
++
++    def d2d_transmission_for_scaling_down(self):
++        eplb_loader = self.model_runner.eplb_loader
++        eplb_adaptor = self.model_runner.eplb_adaptor
++        eplb_updator = self.model_runner.eplb_updator
++
++        all_layer_log2phy_map = []
++
++        for info in eplb_updator.update_info_all:
++            (expert_send_info, expert_recv_info, updated_expert_map, log2phy_map, layer_id) = info
++            log2phy_map_this_rank = torch.from_numpy(np.array(log2phy_map))
++            all_layer_log2phy_map.append(log2phy_map_this_rank)
++            eplb_loader.set_log2phy_map(log2phy_map_this_rank)
++            updated_expert_map_this_rank = torch.from_numpy(np.array(updated_expert_map))
++            eplb_loader.generate_expert_d2d_transfer_task(
++                expert_send_info,
++                expert_recv_info,
++                updated_expert_map_this_rank,
++                layer_id + eplb_adaptor.num_dense_layers,
++            )
++            reqs = []
++            eplb_loader.asyn_expert_weight_transfer(reqs)
++            eplb_loader.update_expert_map_and_weight(reqs)
++
++        eplb_updator.update_info_all.clear()
++
++        num_mtp_layers = self._get_mtp_num_layers() or 0
++        _append_mtp_copies(all_layer_log2phy_map, num_mtp_layers)
++
++        torch_npu.npu.synchronize()
++
++        return all_layer_log2phy_map
++
++    def update_parallel_config(self, update_config: dict[str, int]) -> None:
++        update_parallel_config(self.vllm_config, update_config)
++
++    def update_ep2dp_map(self, ep2dp_map, excluded_dp_ranks, rank_mapping):
++        return update_ep2dp_map(ep2dp_map, excluded_dp_ranks, rank_mapping)
++
++    def update_elastic_info(self, elastic_info, expert_num, raw_ep_size, ep2dp, share_expert_num: int = 0):
++        update_elastic_info(elastic_info, expert_num, raw_ep_size, ep2dp, share_expert_num)
++
++    def destroy_comm_group(self) -> None:
++        get_dp_group().destroy_cpu_group()
++        if get_ascend_config().eplb_config.dynamic_eplb:
++            get_dynamic_eplb_group().destroy_cpu_group()
++
++    def init_dp_cpu_group(self, coord_store, group_type="normal") -> None:
++        init_dp_cpu_group_impl(self.vllm_config, coord_store, group_type)
++
++    def reconfigure_moe(self, num_logical_expert, num_new_phy_experts, all_layer_log2phy):
++        reconfigure_moe(
++            self.model_runner,
++            self.vllm_config,
++            num_logical_expert,
++            num_new_phy_experts,
++            all_layer_log2phy,
++        )
++
++
++def init_dp_cpu_group_impl(vllm_config: VllmConfig, coord_store, group_type="normal") -> None:
++    """Initialize DP CPU group using TCP store for port coordination."""
++    listen_sockets = []
++    ports = []
++    if vllm_config.parallel_config.data_parallel_rank == 0:
++        for i in range(2):
++            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
++            sock.bind((vllm_config.parallel_config.data_parallel_master_ip, 0))
++            sock.listen()
++            listen_sockets.append(sock)
++            ports.append(sock.getsockname()[1])
++        coord_store.set(STORE_KEY, struct.pack(_PORTS_FMT, *ports))
++    else:
++        ports = list(struct.unpack(_PORTS_FMT, coord_store.get(STORE_KEY)))
++        listen_sockets = []
++
++    timeout = timedelta(seconds=vllm_config.parallel_config.gloo_timeout_seconds)
++
++    eplb_port, dp_port = ports
++    if get_ascend_config().eplb_config.dynamic_eplb:
++        get_dynamic_eplb_group().cpu_group = stateless_init_torch_distributed_process_group(
++            vllm_config.parallel_config.data_parallel_master_ip,
++            eplb_port,
++            vllm_config.parallel_config.data_parallel_rank,
++            vllm_config.parallel_config.data_parallel_size,
++            listen_socket=listen_sockets[0] if listen_sockets else None,
++            backend="gloo",
++            group_name=_get_unique_name("eplb_group"),
++        )
++        _set_pg_timeout(timeout=timeout, group=get_dynamic_eplb_group().cpu_group)
++
++    get_dp_group().cpu_group = stateless_init_torch_distributed_process_group(
++        vllm_config.parallel_config.data_parallel_master_ip,
++        dp_port,
++        vllm_config.parallel_config.data_parallel_rank,
++        vllm_config.parallel_config.data_parallel_size,
++        backend="gloo",
++        listen_socket=listen_sockets[1] if listen_sockets else None,
++        group_name=_get_unique_name("dp_group"),
++    )
++    _set_pg_timeout(timeout=timeout, group=get_dp_group().cpu_group)
++
++    for sock in listen_sockets:
++        with contextlib.suppress(OSError):
++            sock.close()
++
++
++@contextmanager
++def patch_get_all_weights(
++    saved_expert_weights_dict: dict[str, torch.Tensor] | None = None,
++    enable_fault_tolerance: bool = False,
++    drafter_model: torch.nn.Module | None = None,
++):
++    if saved_expert_weights_dict is None or not enable_fault_tolerance:
++        yield
++        return
++
++    from vllm.config import LoadConfig
++    from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
++
++    loader = get_model_loader(LoadConfig())
++    if not isinstance(loader, DefaultModelLoader):
++        logger.warning(
++            "Fault tolerance weight saving only supports DefaultModelLoader, "
++            "Current loader type: %s. "
++            "Scale-down weight reload will not available. ",
++            type(loader).__name__,
++        )
++        yield
++        return
++    original_get_all_weights = DefaultModelLoader.get_all_weights
++
++    def saving_get_all_weights(self_loader, model_config, model):
++        for name, tensor in original_get_all_weights(self_loader, model_config, model):
++            saved_expert_weights_dict[name] = tensor
++            yield name, tensor
++
++        if drafter_model is not None:
++            for name, tensor in original_get_all_weights(self_loader, model_config, drafter_model):
++                saved_expert_weights_dict[name] = tensor
++                yield name, tensor
++
++    DefaultModelLoader.get_all_weights = saving_get_all_weights
++    try:
++        yield
++    finally:
++        DefaultModelLoader.get_all_weights = original_get_all_weights
++
++
++def reconfigure_moe(
++    model_runner: NPUModelRunner,
++    vllm_config: VllmConfig,
++    num_global_logical_experts: int,
++    num_global_new_phy_experts: int,
++    log2phy: torch.Tensor,
++):
++    import vllm.envs as envs
++
++    parallel_config = vllm_config.parallel_config
++    new_ep_size = parallel_config.data_parallel_size * parallel_config.tensor_parallel_size
++    get_ascend_config().eplb_config.num_redundant_experts = num_global_new_phy_experts - num_global_logical_experts
++
++    moe_modules = [module for module in model_runner.get_model().modules() if isinstance(module, FusedMoE)]
++    draft_model = getattr(getattr(model_runner, "drafter", None), "model", None)
++    if draft_model is not None:
++        moe_modules.extend(module for module in draft_model.modules() if isinstance(module, FusedMoE))
++
++    for cur_layer_id, module in enumerate(moe_modules):
++        module.local_num_experts = num_global_new_phy_experts // new_ep_size
++        module.global_num_experts = num_global_new_phy_experts
++        module.global_redundant_expert_num = num_global_new_phy_experts - num_global_logical_experts
++        sp_size = module.sp_size
++        module.moe_parallel_config = FusedMoEParallelConfig.make(
++            tp_size_=get_tp_group().world_size,
++            pcp_size_=get_pcp_group().world_size,
++            dp_size_=get_dp_group().world_size,
++            vllm_parallel_config=parallel_config,
++            sp_size_=sp_size,
++        )
++        module.moe_config = FusedMoEConfig(
++            num_experts=module.global_num_experts,
++            experts_per_token=module.top_k,
++            hidden_dim=module.hidden_size,
++            intermediate_size_per_partition=module.intermediate_size_per_partition,
++            num_local_experts=module.local_num_experts,
++            num_logical_experts=num_global_logical_experts,
++            moe_parallel_config=module.moe_parallel_config,
++            in_dtype=module.vllm_config.model_config.dtype,
++            router_logits_dtype=None,
++            max_num_tokens=envs.VLLM_MOE_DP_CHUNK_SIZE,
++            has_bias=False,
++            is_act_and_mul=True,
++            is_lora_enabled=module.vllm_config.lora_config is not None,
++            activation=module.activation,
++            device=module.vllm_config.device_config.device,
++            routing_method=module.routing_method_type,
++        )
++        module.moe_config.num_experts = module.global_num_experts
++        module.moe_config.num_local_experts = module.local_num_experts
++        module.moe_config.global_redundant_expert_num = module.global_redundant_expert_num
++        module.log2phy.copy_(log2phy[cur_layer_id].npu(), non_blocking=True)
+Index: vllm_ascend/worker/worker.py
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/vllm_ascend/worker/worker.py b/vllm_ascend/worker/worker.py
+--- a/vllm_ascend/worker/worker.py	(revision 4a533861c9fcd6e181b67d7c75a037eb2898c5e0)
++++ b/vllm_ascend/worker/worker.py	(revision 24006ea06e41ee408ed78f31f17146bc3766a70b)
+@@ -31,7 +31,11 @@
+ from vllm.distributed import ensure_model_parallel_initialized, init_distributed_environment
+ from vllm.distributed.ec_transfer import ensure_ec_transfer_initialized
+ from vllm.distributed.kv_transfer import ensure_kv_transfer_initialized, get_kv_transfer_group, has_kv_transfer_group
+-from vllm.distributed.parallel_state import Handle, get_pp_group, get_tp_group
++from vllm.distributed.parallel_state import (
++    Handle,
++    get_pp_group,
++    get_tp_group,
++)
+ from vllm.logger import logger
+ from vllm.lora.request import LoRARequest
+ from vllm.sequence import IntermediateTensors
+@@ -61,6 +65,8 @@
+     register_ascend_customop,
+ )
+ from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
++from vllm_ascend.worker.sentinel.npu_worker_sentinel import NPUWorkerSentinel
++from vllm_ascend.worker.sentinel.scale_down import init_elastic_info, init_ep2dp_map, patch_get_all_weights
+ 
+ torch._dynamo.trace_rules.clear_lru_cache()  # noqa: E402
+ from torch._dynamo.variables import TorchInGraphFunctionVariable  # noqa: E402
+@@ -107,6 +113,7 @@
+         # init ascend config and soc version
+         init_ascend_config(vllm_config)
+         check_ascend_device_type()
++        self.weight_name_to_tensor = {}
+ 
+         super().__init__(
+             vllm_config=vllm_config,
+@@ -133,7 +140,7 @@
+ 
+         if "UnquantizedLinearMethod" in WEIGHT_LOADER_V2_SUPPORTED:
+             WEIGHT_LOADER_V2_SUPPORTED.remove("UnquantizedLinearMethod")
+-
++        self.worker_sentinel: NPUWorkerSentinel | None = None
+         self.use_v2_model_runner = envs_vllm.VLLM_USE_V2_MODEL_RUNNER
+         self._pp_send_work: list[Handle] = []
+ 
+@@ -154,6 +161,32 @@
+ 
+             signal.signal(signal.SIGTERM, signal_handler)
+             signal.signal(signal.SIGINT, signal_handler)
++        if self.vllm_config.parallel_config.enable_fault_tolerance:
++            self.ep2dp_map = init_ep2dp_map(
++                self.vllm_config.parallel_config.data_parallel_size,
++                self.vllm_config.parallel_config.tensor_parallel_size,
++            )
++            self.quant = self.model_config.quantization is not None
++            if hasattr(self.vllm_config.model_config.hf_config, "num_experts"):
++                self.num_logical_expert = self.vllm_config.model_config.hf_config.num_experts
++            elif hasattr(self.vllm_config.model_config.hf_config, "n_routed_experts"):
++                self.num_logical_expert = self.vllm_config.model_config.hf_config.n_routed_experts
++            else:
++                raise ValueError("unknown number of experts")
++
++            self.use_mask_mc2 = False
++            ep_size = (
++                self.vllm_config.parallel_config.data_parallel_size
++                * self.vllm_config.parallel_config.tensor_parallel_size
++            )
++            additional_config = self.vllm_config.additional_config or {}
++            eplb_cfg = additional_config.get("eplb_config", {})
++            num_redundant_experts = int(eplb_cfg.get("num_redundant_experts") or 0)
++            if num_redundant_experts and get_ascend_device_type() in {AscendDeviceType.A3}:
++                self.use_mask_mc2 = True
++
++            self.model_loaded = False
++            init_elastic_info(ep_size, self.num_logical_expert + num_redundant_experts)
+ 
+     def uninstall_static_kernel(self):
+         import fcntl
+@@ -246,6 +279,16 @@
+         self.cache_config.num_gpu_blocks = num_gpu_blocks
+         self.cache_config.num_cpu_blocks = num_cpu_blocks
+ 
++    def create_worker_sentinel(self, worker_cmd_addr: str):
++        assert self.vllm_config.parallel_config.enable_fault_tolerance is True, "enable_fault_tolerance is False"
++
++        self.worker_sentinel = NPUWorkerSentinel(
++            self.parallel_config,
++            self.device,
++            worker_cmd_addr,
++            self,
++        )
++
+     def _init_device(self):
+         device = torch.device(f"npu:{self.local_rank}")
+         torch.npu.set_device(device)
+@@ -436,8 +479,18 @@
+ 
+             context = nullcontext()  # type: ignore
+ 
++        if self.vllm_config.parallel_config.enable_fault_tolerance:
++            self.model_loaded = True
++            # todo Hot backup-related code has not yet been ported here.
++            self.model_runner._saved_expert_weights_dict = self.weight_name_to_tensor
++
+         with context, set_current_vllm_config(self.vllm_config):
+-            self.model_runner.load_model()
++            drafter = getattr(self.model_runner, "drafter_model", None)
++            drafter_model = getattr(drafter, "model", None)
++            with patch_get_all_weights(
++                self.weight_name_to_tensor, self.vllm_config.parallel_config.enable_fault_tolerance, drafter_model
++            ):
++                self.model_runner.load_model()
+ 
+     def compile_or_warm_up_model(self) -> float:
+         # Note: need to adapt for graph mode.
+@@ -639,6 +692,10 @@
+     def check_health(self) -> None:
+         import subprocess
+ 
++        if self.vllm_config.parallel_config.enable_fault_tolerance:
++            logger.info("Skipping health check: fault tolerance is enabled.")
++            return
++
+         logger.info("check_health Start!")
+         try:
+             result = subprocess.run(
+Index: vllm_ascend/eplb/core/eplb_device_transfer_loader.py
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/vllm_ascend/eplb/core/eplb_device_transfer_loader.py b/vllm_ascend/eplb/core/eplb_device_transfer_loader.py
+--- a/vllm_ascend/eplb/core/eplb_device_transfer_loader.py	(revision e68ef281c8563747d40db81424bf3fa2c87b7703)
++++ b/vllm_ascend/eplb/core/eplb_device_transfer_loader.py	(revision 069186a53e589167b501e56f0c7a25c3aa6db230)
+@@ -19,6 +19,7 @@
+ import torch.distributed as dist
+ from vllm.logger import logger
+ 
++from vllm_ascend.ascend_config import get_ascend_config
+ from vllm_ascend.distributed.parallel_state import get_dynamic_eplb_group
+ 
+ 
+@@ -37,7 +38,9 @@
+         self.state = ExpertWeightUpdateState.WAITING
+         self.recv_expert_list = []
+         self.num_layers = 0
+-        self.comm_group = get_dynamic_eplb_group()
++        self.comm_group = None
++        if get_ascend_config().eplb_config.dynamic_eplb:
++            self.comm_group = get_dynamic_eplb_group()
+ 
+     def set_adator(self, eplb_adaptor):
+         self.eplb_adaptor = eplb_adaptor
+Index: vllm_ascend/patch/platform/patch_multiproc_executor.py
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/vllm_ascend/patch/platform/patch_multiproc_executor.py b/vllm_ascend/patch/platform/patch_multiproc_executor.py
+--- a/vllm_ascend/patch/platform/patch_multiproc_executor.py	(revision e68ef281c8563747d40db81424bf3fa2c87b7703)
++++ b/vllm_ascend/patch/platform/patch_multiproc_executor.py	(revision 069186a53e589167b501e56f0c7a25c3aa6db230)
+@@ -275,6 +275,7 @@
+         daemon_mode = not (
+             os.getenv("DYNAMIC_EPLB", "false").lower() in ("true", "1")
+             or os.getenv("EXPERT_MAP_RECORD", "false") == "true"
++            or vllm_config.parallel_config.enable_fault_tolerance
+         )
+         proc = context.Process(
+             target=AscendWorkerProc.worker_main,
+Index: vllm_ascend/ops/rotary_embedding.py
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/vllm_ascend/ops/rotary_embedding.py b/vllm_ascend/ops/rotary_embedding.py
+--- a/vllm_ascend/ops/rotary_embedding.py	(revision 069186a53e589167b501e56f0c7a25c3aa6db230)
++++ b/vllm_ascend/ops/rotary_embedding.py	(revision 6898253c21315cf347beda3b2d7dd7b400454524)
+@@ -81,7 +81,7 @@
+         if hasattr(model_config.hf_text_config, "partial_rotary_factor"):
+             rope_dim = int(rope_dim * model_config.hf_text_config.partial_rotary_factor)
+         elif hasattr(model_config.hf_text_config, "rotary_dim"):
+-            rope_dim = int(model_config.hf_text_config.rotary_dim)
++            rope_dim = int(rope_dim * model_config.hf_text_config.rotary_dim)
+         _cos = torch.ones(1, max_num_batched_tokens, 1, rope_dim, dtype=dtype, device=device)
+         _sin = torch.zeros(1, max_num_batched_tokens, 1, rope_dim, dtype=dtype, device=device)
+ 
+@@ -96,6 +96,14 @@
+     global _cos_mla
+     global _sin_mla
+     num_tokens = positions.size(0)
++
++    # Dynamically expand caches if num_tokens exceeds pre-allocated size.
++    # This can happen in MTP draft model when cuda graph padding produces
++    # more tokens than max_num_batched_tokens.
++    if _cos_mla is None or _cos_mla.size(0) < num_tokens:
++        _cos_mla = torch.ones(num_tokens, 1, 1, cos.size(-1), dtype=cos.dtype, device=cos.device)
++        _sin_mla = torch.zeros(num_tokens, 1, 1, sin.size(-1), dtype=sin.dtype, device=sin.device)
++
+     _cos_mla[:num_tokens, ...] = cos
+     _sin_mla[:num_tokens, ...] = sin
+     return _cos_mla[:num_tokens, ...], _sin_mla[:num_tokens, ...]
+@@ -136,6 +144,17 @@
+         return
+ 
+     num_tokens = positions.size(0)
++
++    # Dynamically expand caches if num_tokens exceeds pre-allocated size.
++    # This can happen when cuda graph padding produces more tokens than
++    # max_num_batched_tokens.
++    if _cos.size(1) < num_tokens:
++        rope_dim = _cos.size(-1)
++        dtype = _cos.dtype
++        device = _cos.device
++        _cos = torch.ones(1, num_tokens, 1, rope_dim, dtype=dtype, device=device)
++        _sin = torch.zeros(1, num_tokens, 1, rope_dim, dtype=dtype, device=device)
++
+     _cos[:, :num_tokens] = (
+         _cos_sin_cache.index_select(0, positions).view(num_tokens, 2, -1).repeat(1, 1, 2).chunk(2, dim=-2)[0]
+     )
+@@ -274,7 +293,7 @@
+             "beta_fast": beta_fast,
+             "beta_slow": beta_slow,
+             "apply_yarn_scaling": apply_yarn_scaling,
+-            # TODO: current not support actual truncate，adaptation for extra parameters to be compatible with vllm
++            # TODO: current not support actual truncation，adaptation for extra parameters to be compatible with vllm
+             "truncate": truncate,
+         }
+         super().__init__(
+@@ -376,10 +395,10 @@
+             cos (`torch.Tensor`): The cosine part of the rotary embedding.
+             sin (`torch.Tensor`): The sine part of the rotary embedding.
+             position_ids (`torch.Tensor`):
+-                The position indices of the tokens corresponding to the query and key tensors. For example, this can be
+-                used to pass offsetted position ids when working with a KV-cache.
++                The position indices of the tokens corresponding to the query and key tensors. For example, this can
++                be used to pass offsetted position ids when working with a KV-cache.
+             unsqueeze_dim (`int`, *optional*, defaults to 1):
+-                The 'unsqueeze_dim' argument specifies the dimension along which to unsqueeze cos[position_ids] and
++                The `unsqueeze_dim` argument specifies the dimension along which to unsqueeze cos[position_ids] and
+                 sin[position_ids] so that they can be properly broadcasted to the dimensions of q and k. For example,
+                 note that cos[position_ids] and sin[position_ids] have the shape [batch_size, seq_len, head_dim].
+                 Then, if q and k have the shape [batch_size, heads, seq_len, head_dim], then setting unsqueeze_dim=1
+diff --git a/vllm_ascend/worker/sentinel/__init__.py b/vllm_ascend/worker/sentinel/__init__.py
+new file mode 100644
