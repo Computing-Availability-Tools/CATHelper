@@ -1,154 +1,146 @@
-# vLLM Scale-Down Design Document
+# vLLM 缩容设计文档
 
-## Architecture Overview
+## 架构概览
 
 ```
-                          External Monitor
+                          外部监控器
                           (scale_down.py)
                                 |
                     +-----------+-----------+
                     |                       |
-          ZMQ SUB (fault)        HTTP POST /fault_tolerance/apply
+          ZMQ SUB (故障)        HTTP POST /fault_tolerance/apply
                     |                       |
                     v                       v
             +-------+-------+     +--------+--------+
-            |  API Server   |     |  API Server     |
-            |  (FastAPI)    |     |  (FastAPI)      |
+            |   API服务器   |     |    API服务器    |
+            |   (FastAPI)  |     |    (FastAPI)    |
             +-------+-------+     +--------+--------+
                     |                       |
                     v                       v
             +-------+-----------------------+--------+
             |          ClientSentinel                 |
-            |  (one per vLLM instance)                |
-            |  - Receives fault reports via ZMQ       |
-            |  - Publishes engine health status       |
-            |  - Dispatches pause/retry/scale_down    |
+            |  （每个vLLM实例一个）                    |
+            |  - 通过ZMQ接收故障报告                  |
+            |  - 发布引擎健康状态                     |
+            |  - 分发暂停/重试/缩容指令               |
             +--+------------+------------+------------+
                |            |            |
       +--------+--+  +-----+------+  +--+--------+
       | EngineCore |  | EngineCore |  | EngineCore|
-      | Sentinel   |  | Sentinel   |  | Sentinel  |
+      |   哨兵     |  |   哨兵     |  |   哨兵    |
       | (DP rank 0)|  | (DP rank 1)|  | (DP rank 2)|
       +-----+------+  +-----+------+  +-----+-----+
             |                |               |
       +-----+----------------+---------------+-----+
-      |           EngineCore (busy loop)            |
-      |  wrapped with @fault_tolerant_wrapper       |
+      |           EngineCore（繁忙循环）             |
+      |      使用 @fault_tolerant_wrapper 包装       |
       +-----+----------------+---------------+-----+
             |                |               |
       +-----+------+  +-----+------+  +-----+------+
-      |   Worker   |  |   Worker   |  |   Worker   |
-      |  Sentinel  |  |  Sentinel  |  |  Sentinel  |
+      |   工作进程  |  |   工作进程  |  |   工作进程  |
+      |    哨兵    |  |    哨兵    |  |    哨兵     |
       |   (NPU)    |  |   (NPU)    |  |   (NPU)    |
       +------------+  +------------+  +------------+
 ```
 
-## Sentinel Hierarchy
+## 哨兵层级架构
 
-The fault tolerance framework uses a three-level sentinel architecture:
+容错框架采用三级哨兵架构：
 
-### 1. ClientSentinel (Top Level)
+### 1. ClientSentinel（顶层）
 
-- One per vLLM instance, runs in the API server process
-- Receives fault reports from all EngineCoreSentinels via ZMQ
-- Publishes engine health status to external systems (ZMQ PUB)
-- Dispatches fault tolerance instructions (pause/retry/scale_down) to engines
-- Handles external REST API requests
+- 每个vLLM实例一个，运行在API服务器进程中
+- 通过ZMQ接收所有EngineCoreSentinel的故障报告
+- 向外部系统发布引擎健康状态（ZMQ PUB）
+- 向引擎分发容错指令（暂停/重试/缩容）
+- 处理外部REST API请求
 
-### 2. EngineCoreSentinel (Middle Level)
+### 2. EngineCoreSentinel（中间层）
 
-- One per DP rank, runs in the EngineCore process
-- Monitors engine exceptions via `fault_signal_q`
-- Forwards fault info to ClientSentinel via ZMQ
-- Receives and executes instructions from ClientSentinel
-- Communicates with WorkerSentinels for worker-level operations
+- 每个数据并行等级一个，运行在EngineCore进程中
+- 通过 `fault_signal_q` 监控引擎异常
+- 通过ZMQ将故障信息转发给ClientSentinel
+- 接收并执行ClientSentinel的指令
+- 与WorkerSentinels通信，执行工作进程级操作
 
-### 3. WorkerSentinel (Bottom Level)
+### 3. WorkerSentinel（底层）
 
-- One per worker (NPU device), runs in the worker process
-- Receives commands from EngineCoreSentinel via ZMQ
-- Executes pause/retry operations at the NPU level
-- Manages EP rank masks for fault-tolerant all2all communication
+- 每个工作进程（NPU设备）一个，运行在工作进程中
+- 通过ZMQ接收EngineCoreSentinel的命令
+- 在NPU级别执行暂停/重试操作
+- 管理EP等级掩码，用于容错all2all通信
 
-## Fault Tolerance Workflow
+## 容错工作流
 
 ```
-    NPU Card Drop / Engine Crash
+    NPU卡掉线 / 引擎崩溃
                 |
                 v
     +-----------+-----------+
-    | 1. DETECTION          |
-    |   - DCMI polls health |
-    |   - Engine reports    |
-    |     via ZMQ           |
-    +-----------+-----------+
-                |
-                v
-    +-----------+-----------+
-    | 2. PAUSE              |
-    |   - Stop affected DP  |
-    |     ranks from        |
-    |     processing        |
-    |   - Preempt in-flight |
-    |     requests          |
+    | 1. 故障检测           |
+    |   - DCMI轮询健康状态  |
+    |   - 引擎通过ZMQ报告   |
     +-----------+-----------+
                 |
                 v
     +-----------+-----------+
-    | 3. SCALE DOWN         |
-    |   - Compute new rank  |
-    |     mapping           |
-    |   - Redistribute      |
-    |     experts (EPLB)    |
-    |   - Reload weights    |
+    | 2. 暂停               |
+    |   - 停止受影响的DP等级|
+    |   - 抢占进行中的请求  |
+    +-----------+-----------+
+                |
+                v
+    +-----------+-----------+
+    | 3. 缩容               |
+    |   - 计算新的等级映射  |
+    |   - 重新分配专家(EPLB)|
+    |   - 重载权重          |
     |     CPU -> NPU        |
-    |   - Reinit comm       |
-    |     groups (Gloo)     |
+    |   - 重新初始化通信组  |
+    |     (Gloo)            |
     +-----------+-----------+
                 |
                 v
     +-----------+-----------+
-    | 4. RESUME             |
-    |   - Remaining NPUs    |
-    |     continue serving  |
-    |   - Health status     |
-    |     published         |
+    | 4. 恢复               |
+    |   - 剩余NPU继续服务   |
+    |   - 发布健康状态      |
     +-----------+-----------+
 ```
 
-## Two Operation Modes
+## 两种操作模式
 
-### With External Monitor (NPU Hardware Faults)
+### 带外部监控器（NPU硬件故障）
 
-The monitor (`scale_down.py`) uses DCMI to poll NPU health. When a card failure is detected:
-1. Monitor sends `pause` instruction to freeze affected DP ranks
-2. Monitor sends `scale_down` instruction to remove failed ranks
-3. vLLM redistributes experts across remaining healthy NPUs
+监控器（`scale_down.py`）使用DCMI轮询NPU健康状态。当检测到卡故障时：
+1. 监控器发送 `pause` 指令，冻结受影响的DP等级
+2. 监控器发送 `scale_down` 指令，移除故障等级
+3. vLLM在剩余健康NPU上重新分配专家
 
-### Without Monitor (Any Engine Exception)
+### 不带监控器（任何引擎异常）
 
-The fault tolerance framework catches exceptions in the engine busy loop:
-1. `@fault_tolerant_wrapper` catches the exception
-2. Engine is paused and waits for instructions (up to `engine_recovery_timeout_sec`)
-3. User manually sends `retry` or `scale_down` via REST API
+容错框架在引擎繁忙循环中捕获异常：
+1. `@fault_tolerant_wrapper` 捕获异常
+2. 引擎暂停并等待指令（最多等待 `engine_recovery_timeout_sec`）
+3. 用户通过REST API手动发送 `retry` 或 `scale_down`
 
-## Key Design Decisions
+## 关键设计决策
 
-### ZMQ-Based Communication
+### 基于ZMQ的通信
 
-All inter-component communication uses ZMQ sockets for:
-- Low latency and high throughput
-- decoupled producer-consumer patterns
-- Support for async operations
+所有组件间通信使用ZMQ套接字，原因：
+- 低延迟和高吞吐量
+- 解耦的生产者-消费者模式
+- 支持异步操作
 
-### Stateful Health Tracking
+### 有状态健康跟踪
 
-ClientSentinel maintains `engine_status_dict` tracking each engine's state:
-- `healthy` - Engine operating normally
-- `paused` - Engine paused, waiting for instructions
-- `unhealthy` - Engine encountered an error
-- `dead` - Engine process has exited
+ClientSentinel维护 `engine_status_dict`，跟踪每个引擎的状态：
+- `healthy` - 引擎正常运行
+- `paused` - 引擎暂停，等待指令
+- `unhealthy` - 引擎遇到错误
+- `dead` - 引擎进程已退出
 
-### Graceful Degradation
+### 优雅降级
 
-When `engine_recovery_timeout_sec` expires without receiving instructions, the original exception is re-raised for standard error handling, ensuring the system fails predictably rather than hanging indefinitely.
+当 `engine_recovery_timeout_sec` 超时且未收到指令时，会重新抛出原始异常进行标准错误处理，确保系统可预测地失败，而不是无限期挂起。

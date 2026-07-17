@@ -1,46 +1,46 @@
-# Test Report
+# 测试报告
 
 ## v0.1.0
 
-- **Version:** v0.1.0
-- **Test Date:** 2026-07-16
-- **Tester:** a798347923
+- **版本:** v0.1.0
+- **测试日期:** 2026-07-16
+- **测试人员:** a798347923
 
-### Test Environment
+### 测试环境
 
-| Component | Version/Spec |
-|-----------|--------------|
-| Hardware | Huawei Ascend 910C |
-| Docker Image | `quay.io/ascend/vllm-ascend:v0.18.0-a3` |
+| 组件 | 版本/规格 |
+|------|----------|
+| 硬件 | 华为昇腾 910C |
+| Docker镜像 | `quay.io/ascend/vllm-ascend:v0.18.0-a3` |
 | vLLM | v0.18.0 |
 | vllm-ascend | v0.18.0 |
 
-### Tested Models
+### 测试模型
 
-| Model | Quantization | Status |
-|-------|--------------|--------|
-| DeepSeek-V3 (DSv3) | FP16 | Verified |
-| Qwen3-235B-A22B | W8A8 | Verified |
-| he | FP16 | Verified |
+| 模型 | 量化 | 状态 |
+|------|------|------|
+| DeepSeek-V3 (DSv3) | FP16 | 已验证 |
+| Qwen3-235B-A22B | W8A8 | 已验证 |
+| he | FP16 | 已验证 |
 
-### Test Results
+### 测试结果
 
-| Test Case | Status | Notes |
-|-----------|--------|-------|
-| Service startup with fault tolerance | | |
-| Engine health status reporting | | |
-| Pause instruction execution | | |
-| Retry instruction execution | | |
-| Scale-down instruction execution | | |
-| NPU hardware fault detection (with monitor) | | |
-| Engine exception handling (without monitor) | | |
+| 测试用例 | 状态 | 备注 |
+|----------|------|------|
+| 服务启动与容错 | | |
+| 引擎健康状态报告 | | |
+| 暂停指令执行 | | |
+| 重试指令执行 | | |
+| 缩容指令执行 | | |
+| NPU硬件故障检测（带监控器） | | |
+| 引擎异常处理（无监控器） | | |
 | REST API /fault_tolerance/status | | |
 | REST API /fault_tolerance/apply | | |
-| Multi-DP rank failover | | |
-| Expert redistribution after scale-down | | |
-| `--enforce-eager` mode | | |
-| PIECEWISE ACL Graph mode | | |
+| 多数据并行等级故障转移 | | |
+| 缩容后专家重新分配 | | |
+| `--enforce-eager` 模式 | | |
+| PIECEWISE ACL Graph 模式 | | |
 
-### Summary
+### 总结
 
-<!-- Fill in after testing -->
+<!-- 测试后填写 -->

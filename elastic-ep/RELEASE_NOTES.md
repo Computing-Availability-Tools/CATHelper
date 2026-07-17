@@ -1,38 +1,38 @@
-# Release Notes
+# 发布说明
 
 ## v0.1.0
 
-- **Version:** v0.1.0
-- **Release Date:** 2026-07-16
-- **Releaser:** a798347923
+- **版本:** v0.1.0
+- **发布日期:** 2026-07-16
+- **发布人员:** a798347923
 
-### Features
+### 功能特性
 
-- Core fault tolerance framework with three-level sentinel hierarchy (ClientSentinel, EngineCoreSentinel, WorkerSentinel)
-- ZMQ-based communication for fault reporting and instruction dispatch
-- REST API for external fault tolerance control (`/fault_tolerance/apply`, `/fault_tolerance/status`)
-- Graceful scale-down: pause affected ranks, redistribute experts, reload weights, reinitialize communication groups
-- Dynamic EPLB integration for expert load balancing after fault
-- External NPU hardware fault monitor via DCMI polling
-- `--enforce-eager` mode support
-- PIECEWISE ACL Graph mode support
-- MTP (Multi-Token Prediction) support
+- 核心容错框架，采用三级哨兵层级架构（ClientSentinel、EngineCoreSentinel、WorkerSentinel）
+- 基于ZMQ的通信机制，用于故障报告和指令分发
+- REST API，用于外部容错控制（`/fault_tolerance/apply`、`/fault_tolerance/status`）
+- 优雅缩容：暂停受影响的等级、重新分配专家、重载权重、重新初始化通信组
+- 动态EPLB集成，用于故障后专家负载均衡
+- 通过DCMI轮询实现外部NPU硬件故障监控
+- `--enforce-eager` 模式支持
+- PIECEWISE ACL Graph 模式支持
+- MTP（多令牌预测）支持
 
-### Tested Models
+### 测试模型
 
 - DeepSeek-V3 (DSv3)
 - Qwen3-235B-A22B
 - GLM5
 
-### Known Issues
+### 已知问题
 
-During the **second scale-down**, the following issues may occasionally occur:
+在**第二次缩容**期间，偶尔可能出现以下问题：
 
-1. Fault weight loading time significantly increases
-2. `stop device` cannot stop, blocking the scale-down flow
-3. Worker stuck in `input_event` synchronization after recovery
+1. 故障权重加载时间显著增加
+2. `stop device` 无法停止，阻塞缩容流程
+3. 恢复后工作进程卡在 `input_event` 同步中
 
-### Patches
+### 补丁
 
-- `patches/vllm_scale_down.patch`: Core fault tolerance framework for vLLM v0.18.0
-- `patches/vllm_ascend_scale_down.patch`: Ascend-specific adaptations for vllm-ascend v0.18.0
+- `patches/vllm_scale_down.patch`：vLLM v0.18.0核心容错框架
+- `patches/vllm_ascend_scale_down.patch`：vllm-ascend v0.18.0昇腾特定适配
