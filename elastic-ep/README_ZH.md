@@ -1,4 +1,4 @@
-# vLLM Scale-Down
+# vLLM Elastic EP
 
 [English](README.md)
 
@@ -6,7 +6,7 @@
 
 ## 概述
 
-vLLM Scale-Down 使 vLLM 能够**容忍 NPU 故障而无需重启**。当 NPU 卡掉线或变得不健康时，系统自动检测故障、暂停受影响的 DP rank、缩容并重新分配专家，在剩余健康 NPU 上恢复服务。
+vLLM Elastic EP 使 vLLM 能够**容忍 NPU 故障而无需重启**。当 NPU 卡掉线或变得不健康时，系统自动检测故障、暂停受影响的 DP rank、缩容并重新分配专家，在剩余健康 NPU 上恢复服务。
 
 ## 核心特性
 

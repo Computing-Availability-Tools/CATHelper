@@ -1,4 +1,4 @@
-# vLLM Scale-Down
+# vLLM Elastic EP
 
 [中文](README_ZH.md)
 
@@ -6,7 +6,7 @@ Elastic fault tolerance for [vLLM](https://github.com/vllm-project/vllm) on Huaw
 
 ## Overview
 
-vLLM Scale-Down enables vLLM to **survive NPU failures** without restarting. When a NPU card drops or becomes unhealthy, the system detects the fault, pauses affected data-parallel ranks, scales down by redistributing experts, and resumes serving on the remaining healthy NPUs.
+vLLM Elastic EP enables vLLM to **survive NPU failures** without restarting. When a NPU card drops or becomes unhealthy, the system detects the fault, pauses affected data-parallel ranks, scales down by redistributing experts, and resumes serving on the remaining healthy NPUs.
 
 ## Key Features
 
