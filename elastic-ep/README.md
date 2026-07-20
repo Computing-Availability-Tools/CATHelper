@@ -6,7 +6,7 @@ Elastic fault tolerance for [vLLM](https://github.com/vllm-project/vllm) on Huaw
 
 ## Overview
 
-vLLM Elastic EP enables vLLM to **survive NPU failures** without restarting. When a NPU card drops or becomes unhealthy, the system detects the fault, pauses affected data-parallel ranks, scales down by redistributing experts, and resumes serving on the remaining healthy NPUs.
+vLLM Elastic EP enables vLLM to **survive NPU failures** without restarting. When an NPU card drops or becomes unhealthy, the system detects the fault, pauses affected data-parallel ranks, scales down by redistributing experts, and resumes serving on the remaining healthy NPUs.
 
 ## Key Features
 
@@ -145,7 +145,7 @@ During the **second scale-down**, the following issues may occasionally occur:
 This feature has been verified on the following models:
 
 - DeepSeek-V3 (DSv3)
-- Qwen3-235B-A22B 
+- Qwen3-235B-A22B
 - GLM5
 
 Other model types may have compatibility issues.
