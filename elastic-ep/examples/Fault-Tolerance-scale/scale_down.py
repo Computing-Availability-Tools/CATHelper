@@ -187,13 +187,12 @@ def listen_fault_event(host, port):
 
 def pause(host, port, timeout, exclude_dp_rank=None):
     url = f"http://{host}:{port}/fault_tolerance/apply"
+    params = {"timeout": timeout}
+    if exclude_dp_rank is not None:
+        params["exclude_engine_index"] = exclude_dp_rank
     payload = {
-        "fault_tolerance_instruction": "pause",
-        "fault_tolerance_timeout": timeout,
-        "fault_tolerance_params": {
-            "soft_pause": False,
-            "exclude_index": exclude_dp_rank,
-        },
+        "instruction": "pause",
+        "params": params,
     }
 
     headers = {"Content-Type": "application/json"}
@@ -222,9 +221,8 @@ def pause(host, port, timeout, exclude_dp_rank=None):
 def scale(host, port, timeout, exclude_dp_ranks):
     url = f"http://{host}:{port}/fault_tolerance/apply"
     payload = {
-        "fault_tolerance_instruction": "scale_down",
-        "fault_tolerance_timeout": timeout,
-        "fault_tolerance_params": {"exclude_dp_ranks": exclude_dp_ranks},
+        "instruction": "scale_down",
+        "params": {"timeout": timeout, "exclude_dp_ranks": exclude_dp_ranks},
     }
     headers = {"Content-Type": "application/json"}
 
@@ -262,7 +260,7 @@ def start_monitor_engine_status(host, port, timeout, external_fault_notify_port)
 def monitor_machine_fault(host, port, recover_timeout, interval_time):
     lib.dcmi_init()
     device_list = get_device_list()
-    print(device_list)
+    print(f"Monitoring {len(device_list)} devices")
     global ALL_NPUS, active_npus
 
     while True:
@@ -302,7 +300,7 @@ def monitor_machine_fault(host, port, recover_timeout, interval_time):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Test scale down functionality"
+        description="NPU hardware fault monitor for vLLM fault tolerance"
     )
     parser.add_argument("--host", default="localhost", help="API server host")
     parser.add_argument("--port", type=int, default=8006, help="API server port")

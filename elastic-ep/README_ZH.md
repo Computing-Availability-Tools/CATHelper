@@ -110,7 +110,7 @@ curl http://localhost:8006/fault_tolerance/status
 ```bash
 curl -X POST http://localhost:8006/fault_tolerance/apply \
     -H "Content-Type: application/json" \
-    -d '{"instruction":"retry"}'
+    -d '{"instruction":"retry","params":{"timeout":30}}'
 ```
 
 **缩容（排除指定 DP rank）：**
@@ -127,7 +127,9 @@ curl -X POST http://localhost:8006/fault_tolerance/apply \
 |------|------|------|
 | 动态 EPLB | 已完全适配 | 故障后通过 EPLB 框架重新平衡专家放置 |
 | 量化模型（W8A8） | 已支持 | Ascend 格式 W8A8 量化模型已完成适配 |
+| 量化模型（W4A8） | 暂不支持 | W4A8 量化尚未适配 |
 | MTP（多 Token 预测） | 已支持 | 已完成适配，在 GLM5 上完成测试 |
+| `--enforce-eager` 模式 | 已支持 | 禁用图捕获，在急切模式下运行 |
 | PIECEWISE ACL Graph 模式 | 已支持 | 大模型分块图捕获 |
 
 ## 已知问题（v0.1.0）

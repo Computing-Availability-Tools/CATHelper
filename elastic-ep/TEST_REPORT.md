@@ -21,26 +21,26 @@
 |------|------|------|
 | DeepSeek-V3 (DSv3) | FP16 | 已验证 |
 | Qwen3-235B-A22B | W8A8 | 已验证 |
-| he | FP16 | 已验证 |
+| GLM5 | FP16 | 已验证 |
 
 ### 测试结果
 
 | 测试用例 | 状态 | 备注 |
 |----------|------|------|
-| 服务启动与容错 | | |
-| 引擎健康状态报告 | | |
-| 暂停指令执行 | | |
-| 重试指令执行 | | |
-| 缩容指令执行 | | |
-| NPU硬件故障检测（带监控器） | | |
-| 引擎异常处理（无监控器） | | |
-| REST API /fault_tolerance/status | | |
-| REST API /fault_tolerance/apply | | |
-| 多数据并行等级故障转移 | | |
-| 缩容后专家重新分配 | | |
-| `--enforce-eager` 模式 | | |
-| PIECEWISE ACL Graph 模式 | | |
+| 服务启动与容错 | 通过 | |
+| 引擎健康状态报告 | 通过 | |
+| 暂停指令执行 | 通过 | |
+| 重试指令执行 | 通过 | |
+| 缩容指令执行 | 通过 | 第二次缩容偶现已知问题 |
+| NPU硬件故障检测（带监控器） | 通过 | |
+| 引擎异常处理（无监控器） | 通过 | |
+| REST API /fault_tolerance/status | 通过 | |
+| REST API /fault_tolerance/apply | 通过 | |
+| 多数据并行等级故障转移 | 通过 | |
+| 缩容后专家重新分配 | 通过 | |
+| `--enforce-eager` 模式 | 通过 | |
+| PIECEWISE ACL Graph 模式 | 通过 | |
 
 ### 总结
 
-<!-- 测试后填写 -->
+v0.1.0 在 DeepSeek-V3、Qwen3-235B-A22B、GLM5 三个模型上完成验证，所有核心测试用例通过。已知第二次缩容时存在权重加载慢、stop device 阻塞、worker 同步卡住等问题（见 [README](README.md#known-issues-v010)）。W4A8 量化模型暂未适配。

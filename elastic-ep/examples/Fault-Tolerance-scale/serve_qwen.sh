@@ -1,4 +1,5 @@
 #!/bin/bash
+set -e
 
 HOST="0.0.0.0"
 PORT=8006
@@ -73,23 +74,26 @@ done
 
 echo "Starting vLLM server for $MODEL_NAME with data parallel size: $DATA_PARALLEL_SIZE and redundant experts: $REDUNDANT_EXPERTS"
 
-export DYNAMIC_EPLB="true"
 export HCCL_BUFFSIZE=2048
 
-vllm serve $LOCAL_MODEL_PATH \
-    --served-model-name $MODEL_NAME \
-    --data-parallel-size $DATA_PARALLEL_SIZE \
-    --data-parallel-size-local $DATA_PARALLEL_SIZE \
+if [[ "$REDUNDANT_EXPERTS" -gt 0 ]]; then
+    export DYNAMIC_EPLB="true"
+fi
+
+vllm serve "$LOCAL_MODEL_PATH" \
+    --served-model-name "$MODEL_NAME" \
+    --data-parallel-size "$DATA_PARALLEL_SIZE" \
+    --data-parallel-size-local "$DATA_PARALLEL_SIZE" \
     --enable-expert-parallel \
     --enable-fault-tolerance \
     --fault-tolerance-config '{"external_fault_notify_port":'$FAULT_PORT',"engine_recovery_timeout_sec":'$RECOVERY_TIMEOUT'}' \
     --api-server-count 1 \
     --trust-remote-code \
-    --gloo-timeout-seconds $GLOO_TIMEOUT \
+    --gloo-timeout-seconds "$GLOO_TIMEOUT" \
     --enable-auto-tool-choice \
     --tool-call-parser hermes \
     --additional-config '{"eplb_config":{"dynamic_eplb": true, "num_redundant_experts":'${REDUNDANT_EXPERTS}'}}' \
     --quantization ascend \
-    --host $HOST \
-    --port $PORT \
+    --host "$HOST" \
+    --port "$PORT" \
     --max-cudagraph-capture-size 512

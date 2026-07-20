@@ -64,8 +64,7 @@
 {
     "instruction": "pause | retry | scale_down",
     "params": {
-        "timeout": 30,
-        "exclude_dp_ranks": [2]
+        "timeout": 30
     }
 }
 ```
@@ -115,4 +114,4 @@
 | 故障状态PUB/SUB | ZMQ PUB/SUB | ClientSentinel -> 外部 | 广播引擎健康状态 |
 | 容错请求/结果 | ZMQ DEALER/PUSH | ClientSentinel -> 引擎 | 分发暂停/重试/缩容指令 |
 | 工作进程命令 | ZMQ ROUTER/DEALER | EngineCore -> 工作进程 | 工作进程级控制 |
-| HTTP API | REST | 外部 -> API服务器 | 外部容错控制
+| HTTP API | REST | 外部 -> API服务器 | 外部容错控制 |
