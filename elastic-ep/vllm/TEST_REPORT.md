@@ -13,8 +13,8 @@
 
 验证容错框架核心功能的正确性，包括：
 
-- 三个哨兵类（ClientSentinel、EngineCoreSentinel、NPUWorkerSentinel）所有 public 方法路径覆盖
-- 端到端容错恢复：故障检测→暂停→容错恢复（retry/scale_down）全链路
+- 三个哨兵类（ClientSentinel、EngineCoreSentinel、NPUWorkerSentinel）所有 public 方法
+- 端到端容错恢复：故障检测→暂停→容错恢复（retry/scale_down）
 
 ### 1.2 测试结果汇总
 
@@ -121,7 +121,7 @@
 | 故障暂停 - 健康 EngineCore 正确进入暂停状态 | PASS |
 | retry 恢复 - 瞬时故障恢复后服务正常 | PASS |
 | scale_down 恢复 - 故障 rank 移除后推理服务正常 | PASS |
-| 精度测试 - 恢复后推理精度无回归 | PASS |
+| 精度测试 - 恢复后推理精度正常 | PASS |
 
 #### 汇总
 

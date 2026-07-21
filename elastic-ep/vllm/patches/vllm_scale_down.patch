@@ -1,0 +1,4362 @@
+Subject: [PATCH] [Bugfix]: fix incorrect filter when calling handle fault and unify the destroying logic for torch-native and stateless gloo pg(#232)
+clear fault flag in client sentinel after the successful retry (#231)
+fix: use passed timeout param in drain_stale_executor_responses (#226)
+fix: drain stale executor responses after health check in fault_toler… (#225)
+[feature]: add support for multi-api-count,sync scale_down config via pub/sub to all API server processes (#223)
+kill engine process after executor failure + drain engine batch_queue when exception is raised (#222)
+[BugFix] Update gloo timeout (#220)
+ensure the successful return of pause state (#219)
+[Bugfix] Log errors in the recovery
+[BugFix] Update engine_index on scale_down to prevent coordinator IndexError
+[Refactor] remove scale_down from base sentinel
+let engine check worker responsiveness before reporting the error
+fix: race condition in scale_down resume and clean up dead code in retry
+Refactor client_sentinel, remove redundant parameters
+[BugFix] Update engine_status_dict after scale_down (#217)
+[Bugfix]: use self.engine_identity instead of self.identity for Fault… (#216)
+[Bugfix] merge send_engine_registry two recv_multipart into one (#215)
+fix: make FaultInfo.engine_id optional, fix undefined engine_identity bug (#213)
+update EngineCoreSentinel shutdown: delete self.engine_core.shutdown() (#212)
+format fixed
+retry() asserts comm.all2all_manager before checking whether the configured all2all backend supports fault tolerance. For unsupported backends (or if all2all_manager is unset), this will crash the worker instead of returning a clean failure result.
+ClientSentinel now requires a core_client argument and accesses core_client.core_engines / core_client.engine_registry during init. The test fixture constructs ClientSentinel without providing core_client, so this test will fail with TypeError before exercising any behavior.
+replace print to logger.info
+EngineCoreSentinel.init now requires an engine_core argument, but create_engine_core_sentinel() constructs it without one. The test will fail with TypeError during setup.
+In shutdown, sys.exit() is called before self.engine_core_sentinel.shutdown(), making the sentinel shutdown code completely unreachable. We should shut down the sentinel first before exiting the process.
+The return value of self._execute_command_on_workers is ignored in retry. If the workers fail to recover or time out, the retry operation will still return success=True, leading to silent failures and inconsistent cluster states. We should capture and return the result of the worker command execution.
+fix bug for died is not defined
+feat: migrate _pick_stateless_dp_port for reliable DP port selection
+fix bug for scale down in release v0.18.0
+rename descale to scale_down (#210)
+correct irregular code specifications
+feat: use tcp store to rebuild comm Signed-off-by: zWaNg3 <389750525@qq.com>
+rebase fault_tolerance retry
+rebase fault_tolerance retry
+Add vLLM configuration for ePLB load balancing upon fault.
+rebase vllm-0.18
+feat(fault-tolerance): add retry mechanism to the fault tolerance framework
+Simplify pause logic in model runner and check mask for ft backend in AsyncGPUModelRunnerOutput
+fix: Fix DT test cases and add gloo_timeout_seconds validation
+Create worker sentinel through collective_rpc
+Set gloo timeout seconds in parallel config and pass directly to create process group
+Add fault tolerance instruction workflow and pause operation
+enable fault tolerance if ft config is provided
+Rename func in client sentinel.
+fix: fix fault_tolerance_addresses overwrite by rank0 in external/hybrid mode
+refactor: optimize sentinel logging,and refactor ctx initialization
+Fix DT
+Improve the comments
+set engine_recovery_timeout_sec as attr of engine core sentinel
+refactor: Refactor Sentinel class and move fault_tolerance_config from VllmConfig to ParallelConfig
+chore: remove Chinese comments
+refactor: Refactor Sentinel class and move fault_tolerance_config from VllmConfig to ParallelConfig
+Clean notify_engine_down logic
+Support elastic ep
+Fault Tolerant EP: Implement fault-report
+---
+Index: tests/v1/fault_tolerance/test_client_sentinel.py
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/tests/v1/fault_tolerance/test_client_sentinel.py b/tests/v1/fault_tolerance/test_client_sentinel.py
+new file mode 100644
+--- /dev/null	(revision 7f967c5e6acebde7907ba678280125d77cf20ca8)
++++ b/tests/v1/fault_tolerance/test_client_sentinel.py	(revision 7f967c5e6acebde7907ba678280125d77cf20ca8)
+@@ -0,0 +1,190 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++import asyncio
++from unittest.mock import AsyncMock, Mock, patch
++
++import msgspec.msgpack
++import pytest
++import zmq
++
++from vllm.config import FaultToleranceConfig, ParallelConfig
++from vllm.v1.engine import EngineStatusType
++from vllm.v1.fault_tolerance.client_sentinel import ClientSentinel
++from vllm.v1.fault_tolerance.utils import FaultInfo, FaultToleranceRequest
++
++pytestmark = pytest.mark.skip_global_cleanup
++
++
++@pytest.fixture
++def mock_ft_addresses():
++    """Create mock FaultToleranceZmqAddresses object"""
++    addresses = Mock()
++    addresses.ft_request_addresses = ["tcp://127.0.0.1:5555"]
++    addresses.ft_result_addresses = ["tcp://127.0.0.1:5556"]
++    addresses.engine_fault_socket_addr = "tcp://127.0.0.1:5557"
++    addresses.fault_state_pub_socket_addr = "tcp://127.0.0.1:5558"
++    return addresses
++
++
++@pytest.fixture
++def mock_call_utility_async():
++    """Create mock call_utility_async function"""
++    return AsyncMock(
++        return_value={"request_id": "request_id", "success": True, "reason": None}
++    )
++
++
++@pytest.fixture
++def mock_parallel_config():
++    """Create mock ParallelConfig object"""
++    config = Mock(spec=ParallelConfig)
++
++    config.data_parallel_index = 0
++    config.data_parallel_size = 2
++    config.data_parallel_size_local = 2
++    config.local_engines_only = False
++    config.gloo_timeout_seconds = 5
++    config.fault_tolerance_config = FaultToleranceConfig()
++    return config
++
++
++@pytest.fixture
++def client_sentinel(mock_parallel_config, mock_ft_addresses, mock_call_utility_async):
++    """Create ClientSentinel fixture with mocked sockets."""
++    fault_receiver_socket = AsyncMock()
++
++    with (
++        patch(
++            "vllm.v1.fault_tolerance.client_sentinel.make_zmq_socket",
++            return_value=fault_receiver_socket,
++        ),
++        patch("vllm.v1.fault_tolerance.client_sentinel.asyncio.create_task"),
++    ):
++        core_client = Mock()
++        core_client.core_engines = [b"engine_0", b"engine_1"]
++        core_client.engine_registry = {0: b"engine_0", 1: b"engine_1"}
++        sentinel = ClientSentinel(
++            parallel_config=mock_parallel_config,
++            fault_tolerance_addresses=mock_ft_addresses,
++            call_utility_async=mock_call_utility_async,
++            core_engines=[b"engine_0", b"engine_1"],
++            core_client=core_client,
++        )
++
++    return sentinel
++
++
++# -------------------------- Test Cases --------------------------
++@pytest.mark.asyncio
++async def test_client_sentinel_initialization(client_sentinel: ClientSentinel):
++    """Test ClientSentinel initialization logic."""
++    assert client_sentinel.engine_status_dict == {
++        0: {"status": "healthy"},
++        1: {"status": "healthy"},
++    }
++    assert client_sentinel.start_rank == 0
++    assert client_sentinel.fault_receiver_socket is not None
++    assert client_sentinel.fault_state_pub_socket is not None
++    assert client_sentinel._shutdown_task is None
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("ft_operation", ["pause", "retry"])
++async def test_ft_operation(
++    client_sentinel: ClientSentinel, mock_call_utility_async, ft_operation: str
++):
++    """Test pause method"""
++    # Mock all engines to pause successfully
++    mock_call_utility_async.return_value = {
++        "request_id": "request_id",
++        "success": True,
++        "reason": None,
++    }
++
++    request = FaultToleranceRequest.builder(
++        request_id="request_id",
++        instruction=ft_operation,
++        params={"timeout": 3},
++    )
++
++    # Execute pause
++    result = await client_sentinel.pause(request)
++
++    # Verify result
++    assert result.request_id == "request_id"
++    assert result.success is True
++    assert result.reason is None
++
++    # Verify call parameters
++    assert mock_call_utility_async.call_count == 2
++    for call in mock_call_utility_async.call_args_list:
++        assert call.args[0] == "handle_fault"
++        assert call.args[1] == request
++        assert call.kwargs["engine"] in {b"engine_0", b"engine_1"}
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("ft_operation", ["pause", "retry"])
++async def test_ft_operation_timeout(
++    client_sentinel: ClientSentinel, mock_call_utility_async, ft_operation: str
++):
++    """Pause should fail if engine responses exceed request timeout."""
++
++    async def slow_response(*args, **kwargs):
++        await asyncio.sleep(0.1)
++        return {"request_id": "request_id", "success": True, "reason": None}
++
++    mock_call_utility_async.side_effect = slow_response
++
++    request = FaultToleranceRequest.builder(
++        request_id="request_id",
++        instruction=ft_operation,
++        params={"timeout": 0.01},
++    )
++
++    result = await client_sentinel.pause(request)
++
++    assert result.request_id == "request_id"
++    assert result.success is False
++    assert result.reason == "Timed out after 0.01s waiting for engine responses."
++
++
++@pytest.mark.asyncio
++async def test_monitor_and_report_on_fault(client_sentinel: ClientSentinel):
++    """Fault should update status and publish fault-state report."""
++    fault_info = FaultInfo(
++        engine_id="0",
++        type="EngineDeadError",
++        message="dead",
++        engine_status=EngineStatusType.DEAD,
++    )
++    client_sentinel.fault_receiver_socket.recv_multipart = AsyncMock(
++        side_effect=[
++            [b"", b"", msgspec.msgpack.encode(fault_info)],
++            zmq.ZMQError(),
++        ]
++    )
++
++    await client_sentinel.run()
++
++    assert client_sentinel.engine_status_dict[0]["status"] == "dead"
++    client_sentinel.fault_state_pub_socket.send_multipart.assert_awaited_once()
++
++    sent_topic, sent_payload = (
++        client_sentinel.fault_state_pub_socket.send_multipart.await_args.args[0]
++    )
++    assert sent_topic == b"vllm_fault"
++    assert msgspec.msgpack.decode(sent_payload) == {
++        "total_engines": 2,
++        "engines": [{"id": 0, "status": "dead"}, {"id": 1, "status": "healthy"}],
++    }
++
++
++@pytest.mark.asyncio
++async def test_shutdown(client_sentinel: ClientSentinel):
++    """Test shutdown method."""
++    with patch("vllm.v1.fault_tolerance.client_sentinel.close_sockets") as mock_close:
++        client_sentinel.shutdown()
++
++    assert mock_close.call_count == 2
++    assert client_sentinel.sentinel_dead is True
+Index: tests/v1/fault_tolerance/test_engine_core_sentinel.py
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/tests/v1/fault_tolerance/test_engine_core_sentinel.py b/tests/v1/fault_tolerance/test_engine_core_sentinel.py
+new file mode 100644
+--- /dev/null	(revision bfa2cc9e34ab8213723fc77f1956d19c78d4a758)
++++ b/tests/v1/fault_tolerance/test_engine_core_sentinel.py	(revision bfa2cc9e34ab8213723fc77f1956d19c78d4a758)
+@@ -0,0 +1,141 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++import queue
++import socket
++import time
++from typing import Any
++from unittest.mock import Mock, patch
++
++import pytest
++import zmq
++from msgspec import msgpack
++
++from vllm.config import FaultToleranceConfig, ParallelConfig
++from vllm.v1.engine import EngineCoreRequestType
++from vllm.v1.fault_tolerance import EngineCoreSentinel
++from vllm.v1.fault_tolerance.utils import (
++    FaultInfo,
++    FaultToleranceRequest,
++)
++from vllm.v1.utils import get_engine_client_zmq_addr
++
++pytestmark = pytest.mark.skip_global_cleanup
++
++
++def _find_free_port() -> int:
++    with socket.socket() as s:
++        s.bind(("127.0.0.1", 0))
++        return s.getsockname()[1]
++
++
++@pytest.fixture
++def addr_dict():
++    ports = [_find_free_port() for _ in range(3)]
++    return {
++        "client_cmd_addr": f"tcp://127.0.0.1:{ports[0]}",
++        "worker_cmd_addr": f"tcp://127.0.0.1:{ports[1]}",
++        "engine_fault_socket_addr": f"tcp://127.0.0.1:{ports[2]}",
++    }
++
++
++@pytest.fixture
++def mock_parallel_config():
++    """Create mock ParallelConfig object"""
++    config = Mock(spec=ParallelConfig)
++
++    config.data_parallel_index = 0
++    config.data_parallel_size = 2
++    config.data_parallel_size_local = 2
++    config.tensor_parallel_size = 1
++    config.pipeline_parallel_size = 1
++    config.local_engines_only = False
++
++    config.fault_tolerance_config = FaultToleranceConfig(engine_recovery_timeout_sec=10)
++    return config
++
++
++def create_engine_core_sentinel(
++    parallel_config: ParallelConfig,
++    addr_dict: dict,
++    sentinel_identity: bytes = b"engine_sentinel_0",
++):
++    worker_cmd_addr = get_engine_client_zmq_addr(True, "0.0.0.0")
++    input_queue = queue.Queue[tuple[EngineCoreRequestType, Any]]()
++    return EngineCoreSentinel(
++        parallel_config,
++        engine_index=0,
++        engine_input_q=input_queue,
++        engine_fault_socket_addr=addr_dict["engine_fault_socket_addr"],
++        sentinel_identity=sentinel_identity,
++        worker_cmd_addr=worker_cmd_addr,
++        engine_core=Mock(),
++    )
++
++
++def test_engine_core_sentinel_initialization(addr_dict, mock_parallel_config):
++    sentinel = create_engine_core_sentinel(mock_parallel_config, addr_dict)
++
++    assert sentinel.engine_index == 0
++    assert sentinel.engine_fault_socket.type == zmq.DEALER
++
++    sentinel.shutdown()
++
++
++def test_busy_loop_exception_forwarded_to_client(addr_dict, mock_parallel_config):
++    """
++    Verify that when an engine exception is put into fault_signal_q,
++    EngineCoreSentinel forwards a FaultInfo message to the
++    client-facing engine fault socket.
++    """
++    sentinel_identity = b"engine_sentinel_0"
++    sentinel = create_engine_core_sentinel(
++        mock_parallel_config, addr_dict, sentinel_identity=sentinel_identity
++    )
++
++    # Bind a ROUTER to the engine_fault_socket_addr to receive the fault report.
++    ctx = zmq.Context()
++    engine_fault_receiver = ctx.socket(zmq.ROUTER)
++    engine_fault_receiver.bind(addr_dict["engine_fault_socket_addr"])
++
++    try:
++        time.sleep(0.1)
++        sentinel.fault_signal_q.put(RuntimeError("test exception"))
++        # Wait for the sentinel to forward the fault to the engine_fault socket.
++        if not engine_fault_receiver.poll(timeout=5000):
++            pytest.fail("Timeout waiting for engine fault message from sentinel")
++
++        parts = engine_fault_receiver.recv_multipart()
++        assert len(parts) >= 2
++        fault_info = msgpack.decode(parts[-1], type=FaultInfo)
++        assert fault_info.type == "RuntimeError"
++        assert fault_info.engine_id == "0"
++        assert fault_info.message == "test exception"
++    finally:
++        engine_fault_receiver.close(linger=0)
++        sentinel.shutdown()
++        ctx.term()
++
++
++@pytest.mark.parametrize("dp_size", [1, 2])
++def test_retry(mock_parallel_config, addr_dict, dp_size):
++    mock_parallel_config.data_parallel_size = dp_size
++    sentinel_identity = b"engine_sentinel_0"
++    engine_core_sentinel = create_engine_core_sentinel(
++        mock_parallel_config, addr_dict, sentinel_identity=sentinel_identity
++    )
++    engine_core_sentinel.busy_loop_paused.set()
++    patch.object(engine_core_sentinel, "_execute_command_on_workers")
++    ft_req = FaultToleranceRequest(
++        "1", "retry", {"timeout": 2, "coord_store_port": 54321}
++    )
++
++    engine_core_sentinel.retry(ft_req)
++
++    assert mock_parallel_config._coord_store_port == 54321
++    if dp_size > 1:
++        assert not engine_core_sentinel.cmd_q.empty()
++        cmd = engine_core_sentinel.cmd_q.get()
++        assert cmd.instruction == "reinit_dp_group_on_fault_tolerance"
++        assert not engine_core_sentinel.stop_busy_loop.is_set()
++    else:
++        assert engine_core_sentinel.cmd_q.get() is None
+Index: vllm/config/__init__.py
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/vllm/config/__init__.py b/vllm/config/__init__.py
+--- a/vllm/config/__init__.py	(revision bcf2be96120005e9aea171927f85055a6a5c0cf6)
++++ b/vllm/config/__init__.py	(revision 62f44e65528e281385854b3a37f8762af7cafe6f)
+@@ -11,6 +11,7 @@
+ )
+ from vllm.config.device import DeviceConfig
+ from vllm.config.ec_transfer import ECTransferConfig
++from vllm.config.fault_tolerance import FaultToleranceConfig
+ from vllm.config.kernel import KernelConfig
+ from vllm.config.kv_events import KVEventsConfig
+ from vllm.config.kv_transfer import KVTransferConfig
+@@ -111,6 +112,8 @@
+     "StructuredOutputsConfig",
+     # From vllm.config.profiler
+     "ProfilerConfig",
++    # From vllm.config.fault_tolerance
++    "FaultToleranceConfig",
+     # From vllm.config.utils
+     "ConfigType",
+     "SupportsMetricsInfo",
+Index: vllm/config/fault_tolerance.py
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/vllm/config/fault_tolerance.py b/vllm/config/fault_tolerance.py
+new file mode 100644
+--- /dev/null	(revision d1a334eebbff73b3951b0e79d5b4056aa1ee521e)
++++ b/vllm/config/fault_tolerance.py	(revision d1a334eebbff73b3951b0e79d5b4056aa1ee521e)
+@@ -0,0 +1,33 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++
++from vllm.config.utils import config
++
++
++@config
++class FaultToleranceConfig:
++    """Configuration for fault tolerance."""
++
++    engine_recovery_timeout_sec: int = 120
++    """Timeout (in seconds) to wait for error handling instructions
++    before raising an exception. If the EngineCore encounters an
++    error, it waits up to this many seconds for instructions on how
++    to handle the error. If no instructions are received within this
++    time, the original error is raised.
++    """
++
++    enable_fault_tolerance_rebalance: bool = False
++    """
++    After a fault occurs, re-invoke EPLB for expert placement to achieve load balancing.
++    """
++
++    internal_fault_report_port: int = 22866
++    """
++    The port to use for engines to report fault to client sentinel.
++    """
++
++    external_fault_notify_port: int = 22867
++    """
++    Port used to publish engine fault and status change notifications.
++    """
+Index: vllm/engine/arg_utils.py
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/vllm/engine/arg_utils.py b/vllm/engine/arg_utils.py
+--- a/vllm/engine/arg_utils.py	(revision bcf2be96120005e9aea171927f85055a6a5c0cf6)
++++ b/vllm/engine/arg_utils.py	(revision 159852b19e8fa61699bfda79d52fb04907751074)
+@@ -40,6 +40,7 @@
+     DeviceConfig,
+     ECTransferConfig,
+     EPLBConfig,
++    FaultToleranceConfig,
+     KernelConfig,
+     KVEventsConfig,
+     KVTransferConfig,
+@@ -403,6 +404,7 @@
+     nnodes: int = ParallelConfig.nnodes
+     node_rank: int = ParallelConfig.node_rank
+     distributed_timeout_seconds: int | None = ParallelConfig.distributed_timeout_seconds
++    gloo_timeout_seconds: int | None = ParallelConfig.gloo_timeout_seconds
+     tensor_parallel_size: int = ParallelConfig.tensor_parallel_size
+     prefill_context_parallel_size: int = ParallelConfig.prefill_context_parallel_size
+     decode_context_parallel_size: int = ParallelConfig.decode_context_parallel_size
+@@ -603,6 +605,12 @@
+     optimization_level: OptimizationLevel = VllmConfig.optimization_level
+     performance_mode: PerformanceMode = VllmConfig.performance_mode
+ 
++    # fault tolerance fields (`None` means not explicitly provided).
++    fault_tolerance_config: FaultToleranceConfig | None = get_field(
++        ParallelConfig, "fault_tolerance_config"
++    )
++    enable_fault_tolerance: bool = ParallelConfig.enable_fault_tolerance
++
+     kv_offloading_size: float | None = CacheConfig.kv_offloading_size
+     kv_offloading_backend: KVOffloadingBackend = CacheConfig.kv_offloading_backend
+     tokens_only: bool = False
+@@ -633,6 +641,11 @@
+             self.weight_transfer_config = WeightTransferConfig(
+                 **self.weight_transfer_config
+             )
++        if isinstance(self.fault_tolerance_config, dict):
++            self.fault_tolerance_config = FaultToleranceConfig(
++                **self.fault_tolerance_config
++            )
++
+         # Setup plugins
+         from vllm.plugins import load_general_plugins
+ 
+@@ -821,6 +834,10 @@
+             "--distributed-timeout-seconds",
+             **parallel_kwargs["distributed_timeout_seconds"],
+         )
++        parallel_group.add_argument(
++            "--gloo-timeout-seconds",
++            **parallel_kwargs["gloo_timeout_seconds"],
++        )
+         parallel_group.add_argument(
+             "--tensor-parallel-size", "-tp", **parallel_kwargs["tensor_parallel_size"]
+         )
+@@ -951,6 +968,16 @@
+         parallel_group.add_argument(
+             "--worker-extension-cls", **parallel_kwargs["worker_extension_cls"]
+         )
++        parallel_group.add_argument(
++            "--enable-fault-tolerance", **parallel_kwargs["enable_fault_tolerance"]
++        )
++        parallel_group.add_argument(
++            "--fault-tolerance-config",
++            **{
++                **parallel_kwargs["fault_tolerance_config"],
++                "default": None,
++            },
++        )
+ 
+         # KV cache arguments
+         cache_kwargs = get_kwargs(CacheConfig)
+@@ -1337,6 +1364,13 @@
+     def from_cli_args(cls, args: argparse.Namespace):
+         # Get the list of attributes of this dataclass.
+         attrs = [attr.name for attr in dataclasses.fields(cls)]
++
++        # If --fault-tolerance-config is provided, enable fault tolerance by default.
++        if args.fault_tolerance_config is not None:
++            args.enable_fault_tolerance = True
++        if args.enable_fault_tolerance and args.fault_tolerance_config is None:
++            args.fault_tolerance_config = FaultToleranceConfig()
++
+         # Set the attributes from the parsed arguments.
+         engine_args = cls(
+             **{attr: getattr(args, attr) for attr in attrs if hasattr(args, attr)}
+@@ -1726,6 +1760,7 @@
+             nnodes=self.nnodes,
+             node_rank=self.node_rank,
+             distributed_timeout_seconds=self.distributed_timeout_seconds,
++            gloo_timeout_seconds=self.gloo_timeout_seconds,
+             data_parallel_master_ip=data_parallel_address,
+             data_parallel_rpc_port=data_parallel_rpc_port,
+             data_parallel_backend=self.data_parallel_backend,
+@@ -1757,6 +1792,10 @@
+             cp_kv_cache_interleave_size=self.cp_kv_cache_interleave_size,
+             _api_process_count=self._api_process_count,
+             _api_process_rank=self._api_process_rank,
++            enable_fault_tolerance=self.enable_fault_tolerance,
++            fault_tolerance_config=(
++                self.fault_tolerance_config or FaultToleranceConfig()
++            ),
+         )
+ 
+         speculative_config = self.create_speculative_config(
+Index: vllm/engine/protocol.py
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/vllm/engine/protocol.py b/vllm/engine/protocol.py
+--- a/vllm/engine/protocol.py	(revision bcf2be96120005e9aea171927f85055a6a5c0cf6)
++++ b/vllm/engine/protocol.py	(revision 45c8a32de2944283c0c6755234c065e71ce360eb)
+@@ -21,6 +21,7 @@
+ from vllm.tasks import SupportedTask
+ from vllm.v1.engine import EngineCoreRequest
+ from vllm.v1.engine.input_processor import InputProcessor
++from vllm.v1.fault_tolerance.utils import FaultToleranceRequest, FaultToleranceResult
+ 
+ if TYPE_CHECKING:
+     from vllm.v1.engine import PauseMode
+@@ -220,6 +221,16 @@
+     ):
+         """Perform a collective RPC call to the given path."""
+         raise NotImplementedError
++
++    async def handle_fault(
++        self, fault_tolerance_request: FaultToleranceRequest
++    ) -> FaultToleranceResult:
++        """send fault tolerance instruction to the engine"""
++        raise NotImplementedError
++
++    async def get_fault_info(self):
++        """report exception from engine_core"""
++        raise NotImplementedError
+ 
+     async def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
+         """Get supported tasks"""
+Index: vllm/entrypoints/cli/serve.py
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/vllm/entrypoints/cli/serve.py b/vllm/entrypoints/cli/serve.py
+--- a/vllm/entrypoints/cli/serve.py	(revision bcf2be96120005e9aea171927f85055a6a5c0cf6)
++++ b/vllm/entrypoints/cli/serve.py	(revision 2b7962c0e7e909364dddb81ec847b423de515bf7)
+@@ -221,7 +221,7 @@
+     )
+ 
+     try:
+-        engine_manager.join_first()
++        engine_manager.monitor_engine_liveness(engine_identity=None, run_headless=True)
+     finally:
+         timeout = None
+         if shutdown_requested:
+@@ -294,6 +294,7 @@
+             stats_update_address=coordinator.get_stats_publish_address()
+             if coordinator
+             else None,
++            fault_tolerance_addresses=addresses.fault_tolerance_addresses,
+         )
+ 
+         # For dp ranks > 0 in external/hybrid DP LB modes, we must delay the
+Index: vllm/entrypoints/openai/api_server.py
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/vllm/entrypoints/openai/api_server.py b/vllm/entrypoints/openai/api_server.py
+--- a/vllm/entrypoints/openai/api_server.py	(revision bcf2be96120005e9aea171927f85055a6a5c0cf6)
++++ b/vllm/entrypoints/openai/api_server.py	(revision 62f44e65528e281385854b3a37f8762af7cafe6f)
+@@ -252,6 +252,13 @@
+ 
+         register_pooling_api_routers(app, supported_tasks)
+ 
++    if args.enable_fault_tolerance:
++        from vllm.entrypoints.serve.fault_tolerance.api_router import (
++            register_fault_tolerance_api_router,
++        )
++
++        register_fault_tolerance_api_router(app)
++
+     app.root_path = args.root_path
+     app.add_middleware(
+         CORSMiddleware,
+Index: vllm/entrypoints/serve/fault_tolerance/api_router.py
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/vllm/entrypoints/serve/fault_tolerance/api_router.py b/vllm/entrypoints/serve/fault_tolerance/api_router.py
+new file mode 100644
+--- /dev/null	(revision a639fc88abdeb59bb014a383efdeccca964d80a4)
++++ b/vllm/entrypoints/serve/fault_tolerance/api_router.py	(revision a639fc88abdeb59bb014a383efdeccca964d80a4)
+@@ -0,0 +1,133 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++
++import json
++import uuid
++from http import HTTPStatus
++from typing import TypeAlias
++
++from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request
++from fastapi.responses import JSONResponse
++
++from vllm.engine.protocol import EngineClient
++from vllm.entrypoints.openai.engine.protocol import ErrorResponse
++from vllm.entrypoints.openai.utils import validate_json_request
++from vllm.logger import init_logger
++from vllm.v1.fault_tolerance.utils import FaultToleranceRequest
++
++logger = init_logger(__name__)
++
++
++def engine_client(request: Request) -> EngineClient:
++    return request.app.state.engine_client
++
++
++router = APIRouter()
++
++ParamType: TypeAlias = type | tuple[type, ...]
++INSTRUCTION_PARAMS: dict[str, dict[str, dict[str, ParamType]]] = {
++    "pause": {
++        "required": {"timeout": (int, float)},
++        "optional": {"exclude_engine_index": list},
++    },
++    "retry": {
++        "required": {"timeout": (int, float)},
++        "optional": {},
++    },
++    "scale_down": {
++        "required": {
++            "timeout": (int, float),
++            "exclude_dp_ranks": list,
++        },
++        "optional": {},
++    },
++}
++
++
++def _validate_instruction_params(instruction: str, params: dict) -> None:
++    def _format_expected_type(expected_type: type | tuple[type, ...]) -> str:
++        if isinstance(expected_type, tuple):
++            return " | ".join(t.__name__ for t in expected_type)
++        return expected_type.__name__
++
++    rule = INSTRUCTION_PARAMS[instruction]
++    for key, expected_type in rule["required"].items():
++        expected_name = _format_expected_type(expected_type)
++        if key not in params or not isinstance(params[key], expected_type):
++            raise HTTPException(
++                400,
++                detail=f"Missing or invalid {key} value. Expected: {expected_name}.",
++            )
++    for key, expected_type in rule["optional"].items():
++        expected_name = _format_expected_type(expected_type)
++        if key in params and not isinstance(params[key], expected_type):
++            raise HTTPException(
++                400,
++                detail=f"Invalid {key} value. Expected: {expected_name}.",
++            )
++
++
++def _validate_fault_tolerance_payload(body: dict):
++    instruction = body.get("instruction")
++    params = body.get("params")
++
++    if instruction is None or params is None:
++        raise HTTPException(400, detail="'instruction' and 'params' are required.")
++
++    if instruction not in INSTRUCTION_PARAMS:
++        raise HTTPException(400, detail="Invalid 'instruction'.")
++
++    _validate_instruction_params(instruction, params)
++    return instruction, params
++
++
++@router.post(
++    "/fault_tolerance/apply",
++    dependencies=[Depends(validate_json_request)],
++    responses={
++        HTTPStatus.OK.value: {"model": dict},
++        HTTPStatus.BAD_REQUEST.value: {"model": ErrorResponse},
++        HTTPStatus.REQUEST_TIMEOUT.value: {"model": ErrorResponse},
++        HTTPStatus.INTERNAL_SERVER_ERROR.value: {"model": ErrorResponse},
++    },
++)
++async def process_fault_tolerance_instruction(raw_request: Request):
++    try:
++        body = await raw_request.json()
++    except json.JSONDecodeError as e:
++        raise HTTPException(status_code=400, detail="Invalid JSON format") from e
++
++    instruction, params = _validate_fault_tolerance_payload(body)
++    ft_request = FaultToleranceRequest(str(uuid.uuid4()), instruction, params)
++
++    client = engine_client(raw_request)
++    try:
++        ft_result = await client.handle_fault(ft_request)
++    except Exception as e:
++        logger.error("Failed to handle fault: %s", e)
++        raise HTTPException(
++            status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
++            detail="Failed to handle fault.",
++        ) from e
++
++    if ft_result.success:
++        return JSONResponse({"message": "Instruction executed successfully."})
++
++    raise HTTPException(
++        status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
++        detail=f"Instruction execution failed. Reason: {ft_result.reason}",
++    )
++
++
++@router.get("/fault_tolerance/status")
++async def get_fault_info(
++    raw_request: Request,
++):
++    client = engine_client(raw_request)
++    engine_status_dict = await client.get_fault_info()
++    return JSONResponse(content=engine_status_dict)
++
++
++def register_fault_tolerance_api_router(app: FastAPI):
++    app.include_router(router)
+Index: vllm/v1/engine/__init__.py
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/vllm/v1/engine/__init__.py b/vllm/v1/engine/__init__.py
+--- a/vllm/v1/engine/__init__.py	(revision bcf2be96120005e9aea171927f85055a6a5c0cf6)
++++ b/vllm/v1/engine/__init__.py	(revision 45c8a32de2944283c0c6755234c065e71ce360eb)
+@@ -250,3 +250,10 @@
+ 
+     KEEP_CURRENT_RANK = -1
+     SHUTDOWN_CURRENT_RANK = -2
++
++
++class EngineStatusType(enum.IntEnum):
++    HEALTHY = 0
++    DEAD = 1
++    UNHEALTHY = 2
++    PAUSED = 3
+Index: vllm/v1/engine/async_llm.py
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/vllm/v1/engine/async_llm.py b/vllm/v1/engine/async_llm.py
+--- a/vllm/v1/engine/async_llm.py	(revision bcf2be96120005e9aea171927f85055a6a5c0cf6)
++++ b/vllm/v1/engine/async_llm.py	(revision 45c8a32de2944283c0c6755234c065e71ce360eb)
+@@ -45,6 +45,7 @@
+ from vllm.v1.engine.output_processor import OutputProcessor, RequestOutputCollector
+ from vllm.v1.engine.parallel_sampling import ParentRequest
+ from vllm.v1.executor import Executor
++from vllm.v1.fault_tolerance.utils import FaultToleranceRequest, FaultToleranceResult
+ from vllm.v1.metrics.loggers import (
+     StatLoggerFactory,
+     StatLoggerManager,
+@@ -1013,6 +1014,16 @@
+         finally:
+             set_scaling_elastic_ep(False)
+ 
++    async def handle_fault(
++        self, fault_tolerance_request: FaultToleranceRequest
++    ) -> FaultToleranceResult:
++        """send fault tolerance instruction to the engine"""
++        return await self.engine_core.handle_fault(fault_tolerance_request)
++
++    async def get_fault_info(self):
++        """report exception in engine core"""
++        return await self.engine_core.fault_reporter()
++
+     @property
+     def is_running(self) -> bool:
+         # Is None before the loop is started.
+Index: vllm/v1/engine/core.py
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/vllm/v1/engine/core.py b/vllm/v1/engine/core.py
+--- a/vllm/v1/engine/core.py	(revision bcf2be96120005e9aea171927f85055a6a5c0cf6)
++++ b/vllm/v1/engine/core.py	(revision f9649be3468620fb5477f4e1dcaa137ba9425519)
+@@ -3,6 +3,7 @@
+ import os
+ import queue
+ import signal
++import sys
+ import threading
+ import time
+ from collections import defaultdict, deque
+@@ -59,6 +60,7 @@
+     UtilityOutput,
+     UtilityResult,
+ )
++from vllm.v1.engine.exceptions import EngineLoopPausedError
+ from vllm.v1.engine.utils import (
+     EngineHandshakeMetadata,
+     EngineZmqAddresses,
+@@ -66,13 +68,18 @@
+     get_device_indices,
+ )
+ from vllm.v1.executor import Executor
++from vllm.v1.fault_tolerance.engine_core_sentinel import (
++    EngineCoreSentinel,
++    fault_tolerant_wrapper,
++)
++from vllm.v1.fault_tolerance.utils import FaultToleranceRequest
+ from vllm.v1.kv_cache_interface import KVCacheConfig
+ from vllm.v1.metrics.stats import SchedulerStats
+ from vllm.v1.outputs import ModelRunnerOutput
+ from vllm.v1.request import Request, RequestStatus
+ from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
+ from vllm.v1.structured_output import StructuredOutputManager
+-from vllm.v1.utils import compute_iteration_details
++from vllm.v1.utils import compute_iteration_details, get_engine_client_zmq_addr
+ from vllm.version import __version__ as VLLM_VERSION
+ 
+ logger = init_logger(__name__)
+@@ -793,9 +800,19 @@
+     ):
+         self.input_queue = queue.Queue[tuple[EngineCoreRequestType, Any]]()
+         self.output_queue = queue.Queue[tuple[int, EngineCoreOutputs] | bytes]()
+-        executor_fail_callback = lambda: self.input_queue.put_nowait(
+-            (EngineCoreRequestType.EXECUTOR_FAILED, b"")
+-        )
++        if vllm_config.parallel_config.enable_fault_tolerance:
++
++            def kill_process():
++                import os
++
++                logger.exception("EngineCore is shutting down due to executor failure")
++                os._exit(1)
++
++            executor_fail_callback = kill_process
++        else:
++            executor_fail_callback = lambda: self.input_queue.put_nowait(
++                (EngineCoreRequestType.EXECUTOR_FAILED, b"")
++            )
+ 
+         self.engine_index = engine_index
+         identity = self.engine_index.to_bytes(length=2, byteorder="little")
+@@ -835,7 +852,6 @@
+                     vllm_config=vllm_config,
+                 )
+             self._init_data_parallel(vllm_config)
+-
+             super().__init__(
+                 vllm_config,
+                 executor_class,
+@@ -844,6 +860,33 @@
+                 internal_dp_balancing,
+             )
+ 
++            # Initialize fault tolerance settings.
++            self.enable_fault_tolerance = (
++                vllm_config.parallel_config.enable_fault_tolerance
++            )
++            if self.enable_fault_tolerance:
++                assert addresses.fault_tolerance_addresses is not None
++                ft_addresses = addresses.fault_tolerance_addresses
++                engine_core_sentinel_ids = ft_addresses.engine_core_sentinel_identities
++                ft_config = vllm_config.parallel_config.fault_tolerance_config
++                self.engine_recovery_timeout_sec = ft_config.engine_recovery_timeout_sec
++                # The ZMQ address between engine_core_sentinel and worker_sentinel.
++                worker_cmd_addr = get_engine_client_zmq_addr(True, "0.0.0.0")
++                self.engine_core_sentinel = EngineCoreSentinel(
++                    parallel_config=vllm_config.parallel_config,
++                    engine_index=self.engine_index,
++                    engine_input_q=self.input_queue,
++                    engine_fault_socket_addr=ft_addresses.engine_fault_socket_addr,
++                    sentinel_identity=engine_core_sentinel_ids[self.engine_index],
++                    worker_cmd_addr=worker_cmd_addr,
++                    engine=self,
++                )
++                self.model_executor.collective_rpc(
++                    method="create_worker_sentinel",
++                    args=(worker_cmd_addr,),
++                    non_block=False,
++                )
++
+             # Background Threads and Queues for IO. These enable us to
+             # overlap ZMQ socket IO with GPU since they release the GIL,
+             # and to overlap some serialization/deserialization with the
+@@ -867,7 +910,6 @@
+                 args=(
+                     addresses.outputs,
+                     addresses.coordinator_output,
+-                    self.engine_index,
+                 ),
+                 daemon=True,
+             )
+@@ -881,6 +923,23 @@
+                 assert addresses.coordinator_input is not None
+                 logger.info("Waiting for READY message from DP Coordinator...")
+ 
++    def update_parallel_config(self, data_parallel_size, rank_mapping):
++        self.vllm_config.parallel_config.data_parallel_size = (
++            self.vllm_config.parallel_config
++        ).data_parallel_size_local = data_parallel_size
++        self.vllm_config.parallel_config.data_parallel_rank = rank_mapping.get(
++            self.vllm_config.parallel_config.data_parallel_rank,
++            self.vllm_config.parallel_config.data_parallel_rank,
++        )
++        self.vllm_config.parallel_config.data_parallel_rank_local = rank_mapping.get(
++            self.vllm_config.parallel_config.data_parallel_rank_local,
++            self.vllm_config.parallel_config.data_parallel_rank_local,
++        )
++        self.engine_index = rank_mapping.get(self.engine_index, self.engine_index)
++        self.dp_rank = self.engine_index
++        # todo: Change the method of updating master_port.
++        self.vllm_config.parallel_config.data_parallel_master_port += 1000
++
+     @contextmanager
+     def _perform_handshakes(
+         self,
+@@ -935,6 +994,9 @@
+             with handshake as addresses, local_handshake as client_addresses:
+                 addresses.inputs = client_addresses.inputs
+                 addresses.outputs = client_addresses.outputs
++                addresses.fault_tolerance_addresses = (
++                    client_addresses.fault_tolerance_addresses
++                )
+                 yield addresses
+ 
+         # Update config which may have changed from the handshake
+@@ -1124,6 +1186,7 @@
+         """Returns true if shutdown has not been requested."""
+         return self.shutdown_state == EngineShutdownState.RUNNING
+ 
++    @fault_tolerant_wrapper
+     def run_busy_loop(self):
+         """Core busy loop of the EngineCore."""
+         while self._handle_shutdown():
+@@ -1134,6 +1197,14 @@
+ 
+         raise SystemExit
+ 
++    def _ensure_busy_loop_running(self):
++        if (
++            self.enable_fault_tolerance
++            and self.engine_core_sentinel.stop_busy_loop.is_set()
++        ):
++            raise EngineLoopPausedError("Engine busy loop is paused.")
++        return True
++
+     def _process_input_queue(self):
+         """Exits when an engine step needs to be performed."""
+ 
+@@ -1167,9 +1238,10 @@
+ 
+     def _process_engine_step(self) -> bool:
+         """Called only when there are unfinished local requests."""
+-
++        self._ensure_busy_loop_running()
+         # Step the engine core.
+         outputs, model_executed = self.step_fn()
++        self._ensure_busy_loop_running()
+         # Put EngineCoreOutputs into the output queue.
+         for output in outputs.items() if outputs else ():
+             self.output_queue.put_nowait(output)
+@@ -1232,6 +1304,7 @@
+         """Dispatch request from client."""
+ 
+         if request_type == EngineCoreRequestType.WAKEUP:
++            self._ensure_busy_loop_running()
+             return
+         elif request_type == EngineCoreRequestType.ADD:
+             req, request_wave = request
+@@ -1246,8 +1319,9 @@
+                 return
+             output = UtilityOutput(call_id)
+             # Lazily look-up utility method so that failure will be handled/returned.
+-            get_result = lambda: (method := getattr(self, method_name)) and method(
+-                *self._convert_msgspec_args(method, args)
++            get_result = lambda: (
++                (method := getattr(self, method_name))
++                and method(*self._convert_msgspec_args(method, args))
+             )
+             enqueue_output = lambda out: self.output_queue.put_nowait(
+                 (client_idx, EngineCoreOutputs(utility_output=out))
+@@ -1403,6 +1477,12 @@
+                             request = self.preprocess_add_request(req)
+                         except Exception:
+                             self._handle_request_preproc_error(req)
++                            continue
++                    elif request_type == EngineCoreRequestType.UTILITY:
++                        request = generic_decoder.decode(data_frames)
++                        client_index, call_id, method, args = request
++                        if method == "handle_fault":
++                            self.handle_fault(call_id, client_index, args[0])
+                             continue
+                     else:
+                         request = generic_decoder.decode(data_frames)
+@@ -1421,7 +1501,6 @@
+         self,
+         output_paths: list[str],
+         coord_output_path: str | None,
+-        engine_index: int,
+     ):
+         """Output socket IO thread."""
+ 
+@@ -1462,7 +1541,7 @@
+                     break
+                 assert not isinstance(output, bytes)
+                 client_index, outputs = output
+-                outputs.engine_index = engine_index
++                outputs.engine_index = self.engine_index
+ 
+                 if client_index == -1:
+                     # Don't reuse buffer for coordinator message
+@@ -1487,6 +1566,20 @@
+                     # Limit the number of buffers to reuse.
+                     reuse_buffers.append(buffer)
+ 
++    def handle_fault(self, call_id: int, client_index: int, args: dict):
++        """Call engine_core_sentinel to perform fault tolerance."""
++        uo = UtilityOutput(call_id=call_id)
++        try:
++            ft_result = self.engine_core_sentinel.handle_fault(
++                FaultToleranceRequest(**args)
++            )
++            uo.result = UtilityResult(ft_result)
++        except Exception as e:
++            logger.exception("Call to handle_fault method failed")
++            uo.failure_message = f"Call to handle_fault method failed: {e}"
++        outputs = EngineCoreOutputs(utility_output=uo)
++        self.output_queue.put_nowait((client_index, outputs))
++
+     def _handle_request_preproc_error(self, request: EngineCoreRequest) -> None:
+         """Log and return a request-scoped error response for exceptions raised
+         from the add request preprocessing in the input socket processing thread.
+@@ -1567,6 +1660,12 @@
+             for client_index, req_ids in by_client.items():
+                 self._send_abort_outputs_to_client(list(req_ids), client_index)
+ 
++    def shutdown(self):
++        super().shutdown()
++        if self.enable_fault_tolerance:
++            self.engine_core_sentinel.shutdown()
++            sys.exit()
++
+ 
+ class DPEngineCoreProc(EngineCoreProc):
+     """ZMQ-wrapper for running EngineCore in background process
+@@ -1619,7 +1718,9 @@
+         assert 0 <= local_dp_rank <= dp_rank < dp_size
+ 
+         self.dp_rank = dp_rank
+-        dp_group, dp_store = parallel_config.stateless_init_dp_group(return_store=True)
++        dp_group, dp_store = parallel_config.stateless_init_dp_group(
++            return_store=True,
++        )
+         self.dp_group, self.dp_store = dp_group, dp_store
+ 
+     def shutdown(self):
+@@ -1679,6 +1780,7 @@
+             )
+             self.output_queue.put_nowait((-1, EngineCoreOutputs(scheduler_stats=stats)))
+ 
++    @fault_tolerant_wrapper
+     def run_busy_loop(self):
+         """Core busy loop of the EngineCore for data parallel case."""
+ 
+@@ -1704,7 +1806,9 @@
+ 
+                 # We are in a running state and so must execute a dummy pass
+                 # if the model didn't execute any ready requests.
++                self._ensure_busy_loop_running()
+                 self.execute_dummy_batch()
++                self._ensure_busy_loop_running()
+ 
+             # 3) All-reduce operation to determine global unfinished reqs.
+             self.engines_running = self._has_global_unfinished_reqs(
+@@ -1738,9 +1842,14 @@
+         self.step_counter += 1
+         if self.step_counter % 32 != 0:
+             return True
+-
++        self._ensure_busy_loop_running()
+         return ParallelConfig.has_unfinished_dp(self.dp_group, local_unfinished)
+ 
++    def reinit_dp_group_on_fault_tolerance(self):
++        stateless_destroy_torch_distributed_process_group(self.dp_group)
++        self.dp_group = self.vllm_config.parallel_config.stateless_init_dp_group()
++        self.step_counter = 0
++
+     def reinitialize_distributed(
+         self, reconfig_request: ReconfigureDistributedRequest
+     ) -> None:
+Index: vllm/v1/engine/core_client.py
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/vllm/v1/engine/core_client.py b/vllm/v1/engine/core_client.py
+--- a/vllm/v1/engine/core_client.py	(revision bcf2be96120005e9aea171927f85055a6a5c0cf6)
++++ b/vllm/v1/engine/core_client.py	(revision 341aa9d1568a8e71ec4b79634525b48e5ea42e5c)
+@@ -2,9 +2,9 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ import asyncio
+ import contextlib
+-import multiprocessing
+ import queue
+ import sys
++import threading
+ import uuid
+ import weakref
+ from abc import ABC, abstractmethod
+@@ -52,6 +52,14 @@
+     launch_core_engines,
+ )
+ from vllm.v1.executor import Executor
++from vllm.v1.fault_tolerance import ClientSentinel
++from vllm.v1.fault_tolerance.utils import (
++    FAULT_STATE_PUB_TOPIC,
++    FaultToleranceRequest,
++    FaultToleranceResult,
++    FaultToleranceZmqAddresses,
++    validate_ft_request,
++)
+ from vllm.v1.pool.late_interaction import get_late_interaction_engine_index
+ from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder, bytestr
+ 
+@@ -268,6 +276,14 @@
+     ) -> list[_R]:
+         raise NotImplementedError
+ 
++    async def handle_fault(
++        self, fault_tolerance_request: FaultToleranceRequest
++    ) -> FaultToleranceResult:
++        raise NotImplementedError
++
++    async def fault_reporter(self):
++        raise NotImplementedError
++
+ 
+ class InprocClient(EngineCoreClient):
+     """
+@@ -380,6 +396,8 @@
+     output_queue_task: asyncio.Task | None = None
+     stats_update_task: asyncio.Task | None = None
+     shutdown_path: str | None = None
++    client_sentinel: ClientSentinel | None = None
++    fault_state_sub_socket: zmq.Socket | None = None
+ 
+     # Set if any of the engines are dead. Here so that the output
+     # processing threads can access it without holding a ref to the client.
+@@ -389,6 +407,8 @@
+         """Clean up background resources."""
+ 
+         self.engine_dead = True
++        if self.client_sentinel is not None:
++            self.client_sentinel.shutdown()
+         if self.engine_manager is not None:
+             self.engine_manager.shutdown()
+         if self.coordinator is not None:
+@@ -404,6 +424,7 @@
+                 self.first_req_send_socket,
+                 self.first_req_rcv_socket,
+                 self.stats_update_socket,
++                self.fault_state_sub_socket,
+             )
+ 
+             tasks = (self.output_queue_task, self.stats_update_task)
+@@ -549,8 +570,10 @@
+             # identity. The client input ROUTER needs handover to allow the new
+             # engine to replace the dead connection.
+             enable_input_socket_handover = parallel_config.enable_elastic_ep
++            self.enable_fault_tolerance = parallel_config.enable_fault_tolerance
+ 
+             self.stats_update_address: str | None = None
++            self.addresses = None
+             if client_addresses:
+                 # Engines are managed externally to this client.
+                 input_address = client_addresses["input_address"]
+@@ -586,7 +609,16 @@
+                     self.resources.coordinator = coordinator
+                     self.resources.engine_manager = engine_manager
+ 
++                self.addresses = addresses
+                 self.stats_update_address = addresses.frontend_stats_publish_address
++                if self.enable_fault_tolerance:
++                    assert client_addresses is not None
++                    assert addresses.fault_tolerance_addresses is not None
++                    ft_addrs = addresses.fault_tolerance_addresses
++
++                    self.engine_registry = ft_addrs.engine_core_sentinel_identities
++                    client_addresses["fault_tolerance_addresses"] = ft_addrs.to_str()
++
+                 if coordinator is not None:
+                     assert self.stats_update_address == (
+                         coordinator.get_stats_publish_address()
+@@ -685,26 +717,20 @@
+             # No engine processes to monitor
+             return
+ 
+-        engine_processes = engine_manager.processes
+         self_ref = weakref.ref(self)
+ 
+         # Monitor engine core process liveness. If any die unexpectedly,
+-        # logs an error, shuts down the client and invokes the failure
+-        # callback to inform the engine.
++        # marks the engine as dead, and shuts down the client.
+         def monitor_engine_cores():
+-            sentinels = [proc.sentinel for proc in engine_processes]
+-            died = multiprocessing.connection.wait(sentinels)
++            if isinstance(engine_manager, CoreEngineProcManager):
++                engine_manager.monitor_engine_liveness(self.core_engines)
++            else:
++                engine_manager.monitor_engine_liveness()
++
+             _self = self_ref()
+             if not _self or not _self._finalizer.alive or _self.resources.engine_dead:
+                 return
+             _self.resources.engine_dead = True
+-            proc_name = next(
+-                proc.name for proc in engine_processes if proc.sentinel == died[0]
+-            )
+-            logger.error(
+-                "Engine core proc %s died unexpectedly, shutting down client.",
+-                proc_name,
+-            )
+             _self.shutdown()
+             # Note: For MPClient, we don't have a failure callback mechanism
+             # like MultiprocExecutor, but we set engine_dead flag which will
+@@ -921,6 +947,11 @@
+         client_count: int = 1,
+         client_index: int = 0,
+     ):
++        if (
++            vllm_config.parallel_config.enable_fault_tolerance
++            and client_addresses is None
++        ):
++            client_addresses = {}
+         super().__init__(
+             asyncio_mode=True,
+             vllm_config=vllm_config,
+@@ -932,6 +963,46 @@
+         self.client_count = client_count
+         self.client_index = client_index
+         self.outputs_queue = asyncio.Queue[EngineCoreOutputs | Exception]()
++
++        if self.enable_fault_tolerance:
++            assert client_addresses is not None
++            ft_addr = FaultToleranceZmqAddresses.from_str(
++                client_addresses["fault_tolerance_addresses"]
++            )
++            if self.client_index == 0:
++                self.client_sentinel = ClientSentinel(
++                    parallel_config=vllm_config.parallel_config,
++                    fault_tolerance_addresses=ft_addr,
++                    call_utility_async=self._call_utility_async,
++                    core_engines=self.core_engines,
++                    core_client=self,
++                )
++                self.resources.client_sentinel = self.client_sentinel
++            self.engine_status = {
++                "total_engines": len(self.engine_ranks_managed),
++                "engines": [
++                    {"id": rank, "status": "healthy"}
++                    for rank in self.engine_ranks_managed
++                ],
++            }
++            self.engine_status_lock = threading.Lock()
++            self.fault_state_sub_socket = make_zmq_socket(
++                self.resources.ctx,
++                ft_addr.fault_state_pub_socket_addr,
++                zmq.SUB,
++                bind=False,
++            )
++            self.fault_state_sub_socket.setsockopt(
++                zmq.SUBSCRIBE,
++                FAULT_STATE_PUB_TOPIC.encode(),
++            )
++            self.resources.fault_state_sub_socket = self.fault_state_sub_socket
++            threading.Thread(
++                target=self._engine_status_listener,
++                daemon=True,
++                name="EngineStatusListenerThread",
++            ).start()
++
+         try:
+             # If we are running in an asyncio event loop, start the queue task.
+             # Otherwise, it will be started lazily. If it is not started here,
+@@ -1157,6 +1228,103 @@
+             "collective_rpc", method, timeout, args, kwargs
+         )
+ 
++    async def handle_fault(
++        self, ft_request: FaultToleranceRequest
++    ) -> FaultToleranceResult:
++        # Validate engine status according to instruction semantics.
++        if rejection := validate_ft_request(
++            engines=self.engine_status["engines"],  # type: ignore[attr-defined, arg-type]
++            request_id=ft_request.request_id,
++            instruction=ft_request.instruction,
++            exclude_dp_ranks=ft_request.params.get("exclude_dp_ranks"),
++        ):
++            return rejection
++
++        res = await self._call_utility_async(
++            ft_request.instruction, ft_request, engine=b"client_sentinel"
++        )
++        return FaultToleranceResult(**res)
++
++    def _engine_status_listener(self):
++        decoder = msgspec.msgpack.Decoder()
++        while True:
++            try:
++                frames = self.fault_state_sub_socket.recv_multipart()
++                msg = decoder.decode(frames[-1])
++                with self.engine_status_lock:
++                    self.engine_status = {
++                        "total_engines": msg["total_engines"],
++                        "engines": msg["engines"],
++                    }
++                    if "type" in msg and msg["type"] == "scale_down":
++                        loop = (
++                            self.resources.output_queue_task.get_loop()
++                            if self.resources.output_queue_task
++                            else None
++                        )
++                        if loop and loop.is_running():
++                            loop.call_soon_threadsafe(
++                                self._apply_scale_down_config,
++                                msg["exclude_dp_ranks"],
++                                msg["original_to_new"],
++                            )
++                        else:
++                            self._apply_scale_down_config(
++                                msg["exclude_dp_ranks"],
++                                msg["original_to_new"],
++                            )
++            except zmq.ZMQError:
++                break
++
++    def _apply_scale_down_config(
++        self, exclude_dp_ranks: list[int], original_to_new: dict[int, int]
++    ):
++        """Apply scale_down config updates from ClientSentinel pub message.
++
++        Mirrors ClientSentinel.update_config() operations on self.core_client,
++        adapted for when self is the core_client (other API server processes).
++        """
++        exclude_set = set(exclude_dp_ranks)
++        old_to_new = {int(k): v for k, v in original_to_new.items()}
++
++        # 1. Filter core_engines: keep identities whose rank is not excluded.
++        self.core_engines = [
++            identity
++            for rank, identity in zip(self.engine_ranks_managed, self.core_engines)
++            if rank not in exclude_set
++        ]
++        if self.core_engines:
++            self.core_engine = self.core_engines[0]
++
++        # 2. Reset engine_ranks_managed to contiguous range [0, new_dp_size).
++        new_dp_size = len(old_to_new)
++        self.engine_ranks_managed = list(range(new_dp_size))
++
++        # 3. Update data_parallel_size.
++        self.vllm_config.parallel_config.data_parallel_size = new_dp_size
++
++        # 4. Remove excluded engines from lb_engines by local index (reverse sorted).
++        if hasattr(self, "lb_engines"):
++            dp_rank = self.vllm_config.parallel_config.data_parallel_rank
++            for dead_engine in sorted(exclude_dp_ranks, reverse=True):
++                local_rank = dead_engine - dp_rank
++                if 0 <= local_rank < len(self.lb_engines):
++                    del self.lb_engines[local_rank]
++
++        # 5. Notify DPCoordinator of the scale down (only from client_index=0).
++        if self.client_index == 0:
++            scale_down_marker = msgspec.msgpack.encode(
++                ("SCALE_ELASTIC_EP", new_dp_size)
++            )
++            if self.resources.first_req_send_socket:
++                zmq.Socket.shadow(self.resources.first_req_send_socket).send(
++                    scale_down_marker
++                )
++
++    async def fault_reporter(self):
++        with self.engine_status_lock:
++            return self.engine_status
++
+ 
+ class DPAsyncMPClient(AsyncMPClient):
+     """Asyncio-compatible client for multi-proc, multi-engine (data parallel)
+@@ -1526,6 +1694,8 @@
+             await self._scale_down_elastic_ep(
+                 cur_data_parallel_size, new_data_parallel_size
+             )
++        if self.enable_fault_tolerance:
++            await self.client_sentinel.refresh_engine_status(new_data_parallel_size)
+ 
+     async def _eep_wait_for_setup_switch_complete(self) -> None:
+         """
+Index: vllm/v1/engine/utils.py
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/vllm/v1/engine/utils.py b/vllm/v1/engine/utils.py
+--- a/vllm/v1/engine/utils.py	(revision bcf2be96120005e9aea171927f85055a6a5c0cf6)
++++ b/vllm/v1/engine/utils.py	(revision 7dd8c1f161d97fa49c258aad17d65d86ea1a5f58)
+@@ -10,9 +10,10 @@
+ from enum import Enum, auto
+ from multiprocessing import Process, connection
+ from multiprocessing.process import BaseProcess
+-from typing import TYPE_CHECKING
++from typing import TYPE_CHECKING, cast
+ from unittest.mock import patch
+ 
++import msgpack
+ import msgspec
+ import zmq
+ 
+@@ -25,6 +26,11 @@
+ from vllm.utils.system_utils import get_mp_context
+ from vllm.v1.engine.coordinator import DPCoordinator
+ from vllm.v1.executor import Executor
++from vllm.v1.fault_tolerance.utils import (
++    FaultToleranceZmqAddresses,
++    make_engine_down_report_socket,
++    notify_engine_down,
++)
+ from vllm.v1.utils import get_engine_client_zmq_addr, shutdown
+ 
+ if TYPE_CHECKING:
+@@ -65,6 +71,8 @@
+     # Not used by engine, just relayed to front-end in handshake response.
+     # Only required for external DP LB case.
+     frontend_stats_publish_address: str | None = None
++    # ZMQ socket addresses for fault tolerance if applicable
++    fault_tolerance_addresses: FaultToleranceZmqAddresses | None = None
+ 
+ 
+ @dataclass
+@@ -104,7 +112,11 @@
+             "executor_class": executor_class,
+             "log_stats": log_stats,
+         }
+-
++        self.enable_fault_tolerance = vllm_config.parallel_config.enable_fault_tolerance
++        if self.enable_fault_tolerance:
++            self.ctx, self.engine_down_socket = make_engine_down_report_socket(
++                vllm_config
++            )
+         if client_handshake_address:
+             common_kwargs["client_handshake_address"] = client_handshake_address
+ 
+@@ -130,6 +142,9 @@
+             )
+ 
+         self._finalizer = weakref.finalize(self, shutdown, self.processes)
++        self.manager_stopped = threading.Event()
++        self.failed_proc_name: str | None = None
++        self.start_index = start_index
+ 
+         try:
+             for proc, local_dp_rank in zip(self.processes, local_dp_ranks):
+@@ -144,13 +159,28 @@
+                         proc.start()
+                 else:
+                     proc.start()
++            if vllm_config.parallel_config.enable_fault_tolerance:
++                self.send_engine_range(start_index, local_engine_count)
+         finally:
+             # Kill other procs if not all are running.
+             if self.finished_procs():
+                 self.shutdown()
+ 
++    def send_engine_range(self, start_engine_index, local_engine_count):
++        payload = msgpack.dumps(
++            {
++                "start_engine_index": start_engine_index,
++                "local_engine_count": local_engine_count,
++            }
++        )
++        self.engine_down_socket.send_multipart([b"", payload])
++
+     def shutdown(self, timeout: float | None = None) -> None:
+         """Shutdown engine core processes with configurable timeout."""
++        self.manager_stopped.set()
++        if self.enable_fault_tolerance:
++            self.engine_down_socket.close(linger=0)
++            self.ctx.term()
+         if self._finalizer.detach() is not None:
+             shutdown(self.processes, timeout=timeout)
+ 
+@@ -158,6 +188,44 @@
+         """Wait for any process to exit."""
+         connection.wait(proc.sentinel for proc in self.processes)
+ 
++    def monitor_engine_liveness(self, engine_identity=None, run_headless=False) -> None:
++        """Monitor engine core process liveness."""
++        if self.enable_fault_tolerance:
++            engine_identity = msgpack.loads(
++                self.engine_down_socket.recv_multipart()[1], strict_map_key=False
++            ).values()
++
++        sentinel_to_proc = {proc.sentinel: proc for proc in self.processes}
++        sentinels = set(sentinel_to_proc.keys())
++        pids = [proc.pid for proc in self.processes]
++        pid_mapping = {}
++        if self.enable_fault_tolerance:
++            pid_mapping = {
++                proc: byte_data for proc, byte_data in zip(pids, engine_identity)
++            }
++        while sentinels and not self.manager_stopped.is_set():
++            died_sentinels = connection.wait(sentinels, timeout=1)
++
++            for sentinel in died_sentinels:
++                proc = sentinel_to_proc.pop(cast(int, sentinel))
++                died_proc = next(
++                    proc for proc in self.processes if proc.sentinel == sentinel
++                )
++                exitcode = proc.exitcode
++                if exitcode != 0 and not self.manager_stopped.is_set():
++                    self.failed_proc_name = proc.name
++                if self.enable_fault_tolerance:
++                    notify_engine_down(
++                        self.engine_down_socket,
++                        engine_identity=pid_mapping[died_proc.pid],
++                    )
++                    sentinels.remove(cast(int, sentinel))
++
++            if died_sentinels and not self.enable_fault_tolerance:
++                break
++
++        self.shutdown()
++
+     def sentinels(self) -> list:
+         return [proc.sentinel for proc in self.processes]
+ 
+@@ -280,7 +348,7 @@
+             if dp_size > 1 and vllm_config.model_config.is_moe
+             else EngineCoreActor
+         )
+-
++        self.enable_fault_tolerance = vllm_config.parallel_config.enable_fault_tolerance
+         self.local_engine_actors: list[ray.ActorHandle] = []
+         self.remote_engine_actors: list[ray.ActorHandle] = []
+ 
+@@ -295,7 +363,14 @@
+         self.log_stats = log_stats
+         local_engine_count = vllm_config.parallel_config.data_parallel_size_local
+         world_size = vllm_config.parallel_config.world_size
++        self.manager_stopped = threading.Event()
++        self.failed_proc_name: str | None = None
+ 
++        if self.enable_fault_tolerance:
++            self.ctx, self.engine_down_socket = make_engine_down_report_socket(
++                vllm_config
++            )
++        self.start_rank = vllm_config.parallel_config.data_parallel_index
+         if ray.is_initialized():
+             logger.info("Ray is already initialized. Skipping Ray initialization.")
+         else:
+@@ -379,8 +454,11 @@
+ 
+         ray.get(refs)
+         self.run_refs = []
++        self.actor_run_ref_dict = dict()
+         for actor in self.local_engine_actors + self.remote_engine_actors:
+-            self.run_refs.append(actor.run.remote())
++            ref = actor.run.remote()
++            self.run_refs.append(ref)
++            self.actor_run_ref_dict[actor] = ref
+ 
+     @staticmethod
+     def create_dp_placement_groups(
+@@ -760,7 +838,9 @@
+         ) + self.remote_engine_actors[-(len(placement_groups) - new_local_engines) :]
+ 
+         for actor in actors:
+-            self.run_refs.append(actor.run.remote())
++            ref = actor.run.remote()
++            self.run_refs.append(ref)
++            self.actor_run_ref_dict[actor] = ref
+ 
+         cur_vllm_config.parallel_config.data_parallel_size = new_data_parallel_size
+         # Update old_vllm_config with new data_parallel_size_local if any new
+@@ -789,12 +869,65 @@
+                 self.remote_engine_actors.pop()
+             ray.util.remove_placement_group(pg)
+ 
++    def remove_run_refs_for_scale_down(self, removed_dp_size: int) -> None:
++        if removed_dp_size <= 0:
++            return
++        flags = self.placement_group_is_local[-removed_dp_size:]
++        li = len(self.local_engine_actors) - 1
++        ri = len(self.remote_engine_actors) - 1
++        for is_local in reversed(flags):
++            if is_local:
++                actor = self.local_engine_actors[li]
++                li -= 1
++            else:
++                actor = self.remote_engine_actors[ri]
++                ri -= 1
++            ref = self.actor_run_ref_dict.pop(actor)
++            self.run_refs.remove(ref)
++
+     def get_run_refs(self):
+         return self.run_refs
+ 
++    def monitor_engine_liveness(self) -> None:
++        import ray
++
++        failed_ref = set()
++        while not self.manager_stopped.is_set():
++            actor_run_refs = [r for r in self.get_run_refs() if r not in failed_ref]
++            if not actor_run_refs:
++                logger.info(
++                    "There are no actors to monitor currently. "
++                    "The monitoring function is about to terminate."
++                )
++                break
++            actor_done_refs, _ = ray.wait(actor_run_refs, timeout=5)
++            unexpected_failure = False
++            for actor_ref in actor_done_refs:
++                if self.manager_stopped.is_set():
++                    break
++                if actor_ref not in self.get_run_refs():
++                    # The run refs may have been updated by elastic scale-down.
++                    continue
++                try:
++                    ray.get(actor_ref)
++                except ray.exceptions.RayActorError:
++                    self.failed_proc_name = f"Actor {actor_ref}"
++                    unexpected_failure = True
++                    if self.enable_fault_tolerance:
++                        notify_engine_down(self.engine_down_socket)
++                        failed_ref.add(actor_ref)
++
++            if unexpected_failure and not self.enable_fault_tolerance:
++                break
++        self.shutdown()
++
+     def shutdown(self, timeout: float | None = None) -> None:
+         import ray
+ 
++        self.manager_stopped.set()
++        if self.enable_fault_tolerance:
++            self.engine_down_socket.close(linger=0)
++            self.ctx.term()
+         for actor in self.local_engine_actors + self.remote_engine_actors:
+             ray.kill(actor)
+         for pg in self.created_placement_groups:
+@@ -890,6 +1023,15 @@
+     else:
+         coordinator = None
+ 
++    if vllm_config.parallel_config.enable_fault_tolerance:
++        addresses.fault_tolerance_addresses = FaultToleranceZmqAddresses.build(
++            host,
++            dp_size,
++            addresses.inputs,
++            addresses.outputs,
++            vllm_config.parallel_config.fault_tolerance_config,
++        )
++
+     if parallel_config.data_parallel_backend == "ray":
+         logger.info("Starting ray-based data parallel backend")
+ 
+Index: vllm/v1/fault_tolerance/__init__.py
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/vllm/v1/fault_tolerance/__init__.py b/vllm/v1/fault_tolerance/__init__.py
+new file mode 100644
+--- /dev/null	(revision 62f44e65528e281385854b3a37f8762af7cafe6f)
++++ b/vllm/v1/fault_tolerance/__init__.py	(revision 62f44e65528e281385854b3a37f8762af7cafe6f)
+@@ -0,0 +1,11 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++from .client_sentinel import ClientSentinel
++from .engine_core_sentinel import EngineCoreSentinel
++from .sentinel import BaseSentinel
++
++__all__ = [
++    "BaseSentinel",
++    "ClientSentinel",
++    "EngineCoreSentinel",
++]
+Index: vllm/v1/fault_tolerance/client_sentinel.py
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/vllm/v1/fault_tolerance/client_sentinel.py b/vllm/v1/fault_tolerance/client_sentinel.py
+new file mode 100644
+--- /dev/null	(revision ac3d9b91d35f3acb72267cbfc95638e44a05e254)
++++ b/vllm/v1/fault_tolerance/client_sentinel.py	(revision ac3d9b91d35f3acb72267cbfc95638e44a05e254)
+@@ -0,0 +1,491 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++from __future__ import annotations
++
++import asyncio
++import uuid
++from collections.abc import Callable
++from typing import TYPE_CHECKING
++
++import msgpack
++import msgspec.msgpack
++import zmq.asyncio
++from torch.distributed import default_pg_timeout
++
++from vllm.config import ParallelConfig
++from vllm.distributed.utils import init_distributed_coordination
++from vllm.logger import init_logger
++from vllm.utils.network_utils import close_sockets, get_open_port, make_zmq_socket
++from vllm.v1.engine import EngineCoreOutputs as FTUtilityOutputs
++from vllm.v1.engine import EngineStatusType, UtilityOutput
++from vllm.v1.fault_tolerance.sentinel import BaseSentinel
++from vllm.v1.fault_tolerance.utils import (
++    FAULT_STATE_PUB_TOPIC,
++    FaultInfo,
++    FaultToleranceRequest,
++    FaultToleranceResult,
++    FaultToleranceZmqAddresses,
++)
++from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder, UtilityResult
++
++if TYPE_CHECKING:
++    from vllm.v1.engine.core_client import MPClient
++
++logger = init_logger(__name__)
++DEEP_EP_KERNEL_TIMEOUT = 100  # seconds (currently fixed)
++
++
++class ClientSentinel(BaseSentinel):
++    """
++    Client-side sentinel for fault tolerance monitoring.
++    Monitors EngineCore health status via ZMQ sockets, publishes engine state
++    to upper-level orchestration frameworks (LLMD, K8s, Aibrix), and triggers
++    instance shutdown on unrecoverable faults.
++
++    Connects to:
++    - EngineCore fault reporting sockets (receives exceptions & process exit events)
++    - Fault state publisher socket (broadcasts engine health status)
++    """
++
++    def __init__(
++        self,
++        parallel_config: ParallelConfig,
++        fault_tolerance_addresses: FaultToleranceZmqAddresses,
++        call_utility_async: Callable,
++        core_engines: list[bytes],
++        core_client: MPClient,
++    ):
++        if parallel_config.local_engines_only:
++            raise NotImplementedError(
++                "Fault tolerance is currently supported only for internal LB mode."
++            )
++        self.ctx = zmq.asyncio.Context()
++        super().__init__(parallel_config, None, b"client_sentinel")
++        self.engine_identities = core_engines
++        self.call_utility_async = call_utility_async
++
++        self.ft_config = parallel_config.fault_tolerance_config
++        self.gloo_timeout_seconds: int = (
++            parallel_config.gloo_timeout_seconds
++            if parallel_config.gloo_timeout_seconds is not None
++            else int(default_pg_timeout.total_seconds())
++        )
++        if parallel_config.gloo_timeout_seconds is None:
++            logger.warning(
++                "Gloo timeout not set, using default_pg_timeout:%s",
++                int(default_pg_timeout.total_seconds()),
++            )
++        # Gloo collective timeout and all2all kernel timeout (DeepEP / NIXL-EP)
++        # must both be shorter than the engine recovery timeout.
++        # Otherwise execution may block inside communication (CPU or GPU),
++        # and the recovery logic will not get a chance to run.
++        if (
++            max(self.gloo_timeout_seconds, DEEP_EP_KERNEL_TIMEOUT)
++            > self.ft_config.engine_recovery_timeout_sec
++        ):
++            raise ValueError(
++                "Engine recovery timeout must be greater than both Gloo timeout and "
++                "all2all kernel timeout (DeepEP / NIXL-EP) to ensure recovery can run."
++            )
++
++        self.sentinel_dead = False
++        self.core_client = core_client
++
++        # Port for receiving fault signals:
++        # 1. Exceptions caught by fault_tolerant_wrapper in EngineCore
++        # 2. Exit notifications of EngineCoreProc monitored by CoreEngineActorManager
++        #    or CoreEngineProcManager
++        self.fault_receiver_socket = make_zmq_socket(
++            ctx=self.ctx,
++            path=fault_tolerance_addresses.engine_fault_socket_addr,
++            socket_type=zmq.ROUTER,
++            bind=True,
++        )
++        # Port for reporting EngineCore status to service frameworks (LLMD, K8s, Aibrix)
++        self.fault_state_pub_socket = make_zmq_socket(
++            ctx=self.ctx,
++            path=fault_tolerance_addresses.fault_state_pub_socket_addr,
++            socket_type=zmq.PUB,
++            bind=True,
++        )
++
++        # sockets to receive fault tolerance request from clients
++        self.ft_request_sockets = [
++            make_zmq_socket(self.ctx, addr, zmq.DEALER, False, self.identity)
++            for addr in fault_tolerance_addresses.ft_request_addresses
++        ]
++        # sockets to send fault tolerance execution results back to clients
++        self.ft_result_sockets = [
++            make_zmq_socket(
++                self.ctx,
++                addr,
++                zmq.PUSH,
++                linger=4000,
++            )
++            for addr in fault_tolerance_addresses.ft_result_addresses
++        ]
++
++        self.is_faulted = asyncio.Event()
++        self._utility_encoder = MsgpackEncoder()
++
++        self.start_rank = parallel_config.data_parallel_index
++        self.dp_size = parallel_config.data_parallel_size
++        self.dp_local_size = parallel_config.data_parallel_size_local
++        num_dp_managed = (
++            self.dp_local_size if parallel_config.local_engines_only else self.dp_size
++        )
++        self.engine_status_dict: dict[int, dict[str, str]] = {
++            engine_index: {"status": "healthy"}
++            for engine_index in range(self.start_rank, self.start_rank + num_dp_managed)
++        }
++        self.engine_identity_to_index = {
++            identity: index
++            for index, identity in zip(
++                range(self.start_rank, self.start_rank + num_dp_managed),
++                self.engine_identities,
++            )
++        }
++        self._coord_store = None
++        asyncio.create_task(self.run())
++        asyncio.create_task(self.poll_and_execute_cmd())
++
++    async def _distribute_engine_identities(self, dp_size) -> None:
++        """Multi-node startup handshake: remote nodes request their slice of
++        the engine registry; reply to each until all remote engines are served."""
++        recv_engine_count = 0
++        while recv_engine_count < dp_size:
++            (
++                sender_identity,
++                empty_frame,
++                payload,
++            ) = await self.fault_receiver_socket.recv_multipart()
++            info = msgpack.loads(payload, strict_map_key=False)
++
++            start_engine_index = int(info["start_engine_index"])
++            node_engine_count = int(info["local_engine_count"])
++            recv_engine_count += node_engine_count
++
++            registry_slice = {
++                key: self.engine_identities[key]
++                for key in range(
++                    start_engine_index,
++                    start_engine_index + node_engine_count,
++                )
++            }
++            registry_slice_bytes = msgpack.dumps(registry_slice, use_bin_type=True)
++            await self.fault_receiver_socket.send_multipart(
++                [sender_identity, b"", registry_slice_bytes]
++            )
++
++    async def _send_utility_result(
++        self,
++        client_index: int,
++        call_id: int,
++        result: FaultToleranceResult,
++    ) -> None:
++        # Return the fault-tolerance execution result to the originating client.
++        uo = UtilityOutput(call_id=call_id)
++        uo.result = UtilityResult(result)
++        outputs = FTUtilityOutputs(utility_output=uo)
++        buffers = self._utility_encoder.encode(outputs)
++        await self.ft_result_sockets[client_index].send_multipart(buffers, copy=False)
++
++    async def pause(self, ft_request: FaultToleranceRequest):  # type: ignore[override]
++        """Expected params: timeout, exclude_engine_index (optional)."""
++        exclude_engine_index = ft_request.params.get("exclude_engine_index")
++        # Pause all healthy engines except ones being excluded.
++        target_engines = [
++            self.engine_identities[i - self.start_rank]
++            for i, status in self.engine_status_dict.items()
++            if status["status"] != EngineStatusType.DEAD.name.lower()
++            and (exclude_engine_index is None or i not in exclude_engine_index)
++        ]
++        res = await self._execute_cmd_on_engines(ft_request, target_engines)
++        if res.success:
++            logger.info("vLLM instance is paused and waiting for recovery commands.")
++        return res
++
++    async def retry(self, ft_request: FaultToleranceRequest):  # type: ignore[override]
++        """Expected params: timeout."""
++        for engine_status in self.engine_status_dict.values():
++            if engine_status["status"] == EngineStatusType.DEAD.name.lower():
++                logger.error("Engine core is dead; retry won't work.")
++                return FaultToleranceResult(ft_request.request_id, False, "Engine dead")
++
++        ip, store = init_distributed_coordination(self.parallel_config)
++        self._coord_store = store
++        ft_request.params["coord_store_port"] = self.parallel_config._coord_store_port
++        if "new_stateless_dp_group_port" not in ft_request.params:
++            ft_request.params["new_stateless_dp_group_port"] = get_open_port()
++
++        # try to recover all engines except ones already marked dead or being excluded.
++        target_engines = [
++            self.engine_identities[i - self.start_rank]
++            for i, status in self.engine_status_dict.items()
++        ]
++        res = await self._execute_cmd_on_engines(ft_request, target_engines)
++        if res.success:
++            logger.info("vLLM instance is recovered after retry command.")
++            for i in self.engine_status_dict:
++                self.engine_status_dict[i]["status"] = (
++                    EngineStatusType.HEALTHY.name.lower()
++                )
++            self.is_faulted.clear()
++            await self._pub_engine_status()
++        return res
++
++    @staticmethod
++    def get_mapping(original_list, to_remove) -> dict[int, int]:
++        to_remove_set = set(to_remove)
++        return {
++            original: new
++            for new, original in enumerate(
++                num for num in original_list if num not in to_remove_set
++            )
++        }
++
++    async def terminate_scale_down_engines(
++        self, exclude_dp_ranks, original_to_new, timeout
++    ) -> FaultToleranceResult:
++        dead_engine_identities = [
++            identity
++            for identity, index in self.engine_identity_to_index.items()
++            if index in exclude_dp_ranks
++            and self.engine_status_dict[index]["status"] != "dead"
++        ]
++
++        shutdown_request = FaultToleranceRequest.builder(
++            request_id=str(uuid.uuid4()),
++            instruction="shutdown_engine_core",
++            params={
++                "timeout": timeout,
++                "exclude_dp_ranks": exclude_dp_ranks,
++                "original_to_new": original_to_new,
++            },
++        )
++        res = await self._execute_cmd_on_engines(
++            shutdown_request, dead_engine_identities
++        )
++        return res
++
++    def update_config(self, exclude_dp_ranks, original_to_new):
++        exclude_set = set(exclude_dp_ranks)
++
++        for engine_index in exclude_dp_ranks:
++            self.engine_status_dict.pop(engine_index)
++
++        self.engine_identity_to_index = {
++            identity: idx
++            for identity, idx in self.engine_identity_to_index.items()
++            if idx not in exclude_set
++        }
++
++        idx_to_identity = {
++            idx: identity for identity, idx in self.engine_identity_to_index.items()
++        }
++        for old_idx, new_idx in original_to_new.items():
++            # Migrate engine status
++            if old_idx in self.engine_status_dict:
++                self.engine_status_dict[new_idx] = self.engine_status_dict.pop(old_idx)
++            # Update the mapping from engine identifier to index
++            if old_idx in idx_to_identity:
++                self.engine_identity_to_index[idx_to_identity[old_idx]] = new_idx
++
++        self.engine_identities = [
++            identity
++            for identity in self.engine_identities
++            if identity in self.engine_identity_to_index
++        ]
++
++    async def scale_down(
++        self, ft_request: FaultToleranceRequest
++    ) -> FaultToleranceResult:
++        exclude_dp_ranks = ft_request.params.get("exclude_dp_ranks")
++        timeout = ft_request.params.get("timeout")
++        assert timeout is not None, "timeout is required"
++        assert exclude_dp_ranks is not None, "exclude_dp_ranks is required"
++
++        ip, store = init_distributed_coordination(self.parallel_config)
++        self._coord_store = store
++        ft_request.params["coord_store_port"] = self.parallel_config._coord_store_port
++
++        original_to_new = self.get_mapping(
++            self.engine_status_dict.keys(), exclude_dp_ranks
++        )
++        target_engines = list(
++            {
++                identity
++                for identity, index in self.engine_identity_to_index.items()
++                if index not in exclude_dp_ranks
++            }
++        )
++
++        scale_down_request = FaultToleranceRequest.builder(
++            request_id=str(uuid.uuid4()),
++            instruction="scale_down",
++            params={
++                "timeout": timeout,
++                "exclude_dp_ranks": exclude_dp_ranks,
++                "original_to_new": original_to_new,
++                "coord_store_port": self.parallel_config._coord_store_port,
++            },
++        )
++        res = await self._execute_cmd_on_engines(scale_down_request, target_engines)
++
++        if res.success:
++            await self.terminate_scale_down_engines(
++                exclude_dp_ranks, original_to_new, timeout
++            )
++            self.update_config(exclude_dp_ranks, original_to_new)
++            for i in self.engine_status_dict:
++                self.engine_status_dict[i]["status"] = (
++                    EngineStatusType.HEALTHY.name.lower()
++                )
++            await self._pub_engine_status(
++                type="scale_down",
++                exclude_dp_ranks=exclude_dp_ranks,
++                original_to_new=original_to_new,
++            )
++            self.is_faulted.clear()
++
++        return res
++
++    async def _pub_engine_status(self, **extra_fields):
++        engine_status = self.engine_status_dict.copy()
++        pub_msg = {
++            "total_engines": len(engine_status),
++            "engines": [
++                {"id": i, "status": status["status"]}
++                for i, status in engine_status.items()
++            ],
++            **extra_fields,
++        }
++        topic = FAULT_STATE_PUB_TOPIC.encode()
++        await self.fault_state_pub_socket.send_multipart(
++            (topic, msgspec.msgpack.encode(pub_msg))
++        )
++
++    async def _execute_cmd_on_engines(
++        self, ft_request: FaultToleranceRequest, target_engines: list[bytes]
++    ) -> FaultToleranceResult:
++        coroutines = []
++        # dispatch commands to target engines
++        for core_engine in target_engines:
++            coro = self.call_utility_async(
++                "handle_fault", ft_request, engine=core_engine
++            )
++            coroutines.append(coro)
++
++        timeout = ft_request.params["timeout"]
++        try:
++            results = await asyncio.wait_for(
++                asyncio.gather(*coroutines),
++                timeout=timeout,
++            )
++        except asyncio.TimeoutError:
++            return FaultToleranceResult(
++                request_id=ft_request.request_id,
++                success=False,
++                reason=f"Timed out after {timeout}s waiting for engine responses.",
++            )
++
++        results = [FaultToleranceResult(**res) for res in results]
++        return FaultToleranceResult(
++            request_id=ft_request.request_id,
++            success=all(res.success for res in results),
++            reason="\n".join(
++                f"Engine {self.engine_identity_to_index[engine]}: {res.reason}"
++                for engine, res in zip(target_engines, results)
++                if not res.success
++            )
++            or None,
++        )
++
++    async def run(self):
++        """Receive fault info from engine and pause engines if happened."""
++        await self._distribute_engine_identities(self.dp_size)
++        try:
++            while not self.sentinel_dead:
++                _, _, message = await self.fault_receiver_socket.recv_multipart()
++                fault_info = msgspec.msgpack.decode(message, type=FaultInfo)
++                # Update engine status
++                if (
++                    fault_info.engine_identity
++                    and fault_info.engine_identity not in self.core_client.core_engines
++                ):
++                    continue
++                status_enum = EngineStatusType(fault_info.engine_status)
++                engine_id = self.engine_identity_to_index[fault_info.engine_identity]
++                self.engine_status_dict[engine_id] = {
++                    "status": status_enum.name.lower()
++                }
++                await self._pub_engine_status()
++                if (
++                    not self.is_faulted.is_set()
++                    and status_enum != EngineStatusType.HEALTHY
++                ):
++                    self.is_faulted.set()
++                    # todo: Timeout for DeepEP/nixl-ep kernel is fixed to 100 seconds
++                    timeout = max(DEEP_EP_KERNEL_TIMEOUT, self.gloo_timeout_seconds) + 5
++                    pause_request = FaultToleranceRequest.builder(
++                        request_id=str(uuid.uuid4()),
++                        instruction="pause",
++                        params={"timeout": timeout},
++                    )
++                    asyncio.create_task(self.pause(pause_request))
++
++        except zmq.ZMQError:
++            logger.info("Fault receiver socket closed, stopping async monitor.")
++
++    async def refresh_engine_status(self, new_data_parallel_size: int):
++        # Update the engine status dict and publish the new status.
++        for engine, status in self.engine_status_dict.items():
++            if status["status"] != "healthy":
++                msg = f"Cannot scale elastic EP because engine {engine} is not healthy."
++                logger.error(msg)
++                raise RuntimeError(msg)
++
++        # TODO: Elastic EP currently supports only Ray + internal LB.
++        # The current refresh behavior assumes that ranks have been reassigned to start
++        # from 0 and be contiguous after scale down. This is true for Ray + internal LB
++        # but this logic may need to be revisited when support for MP and other LB modes
++        # are added.
++        self.engine_status_dict = {
++            engine_index: {"status": "healthy"}
++            for engine_index in range(new_data_parallel_size)
++        }
++        await self._pub_engine_status()
++
++    async def poll_and_execute_cmd(self):
++        """Poll and execute fault tolerance commands."""
++        generic_decoder = MsgpackDecoder()
++        # Initialize request sockets.
++        for request_socket in self.ft_request_sockets:
++            await request_socket.send(b"")
++
++        poller = zmq.asyncio.Poller()
++        for sock in self.ft_request_sockets:
++            poller.register(sock, zmq.POLLIN)
++
++        while not self.sentinel_dead:
++            try:
++                events = await poller.poll(timeout=100)
++                if not events:
++                    continue
++                for sock, event in events:
++                    # Receive a client FT request, execute it, and route the result back
++                    _, *msg = await sock.recv_multipart(copy=False)
++                    client_index, call_id, _, ft_args = generic_decoder.decode(msg)
++                    ft_request = FaultToleranceRequest(**ft_args[0])
++                    ft_result = await getattr(self, ft_request.instruction)(ft_request)
++                    await self._send_utility_result(client_index, call_id, ft_result)
++            except zmq.ZMQError:
++                logger.info("Sockets closed, terminating.")
++                self.sentinel_dead = True
++
++    def shutdown(self):
++        self.sentinel_dead = True
++        close_sockets([self.fault_receiver_socket, self.fault_state_pub_socket])
++        close_sockets(self.ft_request_sockets + self.ft_result_sockets)
++        self._coord_store = None
++        super().shutdown()
+Index: vllm/v1/fault_tolerance/engine_core_sentinel.py
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/vllm/v1/fault_tolerance/engine_core_sentinel.py b/vllm/v1/fault_tolerance/engine_core_sentinel.py
+new file mode 100644
+--- /dev/null	(revision e5fb95ff43c2efc46ecd6eaee0f355326276a174)
++++ b/vllm/v1/fault_tolerance/engine_core_sentinel.py	(revision e5fb95ff43c2efc46ecd6eaee0f355326276a174)
+@@ -0,0 +1,554 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++import queue
++import sys
++import threading
++import time
++import traceback
++import uuid
++from collections.abc import Callable
++from typing import TYPE_CHECKING, Any
++
++import msgspec.msgpack
++import zmq
++
++from vllm.config import ParallelConfig, VllmConfig, set_current_vllm_config
++from vllm.distributed import stateless_destroy_torch_distributed_process_group
++from vllm.logger import init_logger
++from vllm.utils.network_utils import close_sockets, make_zmq_socket
++from vllm.v1.engine import EngineCoreRequestType, EngineStatusType
++from vllm.v1.engine.exceptions import EngineLoopPausedError
++from vllm.v1.fault_tolerance.sentinel import BaseSentinel
++from vllm.v1.fault_tolerance.utils import (
++    FaultInfo,
++    FaultToleranceRequest,
++    FaultToleranceResult,
++)
++from vllm.v1.serial_utils import run_method
++
++if TYPE_CHECKING:
++    from vllm.v1.engine.core import DPEngineCoreProc, EngineCoreProc
++
++logger = init_logger(__name__)
++
++
++class EngineCoreSentinel(BaseSentinel):
++    """
++    EngineCoreSentinel monitors a single EngineCore instance, responsible for:
++      1. Receiving fault signals (exceptions raised in EngineCore busy loop)
++      2. Receiving and executing commands from ClientSentinel
++      3. Reporting execution results or faults back to the ClientSentinel
++    """
++
++    def __init__(
++        self,
++        parallel_config: ParallelConfig,
++        engine_index: int,
++        engine_input_q: queue.Queue,
++        engine_fault_socket_addr: str,
++        sentinel_identity: bytes,
++        worker_cmd_addr: str,
++        engine: "EngineCoreProc",
++    ):
++        self.engine_index = engine_index
++        super().__init__(
++            parallel_config,
++            f"DP_{engine_index}",
++            sentinel_identity,
++        )
++        self.engine_identity = self.engine_index.to_bytes(length=2, byteorder="little")
++        self.engine = engine
++        self.data_parallel_size = parallel_config.data_parallel_size
++        self.fault_signal_q: queue.Queue[Exception] = queue.Queue()
++        self.cmd_q: queue.Queue[FaultToleranceRequest | None] = queue.Queue(maxsize=1)
++
++        self.engine_recovery_timeout_sec = (
++            parallel_config.fault_tolerance_config.engine_recovery_timeout_sec
++        )
++        self.stop_busy_loop = threading.Event()
++        self.busy_loop_paused = threading.Event()
++        self.engine_input_q = engine_input_q
++        self.worker_cmd_socket = make_zmq_socket(
++            ctx=self.ctx,
++            path=worker_cmd_addr,
++            socket_type=zmq.ROUTER,
++            bind=True,
++        )
++        self.worker_cmd_poller = zmq.Poller()
++        self.worker_cmd_poller.register(self.worker_cmd_socket, zmq.POLLIN)
++        self.worker_identities = [
++            f"PP{pp_rank}_TP{tp_rank}".encode()
++            for tp_rank in range(parallel_config.tensor_parallel_size)
++            for pp_rank in range(parallel_config.pipeline_parallel_size)
++        ]
++
++        # Client <-> EngineCoreSentinel sockets
++        self.engine_fault_socket = make_zmq_socket(
++            self.ctx,
++            engine_fault_socket_addr,
++            zmq.DEALER,
++            bind=False,
++            identity=sentinel_identity,
++        )
++
++        threading.Thread(
++            target=self.run, daemon=True, name="EngineCoreSentinelMonitorThread"
++        ).start()
++
++    def run(self):
++        """Continuously poll for fault signals and report to client sentinel."""
++        while not self.sentinel_dead:
++            # Check for engine fault signals
++            self.poll_and_report_fault_events()
++
++    def poll_and_report_fault_events(self):
++        try:
++            engine_exception = self.fault_signal_q.get(timeout=1)
++            logger.error(
++                "%s Detected exception %s: %s\n Call Stack:\n%s",
++                self.sentinel_name,
++                type(engine_exception).__name__,
++                engine_exception,
++                "".join(traceback.format_tb(engine_exception.__traceback__)),
++            )
++            engine_status = (
++                EngineStatusType.PAUSED
++                if isinstance(engine_exception, EngineLoopPausedError)
++                else EngineStatusType.UNHEALTHY
++            )
++            msg = FaultInfo.from_exception(
++                engine_exception, self.engine_index, engine_status, self.engine_identity
++            )
++            msg_bytes = msgspec.msgpack.encode(msg)
++            self.engine_fault_socket.send_multipart([b"", msg_bytes])
++        except queue.Empty:
++            pass
++
++    def handle_fault(self, ft_request: FaultToleranceRequest) -> FaultToleranceResult:
++        return self._execute_cmd(ft_request)
++
++    def pause(self, ft_request: FaultToleranceRequest) -> FaultToleranceResult:
++        """Pause the busy loop of engine core safely."""
++        logger.info("Start pausing EngineCore")
++        timeout = ft_request.params["timeout"]
++        deadline = time.monotonic() + timeout
++        # set the flag to signal busy loop should pause
++        self.stop_busy_loop.set()
++        # Put a wakeup request to unblock the busy loop
++        # if it's blocked on input_queue.get()
++        self.engine_input_q.put((EngineCoreRequestType.WAKEUP, None))
++        self._execute_command_on_workers(
++            FaultToleranceRequest(str(uuid.uuid4()), "pause", ft_request.params),
++            self.worker_identities,
++            timeout=timeout,
++        )
++        remaining_timeout = max(0, deadline - time.monotonic())
++        success = self.busy_loop_paused.wait(remaining_timeout)
++        logger.info("Engine finished the pause instruction.")
++        return FaultToleranceResult(
++            request_id=ft_request.request_id,
++            success=success,
++            reason=None if success else "Busy loop did not pause within timeout.",
++        )
++
++    def retry(self, ft_request: FaultToleranceRequest) -> FaultToleranceResult:
++        """
++        Handle the retry instruction from the ClientSentinel.
++        This instruction tells the EngineCore to continue its busy loop
++        after being suspended due to an exception.
++        """
++        if not self.busy_loop_paused.is_set():
++            return FaultToleranceResult(ft_request.request_id, True)
++        timeout = ft_request.params["timeout"]
++        self.parallel_config._coord_store_port = ft_request.params["coord_store_port"]
++        res = self._execute_command_on_workers(
++            FaultToleranceRequest(str(uuid.uuid4()), "retry", ft_request.params),
++            self.worker_identities,
++            timeout=timeout,
++        )
++        if not res.success:
++            return res
++        if self.data_parallel_size > 1:
++            # If the Gloo communication times out,
++            # the data parallel group (dp_group) needs to be reinitialized
++            reinit_request = FaultToleranceRequest(
++                instruction="reinit_dp_group_on_fault_tolerance",
++                request_id=str(uuid.uuid4()),
++                params={},
++            )
++            self.cmd_q.put(reinit_request)
++        else:
++            self.cmd_q.put(None)
++
++        self.stop_busy_loop.clear()
++        logger.info("Engine finished the retry instruction.")
++        return FaultToleranceResult(
++            request_id=ft_request.request_id,
++            success=True,
++        )
++
++    def _calculate_exclude_ep_ranks(
++        self, exclude_dp_ranks: list[int], vllm_config: VllmConfig
++    ) -> list[int]:
++        """Calculate excluded EP ranks from excluded DP ranks."""
++        tensor_model_parallel_size = vllm_config.parallel_config.tensor_parallel_size
++        exclude_ep_ranks: list[int] = []
++        for dp_rank in exclude_dp_ranks:
++            start = dp_rank * tensor_model_parallel_size
++            end = (dp_rank + 1) * tensor_model_parallel_size
++            exclude_ep_ranks.extend(range(start, end))
++
++        exclude_ep_ranks = sorted(list(set(exclude_ep_ranks)))
++        return exclude_ep_ranks
++
++    def _calculate_parallel_config(
++        self, vllm_config: VllmConfig, exclude_dp_ranks_list: list[int]
++    ):
++        """Parse excluded DP ranks to
++        calculate scaled-down EP/DP sizes and DP rank mapping."""
++        if vllm_config.parallel_config.pipeline_parallel_size > 1:
++            raise NotImplementedError(
++                "Pipeline parallel is not supported for scaling down."
++            )
++        tp_size = vllm_config.parallel_config.tensor_parallel_size
++        old_dp_size = vllm_config.parallel_config.data_parallel_size
++
++        new_dp_size = old_dp_size - len(exclude_dp_ranks_list)
++        new_ep_size = new_dp_size * tp_size
++
++        return new_ep_size, new_dp_size
++
++    def _build_vllm_config_update_dict(
++        self,
++        parallel_config: Any,
++        new_ep_size: int,
++        data_parallel_size: int,
++        rank_mapping: Any,
++    ) -> dict[str, Any]:
++        """Build dictionary of VLLM config updates for downstream workers.
++
++        Args:
++            parallel_config: Current parallel configuration object
++            new_ep_size: New expert parallelism size
++            data_parallel_size: New data parallelism size
++            rank_mapping: New rank mapping after exclusion
++
++        Returns:
++            Dict[str, Any]: VLLM configuration update parameters
++        """
++        return {
++            "ep_world_size": new_ep_size,
++            "rank_mapping": rank_mapping,
++            "data_parallel_size": data_parallel_size,
++            "data_parallel_rank": parallel_config.data_parallel_rank,
++            "data_parallel_size_local": parallel_config.data_parallel_size_local,
++            "expert_parallel_size": (
++                data_parallel_size
++                * parallel_config.pipeline_parallel_size
++                * parallel_config.tensor_parallel_size
++            ),
++            "data_parallel_master_port": parallel_config.data_parallel_master_port,
++        }
++
++    def reinit_dp_group_on_fault_tolerance(self):
++        if not isinstance(self.engine, DPEngineCoreProc):
++            return
++        stateless_destroy_torch_distributed_process_group(self.engine.dp_group)
++        self.engine.dp_group = (
++            self.engine.vllm_config.parallel_config.stateless_init_dp_group()
++        )
++        self.engine.step_counter = 0
++
++    def scale_down(self, ft_request: FaultToleranceRequest) -> FaultToleranceResult:
++        """Scale down the engine cluster by removing specified DP ranks.
++
++        This method adjusts parallel configuration parameters,
++        broadcasts the scale_down command to downstream workers,
++        and reinitializes the DP group for fault tolerance.
++        """
++        # Validate required keyword arguments
++        # Extract and type-cast parameters from kwargs
++        timeout = ft_request.params["timeout"]
++        original_to_new = ft_request.params["original_to_new"]
++        exclude_dp_ranks = ft_request.params["exclude_dp_ranks"]
++        self.parallel_config._coord_store_port = ft_request.params["coord_store_port"]
++        deadline = time.monotonic() + timeout
++        original_to_new = {int(k): v for k, v in original_to_new.items()}
++        self.engine_index = original_to_new[self.engine_index]
++        self.sentinel_tag = f"DP_{self.engine_index}"
++        exclude_ep_ranks = self._calculate_exclude_ep_ranks(
++            exclude_dp_ranks, self.engine.vllm_config
++        )
++
++        new_ep_size, data_parallel_size = self._calculate_parallel_config(
++            self.engine.vllm_config, exclude_dp_ranks
++        )
++        with set_current_vllm_config(self.engine.vllm_config):
++            parallel_config = self.engine.vllm_config.parallel_config
++            self.engine.update_parallel_config(data_parallel_size, original_to_new)
++            vllm_config_update_dict = self._build_vllm_config_update_dict(
++                parallel_config, new_ep_size, data_parallel_size, original_to_new
++            )
++            res = self._execute_command_on_workers(
++                FaultToleranceRequest(
++                    request_id=str(uuid.uuid4()),
++                    instruction="scale_down",
++                    params={
++                        "timeout": timeout,
++                        "exclude_ep_ranks": exclude_ep_ranks,
++                        "vllm_config_update_dict": vllm_config_update_dict,
++                        "coord_store_port": self.parallel_config._coord_store_port,
++                    },
++                ),
++                self.worker_identities,
++                timeout=timeout,
++            )
++            if not res.success:
++                return res
++
++        reinit_request = FaultToleranceRequest(
++            instruction="reinit_dp_group_on_fault_tolerance",
++            request_id=str(uuid.uuid4()),
++            params={},
++        )
++        # Clear stop_busy_loop BEFORE enqueueing so the loop won't
++        # immediately re-pause after executing the reinit command.
++        self.stop_busy_loop.clear()
++        self.cmd_q.put(reinit_request)
++
++        # Poll until busy_loop_paused is cleared (loop resumed) or timeout.
++        # If reinit fails, busy_loop_paused stays set → timeout → failure.
++        while self.busy_loop_paused.is_set():
++            remaining = deadline - time.monotonic()
++            if remaining <= 0:
++                return FaultToleranceResult(
++                    request_id=ft_request.request_id,
++                    success=False,
++                    reason="Engine did not resume within timeout.",
++                )
++            time.sleep(0.1)
++
++        logger.info("Engine finished the scale down instruction.")
++        return FaultToleranceResult(
++            request_id=ft_request.request_id,
++            success=True,
++        )
++
++    def _execute_command_on_workers(
++        self,
++        ft_request: FaultToleranceRequest,
++        target_worker_sentinels: list[bytes],
++        timeout: int = 5,
++    ) -> FaultToleranceResult:
++        request_bytes = msgspec.msgpack.encode(ft_request)
++        for identity in target_worker_sentinels:
++            self.worker_cmd_socket.send_multipart([identity, b"", request_bytes])
++
++        results: dict[bytes, FaultToleranceResult] = {}
++        pending = set(target_worker_sentinels)
++        deadline = time.monotonic() + timeout
++
++        while pending:
++            remaining = deadline - time.monotonic()
++            if remaining <= 0:
++                break
++
++            events = dict(self.worker_cmd_poller.poll(timeout=int(remaining * 1000)))
++            if self.worker_cmd_socket not in events:
++                continue
++
++            identity, _, msg = self.worker_cmd_socket.recv_multipart()
++
++            res = msgspec.msgpack.decode(msg, type=FaultToleranceResult)
++
++            # Only consider responses that match the current request ID.
++            if identity not in pending or res.request_id != ft_request.request_id:
++                continue
++
++            results[identity] = res
++            pending.remove(identity)
++
++        # For any workers that did not respond within the timeout, mark them as failed.
++        for identity in pending:
++            results[identity] = FaultToleranceResult(
++                request_id=ft_request.request_id,
++                success=False,
++                reason=f"did not respond within {timeout}s",
++            )
++
++        return FaultToleranceResult(
++            request_id=ft_request.request_id,
++            success=all(result.success for result in results.values()),
++            reason="\n".join(
++                f"Worker {identity.decode()}: {result.reason}"
++                for identity, result in results.items()
++                if not result.success
++            )
++            or None,
++        )
++
++    def check_worker_responsive(self) -> bool:
++        # Check if workers are responsive. Should only be called in busy_loop thread.
++        try:
++            self.engine.model_executor.check_health()
++            return True
++        except TimeoutError:
++            logger.warning("Executor check_health() timeout; worker not responsive.")
++            return False
++        except Exception as err:
++            logger.error(
++                "Worker health check raised unexpected exception, shutdown the engine."
++            )
++            raise SystemExit from err
++
++    def drain_stale_executor_responses(self, executor, num_stale, timeout):
++        """Drain stale futures and pending responses from the executor's
++        message queues before issuing a new collective_rpc."""
++        deadline = time.monotonic() + timeout
++        if not executor.response_mqs:
++            return
++        logger.info("[FT] Draining %d stale response(s) from response queue", num_stale)
++        if executor.kv_output_aggregator is not None:
++            mqs = executor.response_mqs
++        else:
++            mqs = (executor.response_mqs[executor.output_rank],)
++        for mq in mqs:
++            for _ in range(num_stale):
++                try:
++                    mq.dequeue(deadline - time.monotonic())
++                except TimeoutError as err:
++                    raise RuntimeError(
++                        "Timed out while draining stale responses from executor. "
++                    ) from err
++                except Exception:
++                    break
++
++    def shutdown_engine_core(
++        self, ft_request: FaultToleranceRequest
++    ) -> FaultToleranceResult:
++        shutdown_request = FaultToleranceRequest(
++            instruction="shutdown",
++            request_id=str(uuid.uuid4()),
++            params={},
++        )
++
++        self.cmd_q.put(shutdown_request)
++
++        return FaultToleranceResult(
++            request_id=ft_request.request_id,
++            success=True,
++            reason=None,
++        )
++
++    def shutdown(self):
++        close_sockets([self.engine_fault_socket, self.worker_cmd_socket])
++        super().shutdown()
++
++    def drain_engine_responses(self):
++        num_stale_futures = 0
++        while self.engine.batch_queue:
++            future, scheduler_output, exec_model_fut = self.engine.batch_queue.pop()
++            try:
++                num_stale_futures += 1
++                future.result()
++            except Exception:
++                pass
++        logger.info("Drained %s responses from engine batch_queue.", num_stale_futures)
++
++
++def fault_tolerant_wrapper(busy_loop_func: Callable):
++    """
++    Wrap the busy loop function to perform fault tolerance.
++    """
++    from vllm.v1.engine.core import logger
++
++    def run_with_fault_tolerance(self: "EngineCoreProc"):
++        while True:
++            try:
++                if self.enable_fault_tolerance:
++                    self.engine_core_sentinel.busy_loop_paused.clear()
++                busy_loop_func(self)
++            except SystemExit:
++                raise
++            except Exception as original_exc:
++                if self.enable_fault_tolerance:
++                    deadline = (
++                        time.monotonic()
++                        + self.engine_core_sentinel.engine_recovery_timeout_sec
++                    )
++                    self.engine_core_sentinel.busy_loop_paused.set()
++                    logger.warning(
++                        "[BusyLoopWrapper] EngineCore busy loop raised a %s exception.",
++                        type(original_exc).__name__,
++                    )
++                    check_stale_cnt = 0
++                    while (
++                        not self.engine_core_sentinel.check_worker_responsive()
++                        and time.monotonic() < deadline
++                    ):
++                        logger.warning(
++                            "[BusyLoopWrapper] Worker is not responsive. Checking..."
++                        )
++                        check_stale_cnt += 1
++                        time.sleep(1)
++                    logger.warning(
++                        "[BusyLoopWrapper] Engine loop suspended. "
++                        "Wait for fault tolerance instructions."
++                    )
++                    self.engine_core_sentinel.drain_stale_executor_responses(
++                        self.model_executor,
++                        check_stale_cnt,
++                        deadline - time.monotonic(),
++                    )
++                    self.engine_core_sentinel.drain_engine_responses()
++
++                    self.engine_core_sentinel.fault_signal_q.put(original_exc)
++                    # Put running requests into waiting list.
++                    timestamp = time.monotonic()
++                    while self.scheduler.running:  # type: ignore[attr-defined]
++                        request = self.scheduler.running.pop()  # type: ignore[attr-defined]
++                        self.scheduler.preempt_request(request, timestamp)  # type: ignore[attr-defined]
++                    self.scheduler.prev_step_scheduled_req_ids.clear()  # type: ignore[attr-defined]
++                    if self.batch_queue is not None:
++                        assert len(self.batch_queue) == 0, (
++                            f"batch_queue should be empty after draining, "
++                            f"but got {len(self.batch_queue)}"
++                        )
++
++                    try:
++                        # Block until recovery command received
++                        ft_request = self.engine_core_sentinel.cmd_q.get(
++                            timeout=max(0, deadline - time.monotonic())
++                        )
++
++                        if ft_request is not None:
++                            logger.debug(
++                                "[BusyLoopWrapper] Received fault tolerance "
++                                "command: %s",
++                                ft_request.instruction,
++                            )
++                            method, params = (ft_request.instruction, ft_request.params)
++                            if method == "shutdown":
++                                sys.exit()
++                            run_method(self, method, args=(), kwargs=params)
++                        # recovery succeeded; restart the busy loop
++                        continue
++                    except queue.Empty:
++                        # No handling instruction received within predefined
++                        # timeout period.
++                        logger.error(
++                            "[BusyLoopWrapper] Fault tolerance instruction not received"
++                            " within timeout. Proceeding with default exception "
++                            "handling."
++                        )
++                    except Exception as cmd_exc:
++                        raise RuntimeError(
++                            "Fault tolerance execution failed."
++                        ) from cmd_exc
++
++                    # Fault tolerance not enabled OR no instruction received
++                    # before timeout. Re-raise the original exception
++                    # for upper level handling.
++                raise original_exc
++
++    return run_with_fault_tolerance
+Index: vllm/v1/fault_tolerance/sentinel.py
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/vllm/v1/fault_tolerance/sentinel.py b/vllm/v1/fault_tolerance/sentinel.py
+new file mode 100644
+--- /dev/null	(revision 13405043435ce8540ae1af757d5cee1e06cf8278)
++++ b/vllm/v1/fault_tolerance/sentinel.py	(revision 13405043435ce8540ae1af757d5cee1e06cf8278)
+@@ -0,0 +1,88 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++import traceback
++from abc import ABC, abstractmethod
++
++import zmq
++
++from vllm.config import ParallelConfig
++from vllm.logger import init_logger
++from vllm.v1.fault_tolerance.utils import (
++    FaultToleranceRequest,
++    FaultToleranceResult,
++)
++from vllm.v1.serial_utils import run_method
++
++logger = init_logger(__name__)
++
++
++class BaseSentinel(ABC):
++    """
++    Core functionalities of the sentinel covered:
++    - Fault listening
++    - Fault tolerance instruction reception
++    - Fault tolerance instruction execution
++    - Upstream and downstream communication
++    """
++
++    def __init__(
++        self,
++        parallel_config: ParallelConfig,
++        sentinel_tag: str | None,
++        identity: bytes,
++    ):
++        self.parallel_config = parallel_config
++        self.sentinel_dead = False
++        if not hasattr(self, "ctx"):
++            self.ctx = zmq.Context()
++        self.sentinel_tag = sentinel_tag
++        self.identity = identity
++
++    @property
++    def sentinel_name(self) -> str:
++        if self.sentinel_tag is None:
++            return f"[{self.__class__.__name__}] "
++        return f"[{self.__class__.__name__}_{self.sentinel_tag}] "
++
++    @abstractmethod
++    def run(self) -> None:
++        """
++        Run continuously to listen for control commands or error signals;
++        on receipt, execute the command or report the result.
++        """
++        raise NotImplementedError
++
++    def _execute_cmd(self, ft_request: FaultToleranceRequest) -> FaultToleranceResult:
++        method = ft_request.instruction
++        try:
++            res = run_method(self, method, args=(ft_request,), kwargs={})
++            logger.debug("Command (%s) succeeded: %s", method, res.success)
++        except Exception as e:
++            logger.exception("Command (%s) failed", method)
++            res = FaultToleranceResult(
++                ft_request.request_id,
++                False,
++                f"{type(e).__name__}: {e}\n{traceback.format_exc()}",
++            )
++        return res
++
++    @abstractmethod
++    def pause(self, ft_request: FaultToleranceRequest) -> FaultToleranceResult:
++        """
++        Pause the vLLM instance to enter fault-tolerance mode.
++        This method should be called when a fault is detected. It pauses the
++        execution, allowing the system to wait for fault-tolerance instructions
++        (e.g., retry, scale-down, or other control commands).
++        """
++        raise NotImplementedError
++
++    @abstractmethod
++    def retry(self, ft_request: FaultToleranceRequest) -> FaultToleranceResult:
++        """
++        Retry execution after a transient recoverable fault.
++        """
++        raise NotImplementedError
++
++    def shutdown(self):
++        self.sentinel_dead = True
++        self.ctx.term()
+Index: vllm/v1/fault_tolerance/utils.py
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/vllm/v1/fault_tolerance/utils.py b/vllm/v1/fault_tolerance/utils.py
+new file mode 100644
+--- /dev/null	(revision 341aa9d1568a8e71ec4b79634525b48e5ea42e5c)
++++ b/vllm/v1/fault_tolerance/utils.py	(revision 341aa9d1568a8e71ec4b79634525b48e5ea42e5c)
+@@ -0,0 +1,246 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++import contextlib
++import json
++import time
++import uuid
++from dataclasses import dataclass
++from typing import Any
++
++import msgspec
++import zmq
++
++from vllm.config import FaultToleranceConfig
++from vllm.utils.network_utils import make_zmq_socket
++from vllm.v1.engine import EngineStatusType
++from vllm.v1.utils import get_engine_client_zmq_addr, logger
++
++FAULT_STATE_PUB_TOPIC = "vllm_fault"
++
++
++class FaultInfo(msgspec.Struct):
++    type: str
++    message: str
++    engine_status: EngineStatusType
++    engine_id: str | None = None
++    engine_identity: bytes | None = None
++    timestamp: str | None = None
++    additional_info: dict | None = None
++
++    @classmethod
++    def from_exception(
++        cls,
++        exception: Exception,
++        engine_id: str | int,
++        engine_status: EngineStatusType,
++        engine_identity: bytes | None = None,
++        additional_info: dict | None = None,
++    ) -> "FaultInfo":
++        """Create FaultInfo from an exception."""
++        local_time = time.localtime(time.time())
++        return cls(
++            type=type(exception).__name__,
++            message=str(exception),
++            engine_id=str(engine_id),
++            engine_status=engine_status,
++            engine_identity=engine_identity,
++            timestamp=time.strftime("%H:%M:%S", local_time),
++            additional_info=additional_info or {},
++        )
++
++
++class FaultToleranceResult(msgspec.Struct):
++    """
++    Result of applying fault tolerance instructions.
++    """
++
++    request_id: str
++    success: bool
++    reason: str | None = None
++
++
++class FaultToleranceRequest(msgspec.Struct):
++    """
++    Request for fault tolerance instructions, used in the fault tolerance protocol.
++    """
++
++    request_id: str
++    instruction: str
++    params: dict[str, Any]
++
++    @classmethod
++    def builder(
++        cls, request_id: str, instruction: str, params: dict[str, Any]
++    ) -> "FaultToleranceRequest":
++        return cls(request_id=request_id, instruction=instruction, params=params)
++
++
++@dataclass
++class FaultToleranceZmqAddresses:
++    ft_request_addresses: list[str]
++    ft_result_addresses: list[str]
++    # ZMQ fault_state_pub_socket address of client sentinel
++    fault_state_pub_socket_addr: str
++    # ZMQ engine_fault socket address of EngineCoreSentinel
++    engine_fault_socket_addr: str
++    # Identities of engine core DEALER sockets, keyed by engine index.
++    # These identities are used by the ClientSentinel (ROUTER) to route
++    # messages to the corresponding engine core.
++    engine_core_sentinel_identities: dict[int, bytes]
++
++    @classmethod
++    def build(
++        cls,
++        host,
++        dp_size,
++        ft_request_addresses,
++        ft_result_addresses,
++        ft_config: FaultToleranceConfig,
++    ):
++        engine_fault_socket_addr = get_engine_client_zmq_addr(
++            local_only=False,
++            host=host,
++            port=ft_config.internal_fault_report_port,
++        )
++        identity_group = [str(uuid.uuid4()).encode("utf8") for _ in range(dp_size)]
++        engine_core_sentinel_identities = {
++            rank: identity for rank, identity in enumerate(identity_group)
++        }
++        fault_state_pub_socket_addr = get_engine_client_zmq_addr(
++            local_only=False,
++            host=host,
++            port=ft_config.external_fault_notify_port,
++        )
++        return cls(
++            fault_state_pub_socket_addr=fault_state_pub_socket_addr,
++            engine_fault_socket_addr=engine_fault_socket_addr,
++            engine_core_sentinel_identities=engine_core_sentinel_identities,
++            ft_request_addresses=ft_request_addresses,
++            ft_result_addresses=ft_result_addresses,
++        )
++
++    def to_str(self) -> str:
++        payload = {
++            "fault_state_pub_socket_addr": self.fault_state_pub_socket_addr,
++            "engine_fault_socket_addr": self.engine_fault_socket_addr,
++            "ft_request_addresses": self.ft_request_addresses,
++            "ft_result_addresses": self.ft_result_addresses,
++            "engine_core_sentinel_identities": {
++                str(rank): identity.hex()
++                for rank, identity in self.engine_core_sentinel_identities.items()
++            },
++        }
++        return json.dumps(payload, separators=(",", ":"))
++
++    @classmethod
++    def from_str(cls, s: str) -> "FaultToleranceZmqAddresses":
++        payload = json.loads(s)
++        identities = {
++            int(rank): bytes.fromhex(identity_hex)
++            for rank, identity_hex in payload["engine_core_sentinel_identities"].items()
++        }
++        return cls(
++            ft_request_addresses=payload["ft_request_addresses"],
++            ft_result_addresses=payload["ft_result_addresses"],
++            fault_state_pub_socket_addr=payload["fault_state_pub_socket_addr"],
++            engine_fault_socket_addr=payload["engine_fault_socket_addr"],
++            engine_core_sentinel_identities=identities,
++        )
++
++
++def validate_ft_request(
++    engines: list[dict[str, object]],
++    request_id: str,
++    instruction: str,
++    exclude_dp_ranks: Any = None,
++) -> FaultToleranceResult | None:
++    """Validate engine status before forwarding a fault tolerance instruction.
++
++    Returns None if validation passes (caller should proceed to execute),
++    or a FaultToleranceResult with success=False if validation fails
++    (caller should return it immediately).
++
++    Validation rules:
++    - **pause**: Always passes — pause itself transitions healthy engines
++      to paused/unhealthy, so rejecting on healthy would create a deadlock.
++    - **retry**: Rejects if any engine is still healthy. After pause, all
++      engines should be paused/unhealthy; a healthy engine at this stage
++      indicates it may have hung during pause, so retry cannot safely proceed.
++    - **scale_down**: Only checks retained engines (those NOT in
++      exclude_dp_ranks). Excluded ranks are being removed and their
++      hung/healthy state is irrelevant to the scale-down operation.
++    - Unknown instructions are passed through without validation.
++    """
++    exclude_set: set[int] = set()
++    if exclude_dp_ranks is not None:
++        exclude_set = set(exclude_dp_ranks)
++
++    if instruction == "pause":
++        # No pre-condition: pause is the first step that puts engines
++        # into paused/unhealthy state.
++        return None
++
++    healthy_engines = [
++        e for e in engines if e["status"] == EngineStatusType.HEALTHY.name.lower()
++    ]
++
++    if instruction == "retry":
++        if healthy_engines:
++            return FaultToleranceResult(
++                request_id=request_id,
++                success=False,
++                reason=(
++                    "Some engines are still healthy — may have hung during "
++                    f"pause: {healthy_engines}"
++                ),
++            )
++        return None
++
++    if instruction == "scale_down":
++        # Only care about engines that will be kept.
++        healthy_retained = [e for e in healthy_engines if e["id"] not in exclude_set]
++        if healthy_retained:
++            return FaultToleranceResult(
++                request_id=request_id,
++                success=False,
++                reason=(
++                    "Some retained engines are still healthy — may have hung "
++                    f"during pause: {healthy_retained}"
++                ),
++            )
++        return None
++
++    # Unknown / future instruction — let it through.
++    return None
++
++
++def make_engine_down_report_socket(vllm_config):
++    zmq_ctx = zmq.Context()
++    zmq_addr = get_engine_client_zmq_addr(
++        local_only=False,
++        host=vllm_config.parallel_config.data_parallel_master_ip,
++        port=vllm_config.parallel_config.fault_tolerance_config.internal_fault_report_port,
++    )
++    engine_down_socket = make_zmq_socket(
++        ctx=zmq_ctx,
++        path=zmq_addr,
++        socket_type=zmq.DEALER,
++        bind=False,
++        identity=str(uuid.uuid4()).encode("utf8"),
++    )
++    return zmq_ctx, engine_down_socket
++
++
++def notify_engine_down(engine_down_socket, engine_id=None, engine_identity=None):
++    fault_info = FaultInfo(
++        type="EngineDeadError",
++        message="Engine died unexpectedly.",
++        engine_id=str(engine_id) if engine_id is not None else None,
++        engine_identity=engine_identity,
++        engine_status=EngineStatusType.DEAD,
++    )
++    # During normal shutdown, the DEALER socket may already be closed.
++    # Sending the final fault report can then raise ZMQError, which is safe to ignore.
++    logger.warning("Notifying engine down, fault_info=%s", fault_info)
++    with contextlib.suppress(zmq.ZMQError):
++        engine_down_socket.send_multipart([b"", msgspec.msgpack.encode(fault_info)])
+Index: vllm/v1/utils.py
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/vllm/v1/utils.py b/vllm/v1/utils.py
+--- a/vllm/v1/utils.py	(revision bcf2be96120005e9aea171927f85055a6a5c0cf6)
++++ b/vllm/v1/utils.py	(revision 8e544f8ff306af4b6eaa7688ba364507aede12e8)
+@@ -3,6 +3,7 @@
+ import argparse
+ import contextlib
+ import multiprocessing
++import threading
+ import time
+ import weakref
+ from collections.abc import Callable, Sequence
+@@ -34,6 +35,7 @@
+ 
+     from vllm.v1.engine.coordinator import DPCoordinator
+     from vllm.v1.engine.utils import CoreEngineActorManager, CoreEngineProcManager
++    from vllm.v1.fault_tolerance.utils import FaultToleranceZmqAddresses
+ 
+ logger = init_logger(__name__)
+ 
+@@ -173,6 +175,7 @@
+         input_addresses: list[str],
+         output_addresses: list[str],
+         stats_update_address: str | None = None,
++        fault_tolerance_addresses: "FaultToleranceZmqAddresses|None|str" = None,
+     ):
+         """Initialize and start API server worker processes.
+ 
+@@ -206,6 +209,13 @@
+             if stats_update_address is not None:
+                 client_config["stats_update_address"] = stats_update_address
+ 
++            if fault_tolerance_addresses is not None:
++                from vllm.v1.fault_tolerance.utils import FaultToleranceZmqAddresses
++
++                if isinstance(fault_tolerance_addresses, FaultToleranceZmqAddresses):
++                    fault_tolerance_addresses = fault_tolerance_addresses.to_str()
++                client_config["fault_tolerance_addresses"] = fault_tolerance_addresses
++
+             proc = spawn_context.Process(
+                 target=target_server_fn,
+                 name=f"ApiServer_{i}",
+@@ -244,8 +254,6 @@
+         coordinator: The coordinator for data parallel.
+     """
+ 
+-    from vllm.v1.engine.utils import CoreEngineActorManager, CoreEngineProcManager
+-
+     try:
+         logger.info("Waiting for API servers to complete ...")
+         # Create a mapping of sentinels to their corresponding processes
+@@ -257,33 +265,40 @@
+         if coordinator:
+             sentinel_to_proc[coordinator.proc.sentinel] = coordinator.proc
+ 
+-        actor_run_refs = []
+-        if isinstance(engine_manager, CoreEngineProcManager):
+-            for proc in engine_manager.processes:
+-                sentinel_to_proc[proc.sentinel] = proc
+-        elif isinstance(engine_manager, CoreEngineActorManager):
+-            actor_run_refs = engine_manager.get_run_refs()
++        if engine_manager:
++            core_shutdown_recv, core_shutdown_send = connection.Pipe(duplex=False)
++
++            def monitor_engines():
++                try:
++                    engine_manager.monitor_engine_liveness()
++                finally:
++                    core_shutdown_send.close()
++                    core_shutdown_recv.close()
++
++            # start monitor for engine liveness
++            threading.Thread(target=monitor_engines, daemon=True).start()
++            sentinel_to_proc[core_shutdown_recv] = None  # type: ignore[assignment]
+ 
+         # Check if any process terminates
+-        while sentinel_to_proc or actor_run_refs:
+-            # Wait for any process to terminate
+-            ready_sentinels: list[Any] = connection.wait(sentinel_to_proc, timeout=5)
++        while sentinel_to_proc:
++            # Wait for any process to terminate (or engine shutdown signal)
++            ready_sentinels: list[Any] = connection.wait(sentinel_to_proc)
+ 
+             # Process any terminated processes
+             for sentinel in ready_sentinels:
+                 proc = sentinel_to_proc.pop(sentinel)
+ 
+                 # Check if process exited with error
+-                if proc.exitcode != 0:
++                if proc is not None and proc.exitcode != 0:
+                     raise RuntimeError(
+                         f"Process {proc.name} (PID: {proc.pid}) "
+                         f"died with exit code {proc.exitcode}"
+                     )
+-
+-            if actor_run_refs:
+-                import ray
+-
+-                _, actor_run_refs = ray.wait(actor_run_refs, timeout=5)
++                if engine_manager and engine_manager.failed_proc_name is not None:
++                    raise RuntimeError(
++                        f"Engine core process {engine_manager.failed_proc_name} "
++                        "died unexpectedly."
++                    )
+ 
+     except KeyboardInterrupt:
+         logger.info("Received KeyboardInterrupt, shutting down API servers...")
+Index: vllm/v1/worker/gpu_worker.py
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
+--- a/vllm/v1/worker/gpu_worker.py	(revision bcf2be96120005e9aea171927f85055a6a5c0cf6)
++++ b/vllm/v1/worker/gpu_worker.py	(revision b63c95f96f55fb068dc4f4c468d209e08ab17717)
+@@ -55,6 +55,7 @@
+     ModelRunnerOutput,
+ )
+ from vllm.v1.utils import compute_iteration_details, report_usage_stats
++from vllm.v1.worker.sentinel.gpu_worker_sentinel import WorkerSentinel
+ from vllm.v1.worker.utils import is_residual_scattered_for_sp
+ from vllm.v1.worker.worker_base import WorkerBase
+ from vllm.v1.worker.workspace import init_workspace_manager
+@@ -126,7 +127,7 @@
+         from vllm.distributed.elastic_ep.elastic_execute import ElasticEPScalingExecutor
+ 
+         self.elastic_ep_executor = ElasticEPScalingExecutor(self)
+-
++        self.worker_sentinel: WorkerSentinel | None = None
+         # Buffers saved before sleep
+         self._sleep_saved_buffers: dict[str, torch.Tensor] = {}
+ 
+@@ -313,6 +314,21 @@
+             # If usage stat is enabled, collect relevant info.
+             report_usage_stats(self.vllm_config)
+ 
++    def create_worker_sentinel(self, worker_cmd_addr: str):
++        def clear_input_batch_callback():
++            input_batch = self.model_runner.input_batch
++            cached_req_ids = input_batch.req_id_to_index.keys()
++            for req_id in list(cached_req_ids):
++                input_batch.remove_request(req_id)
++
++        with set_current_vllm_config(self.vllm_config):
++            self.worker_sentinel = WorkerSentinel(
++                self.parallel_config,
++                self.device,
++                worker_cmd_addr,
++                clear_input_batch_callback,
++            )
++
+     # FIXME(youkaichao & ywang96): Use TorchDispatchMode instead of memory pool
+     # to hijack tensor allocation.
+     def load_model(self) -> None:
+@@ -756,6 +772,12 @@
+     def sample_tokens(
+         self, grammar_output: "GrammarOutput | None"
+     ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
++        if self.worker_sentinel is not None and self.worker_sentinel.use_ft_backend:
++            ep_rank_mask = self.worker_sentinel.mask
++            last_ep_rank_mask = self.worker_sentinel.last_mask
++            return self.model_runner.sample_tokens(
++                grammar_output, ep_rank_mask, last_ep_rank_mask
++            )
+         return self.model_runner.sample_tokens(grammar_output)
+ 
+     @torch.inference_mode()
+@@ -1019,6 +1041,8 @@
+             ensure_kv_transfer_shutdown()
+         if self.profiler is not None:
+             self.profiler.shutdown()
++        if self.worker_sentinel is not None:
++            self.worker_sentinel.shutdown()
+ 
+         if weight_transfer_engine := getattr(self, "weight_transfer_engine", None):
+             weight_transfer_engine.shutdown()
+Index: vllm/v1/worker/sentinel/gpu_worker_sentinel.py
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/vllm/v1/worker/sentinel/gpu_worker_sentinel.py b/vllm/v1/worker/sentinel/gpu_worker_sentinel.py
+new file mode 100644
+--- /dev/null	(revision 3751124bd8ae0b640908c3bd7f62034509173b83)
++++ b/vllm/v1/worker/sentinel/gpu_worker_sentinel.py	(revision 3751124bd8ae0b640908c3bd7f62034509173b83)
+@@ -0,0 +1,131 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++import threading
++from collections.abc import Callable
++
++import msgspec
++import torch
++import zmq
++
++from vllm.config import ParallelConfig
++from vllm.distributed import (
++    get_dp_group,
++    get_ep_group,
++    get_pp_group,
++    get_tp_group,
++    stateless_init_torch_distributed_process_group,
++)
++from vllm.logger import init_logger
++from vllm.utils.network_utils import close_sockets, make_zmq_socket
++from vllm.v1.fault_tolerance import BaseSentinel
++from vllm.v1.fault_tolerance.utils import FaultToleranceRequest, FaultToleranceResult
++
++logger = init_logger(__name__)
++
++_GLOBAL_PAUSE_EVENT = threading.Event()
++
++# Currently, only deepep_ll and nixl_ep backends support fault tolerance.
++_FT_BACKEND_SET = {"deepep_low_latency", "nixl_ep"}
++
++
++def get_pause_event() -> threading.Event:
++    global _GLOBAL_PAUSE_EVENT
++    return _GLOBAL_PAUSE_EVENT
++
++
++class WorkerSentinel(BaseSentinel):
++    def __init__(
++        self,
++        parallel_config: ParallelConfig,
++        device: torch.device,
++        worker_cmd_addr: str,
++        clear_input_batch_callback: Callable,
++    ):
++        self.dp_rank = parallel_config.data_parallel_rank
++        tp_rank = get_tp_group().rank_in_group
++        pp_rank = get_pp_group().rank_in_group
++        identity_str = f"PP{pp_rank}_TP{tp_rank}"
++        super().__init__(
++            parallel_config, f"{self.dp_rank}_{identity_str}", identity_str.encode()
++        )
++        self.device = device
++        self.data_parallel_master_ip = parallel_config.data_parallel_master_ip
++        self.data_parallel_master_port = parallel_config.data_parallel_master_port
++        self.dp_size = parallel_config.data_parallel_size
++        torch.accelerator.set_device_index(self.device)
++
++        self.engine_core_cmd_socket = make_zmq_socket(
++            self.ctx,
++            worker_cmd_addr,
++            zmq.DEALER,
++            bind=False,
++            identity=self.identity,
++        )
++
++        self.use_ft_backend = (
++            parallel_config.all2all_backend in _FT_BACKEND_SET
++            and parallel_config.data_parallel_size > 1
++        )
++        if self.use_ft_backend:
++            world_size = get_ep_group().world_size
++            self.mask = torch.zeros((world_size,), device=self.device, dtype=torch.int)
++            # todo: last_mask is prepared and should be updated in scaling down.
++            self.last_mask = torch.zeros_like(self.mask)
++
++        self.clear_input_batch_callback = clear_input_batch_callback
++
++        threading.Thread(
++            target=self.run, daemon=True, name="WorkerSentinelThread"
++        ).start()
++
++    def run(self):
++        # set CUDA device context for this thread
++        torch.accelerator.set_device_index(self.device)
++        # Wait for fault tolerance instructions from EngineCoreSentinel
++        while not self.sentinel_dead:
++            self.poll_and_execute_upstream_cmd()
++
++    def poll_and_execute_upstream_cmd(self):
++        """
++        Receive and execute a command from upstream sentinel and send back
++        the execution result.
++        """
++        try:
++            _, msg = self.engine_core_cmd_socket.recv_multipart()
++            ft_request = msgspec.msgpack.decode(msg, type=FaultToleranceRequest)
++            ft_result = self._execute_cmd(ft_request)
++            msg_bytes = msgspec.msgpack.encode(ft_result)
++            self.engine_core_cmd_socket.send_multipart([b"", msg_bytes])
++        except zmq.ZMQError:
++            logger.info("Socket closed, terminating.")
++            self.sentinel_dead = True
++
++    def pause(self, ft_request: FaultToleranceRequest) -> FaultToleranceResult:
++        get_pause_event().set()
++        return FaultToleranceResult(ft_request.request_id, True)
++
++    def retry(self, ft_request: FaultToleranceRequest) -> FaultToleranceResult:
++        self.clear_input_batch_callback()
++        get_pause_event().clear()
++        if self.parallel_config.all2all_backend not in _FT_BACKEND_SET:
++            return FaultToleranceResult(
++                ft_request.request_id,
++                False,
++                "all2all_backend not supported, must in {}".format(_FT_BACKEND_SET),
++            )
++        comm = get_ep_group().device_communicator
++        assert comm and comm.all2all_manager
++        comm.all2all_manager.clean_mask()
++
++        get_dp_group().cpu_group = stateless_init_torch_distributed_process_group(
++            self.data_parallel_master_ip,
++            ft_request.params["new_stateless_dp_group_port"],
++            self.dp_rank,
++            self.dp_size,
++            backend="gloo",
++        )
++        return FaultToleranceResult(ft_request.request_id, True)
++
++    def shutdown(self):
++        close_sockets([self.engine_core_cmd_socket])
++        super().shutdown()
+Index: vllm/config/parallel.py
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/vllm/config/parallel.py b/vllm/config/parallel.py
+--- a/vllm/config/parallel.py	(revision 38ff1f0ef563f5e1b028fda8d28b537ef4241d6b)
++++ b/vllm/config/parallel.py	(revision 3d98171da0eea03467c3c2c0b1d0cd44691b2e35)
+@@ -2,6 +2,7 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
+ import os
++import socket
+ from collections.abc import Callable
+ from typing import TYPE_CHECKING, Any, Literal, overload
+ 
+@@ -11,6 +12,7 @@
+ from typing_extensions import Self
+ 
+ import vllm.envs as envs
++from vllm.config.fault_tolerance import FaultToleranceConfig
+ from vllm.config.utils import config
+ from vllm.logger import init_logger
+ from vllm.model_executor.layers.batch_invariant import (
+@@ -24,6 +26,7 @@
+     from ray.runtime_env import RuntimeEnv
+     from ray.util.placement_group import PlacementGroup
+ 
++    from vllm.config.fault_tolerance import FaultToleranceConfig
+     from vllm.v1.executor import Executor
+ else:
+     RuntimeEnv = Any
+@@ -134,6 +137,8 @@
+     between local data parallel ranks, but an external LB balances
+     between vLLM nodes/replicas. Set explicitly in conjunction with
+     --data-parallel-start-rank."""
++    expert_parallel_size: int = 1
++    """Number of expert parallel groups."""
+     is_moe_model: bool | None = None
+     """Whether the deployed model is MoE (if known)."""
+     enable_expert_parallel: bool = False
+@@ -255,12 +260,19 @@
+     timeout parameter. If None, PyTorch's default timeout is used (600s for NCCL).
+     Increase this for multi-node setups where model downloads may be slow."""
+ 
++    gloo_timeout_seconds: int | None = None
++    """Timeout (in seconds) for gloo communication groups."""
++
+     world_size: int = Field(init=False)
+     """world_size is TPxPP, it affects the number of workers we create."""
+ 
+     rank: int = 0
+     """Global rank in distributed setup."""
+ 
++    _coord_store_port: int = 0
++    """Port for the TCPStore used to coordinate DP port selection
++    during stateless DP group init (e.g., after fault recovery)."""
++
+     _data_parallel_master_port_list: list[int] = Field(default_factory=list)
+     """List of open port auto-queried for data parallel messaging.
+     Set to be private as it's not intended to be configured by users.
+@@ -352,6 +364,16 @@
+         should only be set by API server scale-out.
+     """
+ 
++    enable_fault_tolerance: bool = False
++    """Enable fault tolerance for detailed error recovery,
++    such as scaling down fault DPEngineCore.
++    """
++
++    fault_tolerance_config: FaultToleranceConfig = Field(
++        default_factory=FaultToleranceConfig
++    )
++    """The configurations for fault tolerance."""
++
+     @field_validator("disable_nccl_for_dp_synchronization", mode="wrap")
+     @classmethod
+     def _skip_none_validation(cls, value: Any, handler: Callable) -> Any:
+@@ -525,6 +547,33 @@
+     def get_next_stateless_eplb_group_port(self) -> list[int]:
+         return self._stateless_eplb_group_port_list.pop()
+ 
++    def _pick_stateless_dp_port(self) -> tuple[int, socket.socket | None]:
++        """Return ``(port, listen_socket)`` for DP group init.
++
++        With a coord store, rank 0 binds a socket and publishes the port;
++        others read it.  Without one, pops a pre-allocated port and
++        returns ``listen_socket=None``.
++        """
++        if not self._coord_store_port:
++            return self.get_next_dp_init_port(), None
++
++        from vllm.distributed.utils import get_cached_tcp_store_client
++
++        store = get_cached_tcp_store_client(
++            self.data_parallel_master_ip, self._coord_store_port
++        )
++
++        key = "dp_master_port"
++        if self.data_parallel_rank == 0:
++            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
++            s.bind((self.data_parallel_master_ip, 0))
++            s.listen()
++            port = s.getsockname()[1]
++            store.set(key, str(port).encode())
++            return port, s
++        else:
++            return int(store.get(key).decode()), None
++
+     @overload
+     def stateless_init_dp_group(
+         self, return_store: Literal[False] = ...
+@@ -553,14 +602,17 @@
+         last_exc: Exception | None = None
+         for _ in range(max_retries):
+             try:
++                port, listen_socket = self._pick_stateless_dp_port()
+                 # use gloo since the engine process might not have cuda device
+                 return stateless_init_torch_distributed_process_group(
+                     self.data_parallel_master_ip,
+-                    self.get_next_dp_init_port(),
++                    port,
+                     self.data_parallel_rank,
+                     self.data_parallel_size,
+                     backend="gloo",
+                     return_store=return_store,
++                    listen_socket=listen_socket,
++                    gloo_timeout_seconds=self.gloo_timeout_seconds,
+                 )
+             except DistNetworkError as e:
+                 # We only want to retry when the root cause is EADDRINUSE.
+Index: vllm/distributed/device_communicators/all2all.py
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/vllm/distributed/device_communicators/all2all.py b/vllm/distributed/device_communicators/all2all.py
+--- a/vllm/distributed/device_communicators/all2all.py	(revision b6df1f13fd42eb2ac52e49aa4ae38b08f394fc03)
++++ b/vllm/distributed/device_communicators/all2all.py	(revision b63c95f96f55fb068dc4f4c468d209e08ab17717)
+@@ -7,6 +7,7 @@
+ import torch.distributed as dist
+ 
+ import vllm.envs as envs
++from vllm.config import get_current_vllm_config
+ from vllm.distributed import get_dp_group, get_ep_group
+ from vllm.forward_context import get_forward_context
+ from vllm.logger import init_logger
+@@ -367,6 +368,10 @@
+ 
+     def __init__(self, cpu_group, tcp_store_group=None):
+         super().__init__(cpu_group, tcp_store_group)
++        self.enable_ft = (
++            get_current_vllm_config().parallel_config.enable_fault_tolerance
++        )
++        self.buffer = None
+ 
+     def _make_all2all_kwargs(
+         self,
+@@ -406,6 +411,7 @@
+             allow_nvlink_for_low_latency_mode=True,
+             allow_mnnvl=envs.VLLM_DEEPEP_LOW_LATENCY_USE_MNNVL,
+             explicitly_destroy=True,
++            enable_shrink=self.enable_ft,
+         )
+ 
+     def get_handle(self, kwargs):
+@@ -420,12 +426,27 @@
+         handle: deep_ep.Buffer = self.handle_cache.get_or_create(
+             buffer_kwargs, deep_ep.Buffer
+         )
++        self.buffer = handle
+         return handle
+ 
+     # DeepEP LL uses RDMA so no SMs are used for communication
+     def max_sms_used(self) -> int | None:
+         return 0
+ 
++    def query_mask(self, mask: torch.Tensor) -> torch.Tensor:
++        import deep_ep  # type: ignore[import-not-found]
++
++        assert self.enable_ft, "Fault tolerance must be enabled to use query mask"
++        assert isinstance(self.buffer, deep_ep.Buffer)
++        return self.buffer.low_latency_query_mask_buffer(mask)
++
++    def clean_mask(self):
++        import deep_ep  # type: ignore[import-not-found]
++
++        assert self.enable_ft, "Fault tolerance must be enabled to use clean_mask"
++        assert isinstance(self.buffer, deep_ep.Buffer)
++        self.buffer.low_latency_clean_mask_buffer()
++
+ 
+ class NixlEPAll2AllManager(All2AllManagerBase):
+     """
+@@ -541,6 +562,14 @@
+     def max_sms_used(self) -> int | None:
+         return 0
+ 
++    def query_mask(self, mask: torch.Tensor) -> torch.Tensor:
++        assert self._buffer is not None
++        return self._buffer[0].query_mask_buffer(mask)
++
++    def clean_mask(self):
++        assert self._buffer is not None
++        self._buffer[0].clean_mask_buffer()
++
+ 
+ class FlashInferNVLinkTwoSidedManager(All2AllManagerBase):
+     """
+Index: vllm/distributed/parallel_state.py
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/vllm/distributed/parallel_state.py b/vllm/distributed/parallel_state.py
+--- a/vllm/distributed/parallel_state.py	(revision b6df1f13fd42eb2ac52e49aa4ae38b08f394fc03)
++++ b/vllm/distributed/parallel_state.py	(revision 341aa9d1568a8e71ec4b79634525b48e5ea42e5c)
+@@ -46,7 +46,10 @@
+ from vllm.distributed.device_communicators.base_device_communicator import (
+     DeviceCommunicatorBase,
+ )
+-from vllm.distributed.utils import StatelessProcessGroup
++from vllm.distributed.utils import (
++    StatelessProcessGroup,
++    stateless_destroy_torch_distributed_process_group,
++)
+ from vllm.logger import init_logger
+ from vllm.utils.import_utils import resolve_obj_by_qualname
+ from vllm.utils.network_utils import get_distributed_init_method
+@@ -321,6 +324,7 @@
+         use_device_communicator: bool,  # whether to use device communicator
+         use_message_queue_broadcaster: bool = False,
+         group_name: str | None = None,
++        gloo_timeout_seconds: int | None = None,
+     ):
+         group_name = group_name or "anonymous"
+         self.unique_name = _get_unique_name(group_name)
+@@ -331,7 +335,9 @@
+ 
+         self_device_group = None
+         self_cpu_group = None
+-
++        gloo_timeout_timedelta: timedelta | None = None
++        if gloo_timeout_seconds is not None:
++            gloo_timeout_timedelta = timedelta(seconds=gloo_timeout_seconds)
+         for ranks in group_ranks:
+             device_group = torch.distributed.new_group(
+                 ranks, backend=torch_distributed_backend
+@@ -339,7 +345,9 @@
+             # a group with `gloo` backend, to allow direct coordination between
+             # processes through the CPU.
+             with suppress_stdout():
+-                cpu_group = torch.distributed.new_group(ranks, backend="gloo")
++                cpu_group = torch.distributed.new_group(
++                    ranks, backend="gloo", timeout=gloo_timeout_timedelta
++                )
+             if self.rank in ranks:
+                 self.ranks = ranks
+                 self.world_size = len(ranks)
+@@ -1061,6 +1069,11 @@
+         if self.mq_broadcaster is not None:
+             self.mq_broadcaster = None
+ 
++    def destroy_cpu_group(self):
++        if hasattr(self, "cpu_group"):
++            stateless_destroy_torch_distributed_process_group(self.cpu_group)
++            del self.cpu_group
++
+     def prepare_communication_buffer_for_model(self, model: torch.nn.Module):
+         if self.device_communicator is not None:
+             self.device_communicator.prepare_communication_buffer_for_model(model)
+@@ -1150,6 +1163,7 @@
+     use_message_queue_broadcaster: bool = False,
+     group_name: str | None = None,
+     use_device_communicator: bool = True,
++    gloo_timeout_seconds: int | None = None,
+ ) -> GroupCoordinator:
+     return GroupCoordinator(
+         group_ranks=group_ranks,
+@@ -1158,6 +1172,7 @@
+         use_device_communicator=use_device_communicator,
+         use_message_queue_broadcaster=use_message_queue_broadcaster,
+         group_name=group_name,
++        gloo_timeout_seconds=gloo_timeout_seconds,
+     )
+ 
+ 
+@@ -1168,6 +1183,7 @@
+     host: str,
+     backend: str,
+     use_device_communicator: bool = True,
++    gloo_timeout_seconds: int | None = None,
+ ) -> "StatelessGroupCoordinator":
+     """Create a StatelessGroupCoordinator with the given parameters."""
+     from vllm.distributed.stateless_coordinator import StatelessGroupCoordinator
+@@ -1183,6 +1199,7 @@
+         group_ports=group_ports,
+         global_rank=world.rank,
+         global_world_size=world.world_size,
++        gloo_timeout_seconds=gloo_timeout_seconds,
+     )
+ 
+ 
+@@ -1513,6 +1530,8 @@
+     config = get_current_vllm_config()
+     data_parallel_size = config.parallel_config.data_parallel_size
+     enable_elastic_ep = config.parallel_config.enable_elastic_ep
++    parallel_config = config.parallel_config
++    gloo_timeout_seconds = parallel_config.gloo_timeout_seconds
+     if enable_elastic_ep:
+         # Use stateless world group for global information
+         world_size = get_world_group().world_size
+@@ -1567,6 +1586,7 @@
+         backend,
+         use_message_queue_broadcaster=True,
+         group_name="tp",
++        gloo_timeout_seconds=gloo_timeout_seconds,
+     )
+ 
+     # Build the DCP model-parallel groups.
+@@ -1589,6 +1609,7 @@
+         backend,
+         use_message_queue_broadcaster=True,
+         group_name="dcp",
++        gloo_timeout_seconds=gloo_timeout_seconds,
+     )
+ 
+     global _PCP
+@@ -1607,7 +1628,11 @@
+         )
+         group_ranks = [x.tolist() for x in group_ranks]
+     _PCP = init_model_parallel_group(
+-        group_ranks, get_world_group().local_rank, backend, group_name="pcp"
++        group_ranks,
++        get_world_group().local_rank,
++        backend,
++        group_name="pcp",
++        gloo_timeout_seconds=gloo_timeout_seconds,
+     )
+ 
+     # Build the pipeline model-parallel groups.
+@@ -1625,7 +1650,11 @@
+         )
+         group_ranks = [x.tolist() for x in group_ranks]
+     _PP = init_model_parallel_group(
+-        group_ranks, get_world_group().local_rank, backend, group_name="pp"
++        group_ranks,
++        get_world_group().local_rank,
++        backend,
++        group_name="pp",
++        gloo_timeout_seconds=gloo_timeout_seconds,
+     )
+ 
+     global _DP
+@@ -1643,10 +1672,15 @@
+             dp_ports,
+             parallel_config.data_parallel_master_ip,
+             backend,
++            gloo_timeout_seconds=gloo_timeout_seconds,
+         )
+     else:
+         _DP = init_model_parallel_group(
+-            group_ranks, get_world_group().local_rank, backend, group_name="dp"
++            group_ranks,
++            get_world_group().local_rank,
++            backend,
++            group_name="dp",
++            gloo_timeout_seconds=gloo_timeout_seconds,
+         )
+ 
+     global _EP
+@@ -1675,10 +1709,15 @@
+                 ep_ports,
+                 parallel_config.data_parallel_master_ip,
+                 backend,
++                gloo_timeout_seconds=gloo_timeout_seconds,
+             )
+         else:
+             _EP = init_model_parallel_group(
+-                group_ranks, get_world_group().local_rank, backend, group_name="ep"
++                group_ranks,
++                get_world_group().local_rank,
++                backend,
++                group_name="ep",
++                gloo_timeout_seconds=gloo_timeout_seconds,
+             )
+ 
+         # Create EPLB group with the same ranks as EP if EPLB is enabled.
+@@ -1703,6 +1742,7 @@
+                     eplb_ports,
+                     parallel_config.data_parallel_master_ip,
+                     backend,
++                    gloo_timeout_seconds=gloo_timeout_seconds,
+                 )
+             else:
+                 _EPLB = init_model_parallel_group(
+@@ -1710,6 +1750,7 @@
+                     get_world_group().local_rank,
+                     backend,
+                     group_name="eplb",
++                    gloo_timeout_seconds=gloo_timeout_seconds,
+                 )
+     # If no EP group needed, _EP remains None
+     # If no EPLB group needed, _EPLB remains None
+Index: vllm/distributed/stateless_coordinator.py
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/vllm/distributed/stateless_coordinator.py b/vllm/distributed/stateless_coordinator.py
+--- a/vllm/distributed/stateless_coordinator.py	(revision b6df1f13fd42eb2ac52e49aa4ae38b08f394fc03)
++++ b/vllm/distributed/stateless_coordinator.py	(revision af48f28d4840da8fda7bffff2828d54d251bcaaf)
+@@ -45,6 +45,7 @@
+         group_ports: list[list[int]] | None = None,
+         global_rank: int = 0,
+         global_world_size: int = 1,
++        gloo_timeout_seconds: int | None = None,
+     ):
+         group_name = group_name or "anonymous"
+         self.unique_name = _get_unique_name(group_name)
+@@ -88,6 +89,7 @@
+                     world_size=self.world_size,
+                     backend="gloo",
+                     group_name=f"{self.unique_name}_cpu",
++                    gloo_timeout_seconds=gloo_timeout_seconds,
+                 )
+                 tcp_store_group = StatelessProcessGroup.create(
+                     host=host,
+Index: vllm/distributed/utils.py
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/vllm/distributed/utils.py b/vllm/distributed/utils.py
+--- a/vllm/distributed/utils.py	(revision b6df1f13fd42eb2ac52e49aa4ae38b08f394fc03)
++++ b/vllm/distributed/utils.py	(revision 3d98171da0eea03467c3c2c0b1d0cd44691b2e35)
+@@ -6,6 +6,7 @@
+ # https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/core/tensor_parallel/utils.py
+ # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
+ import dataclasses
++import functools
+ import os
+ import pickle
+ import socket
+@@ -139,6 +140,29 @@
+     return (start_layer, end_layer)
+ 
+ 
++def create_tcp_store(
++    host: str,
++    port: int,
++    listen_socket: socket.socket | None = None,
++    **kwargs: Any,
++) -> TCPStore:
++    """Create a TCPStore, optionally taking ownership of ``listen_socket``."""
++    if listen_socket is None:
++        return TCPStore(host_name=host, port=port, **kwargs)
++
++    listen_fd = listen_socket.detach()
++    try:
++        return TCPStore(
++            host_name=host,
++            port=port,
++            master_listen_fd=listen_fd,
++            **kwargs,
++        )
++    except Exception:
++        socket.close(listen_fd)
++        raise
++
++
+ @dataclasses.dataclass
+ class StatelessProcessGroup:
+     """A dataclass to hold a metadata store, and the rank, world_size of the
+@@ -466,6 +490,16 @@
+         )
+ 
+ 
++@functools.lru_cache(maxsize=1)
++def get_cached_tcp_store_client(host: str, port: int) -> TCPStore:
++    """Return a cached TCPStore client.
++
++    Cached so that every call with the same ``(host, port)`` reuses the
++    same connection.  A new ``(host, port)`` evicts the old entry.
++    """
++    return TCPStore(host, port, is_master=False, wait_for_workers=False)
++
++
+ def init_gloo_process_group(
+     prefix_store: PrefixStore,
+     group_rank: int,
+@@ -504,6 +538,8 @@
+     backend: str,
+     group_name: str | None = None,
+     return_store: bool = False,
++    listen_socket: socket.socket | None = None,
++    gloo_timeout_seconds: int | None = None,
+ ) -> ProcessGroup | tuple[ProcessGroup, Store]:
+     """
+     A replacement for `torch.distributed.init_process_group` that does not
+@@ -535,14 +571,31 @@
+     are the same as process 1 and 5, the main communication channel is
+     always formed with process 1, 2, ..., 8, and the additional communication
+     channel is formed with process 9 and 10.
++
++    When *listen_socket* is provided, the rendezvous step
++    is skipped and a ``TCPStore`` server is created directly using the
++    pre-bound socket.  This is useful for eliminating TOCTOU races
++    between port allocation and binding.
+     """
+     init_method = get_tcp_uri(host, port)
+     backend = Backend(backend)  # it is basically string
+     timeout = _get_default_timeout(backend)
+-
+-    store, rank, world_size = next(
+-        rendezvous(init_method, rank, world_size, timeout=timeout)
+-    )
++    if gloo_timeout_seconds is not None:
++        timeout = timedelta(seconds=gloo_timeout_seconds)
++    if listen_socket is not None:
++        store = create_tcp_store(
++            host,
++            port,
++            listen_socket=listen_socket,
++            world_size=world_size,
++            is_master=True,
++            timeout=timeout,
++            multi_tenant=True,
++        )
++    else:
++        store, rank, world_size = next(
++            rendezvous(init_method, rank, world_size, timeout=timeout)
++        )
+     store.set_timeout(timeout)
+ 
+     group_rank = rank
+@@ -629,3 +682,22 @@
+         if global_rank is not None:
+             return f"rank{global_rank}"
+         return ""
++
++
++def init_distributed_coordination(parallel_config):
++    from vllm.utils.network_utils import get_open_ports_list
++
++    parallel_config._data_parallel_master_port_list = get_open_ports_list(5)
++    parallel_config.data_parallel_master_port = (
++        parallel_config._data_parallel_master_port_list.pop()
++    )
++    ip = parallel_config.data_parallel_master_ip
++    store = create_tcp_store(
++        ip,
++        0,
++        is_master=True,
++        world_size=-1,
++        wait_for_workers=False,
++    )
++    parallel_config._coord_store_port = store.port
++    return ip, store
+Index: vllm/v1/engine/exceptions.py
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/vllm/v1/engine/exceptions.py b/vllm/v1/engine/exceptions.py
+--- a/vllm/v1/engine/exceptions.py	(revision b6df1f13fd42eb2ac52e49aa4ae38b08f394fc03)
++++ b/vllm/v1/engine/exceptions.py	(revision ae17e51c48d811ef94a8720885725bd85491c130)
+@@ -16,3 +16,14 @@
+         # Make stack trace clearer when using with LLMEngine by
+         # silencing irrelevant ZMQError.
+         self.__suppress_context__ = suppress_context
++
++
++class EngineLoopPausedError(Exception):
++    PREFIX = "[EnginePaused]"
++
++    def __init__(self, message=""):
++        if message.startswith(self.PREFIX):
++            full_message = message
++        else:
++            full_message = f"{self.PREFIX} {message}"
++        super().__init__(full_message)
+Index: vllm/v1/executor/multiproc_executor.py
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/vllm/v1/executor/multiproc_executor.py b/vllm/v1/executor/multiproc_executor.py
+--- a/vllm/v1/executor/multiproc_executor.py	(revision b6df1f13fd42eb2ac52e49aa4ae38b08f394fc03)
++++ b/vllm/v1/executor/multiproc_executor.py	(revision ae17e51c48d811ef94a8720885725bd85491c130)
+@@ -57,6 +57,7 @@
+     set_process_title,
+ )
+ from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
++from vllm.v1.engine.exceptions import EngineLoopPausedError
+ from vllm.v1.executor.abstract import Executor, FailureCallback
+ from vllm.v1.outputs import AsyncModelRunnerOutput, DraftTokenIds, ModelRunnerOutput
+ from vllm.v1.worker.worker_base import WorkerWrapperBase
+@@ -377,6 +378,9 @@
+                 except TimeoutError as e:
+                     raise TimeoutError(f"RPC call to {method} timed out.") from e
+                 if status != WorkerProc.ResponseStatus.SUCCESS:
++                    # FORCE STOP is the returned msg from stop_device on Ascend NPU.
++                    if EngineLoopPausedError.PREFIX in result or "FORCE STOP" in result:
++                        raise EngineLoopPausedError(result)
+                     raise RuntimeError(
+                         f"Worker failed with error '{result}', please check the"
+                         " stack trace above for the root cause"
+@@ -886,7 +890,10 @@
+         converted to a FAILURE response.
+         """
+         if isinstance(output, AsyncModelRunnerOutput):
+-            output = output.get_output()
++            try:
++                output = output.get_output()
++            except Exception as e:
++                output = e
+ 
+         if isinstance(output, Exception):
+             result = (WorkerProc.ResponseStatus.FAILURE, str(output))
+Index: vllm/v1/worker/gpu_model_runner.py
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+--- a/vllm/v1/worker/gpu_model_runner.py	(revision b6df1f13fd42eb2ac52e49aa4ae38b08f394fc03)
++++ b/vllm/v1/worker/gpu_model_runner.py	(revision b63c95f96f55fb068dc4f4c468d209e08ab17717)
+@@ -39,6 +39,7 @@
+ from vllm.distributed.kv_transfer.kv_connector.utils import copy_kv_blocks
+ from vllm.distributed.parallel_state import (
+     get_dcp_group,
++    get_ep_group,
+     get_pp_group,
+     get_tp_group,
+     graph_capture,
+@@ -128,6 +129,7 @@
+ )
+ from vllm.v1.core.sched.output import NewRequestData
+ from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
++from vllm.v1.engine.exceptions import EngineLoopPausedError
+ from vllm.v1.kv_cache_interface import (
+     AttentionSpec,
+     ChunkedLocalAttentionSpec,
+@@ -225,6 +227,8 @@
+         invalid_req_indices: list[int],
+         async_output_copy_stream: torch.cuda.Stream,
+         vocab_size: int,
++        ep_rank_mask: torch.Tensor | None = None,
++        last_ep_rank_mask: torch.Tensor | None = None,
+     ):
+         self._model_runner_output = model_runner_output
+         self._invalid_req_indices = invalid_req_indices
+@@ -237,6 +241,8 @@
+         self._sampled_token_ids = sampled_token_ids
+         self.vocab_size = vocab_size
+         self._logprobs_tensors = logprobs_tensors
++        self.has_fault = None
++        self.ep_rank_mask = ep_rank_mask
+ 
+         # Initiate the copy on a separate stream, but do not synchronize it.
+         default_stream = torch.cuda.current_stream()
+@@ -250,6 +256,13 @@
+                 if self._logprobs_tensors
+                 else None
+             )
++            if ep_rank_mask is not None:
++                comm = get_ep_group().device_communicator
++                assert comm and comm.all2all_manager
++                comm.all2all_manager.query_mask(ep_rank_mask)
++                has_fault = (ep_rank_mask - last_ep_rank_mask).any()
++                self.has_fault = has_fault.to("cpu", non_blocking=True)
++
+             self.async_copy_ready_event.record()
+ 
+     def get_output(self) -> ModelRunnerOutput:
+@@ -281,6 +294,13 @@
+         output = self._model_runner_output
+         output.sampled_token_ids = valid_sampled_token_ids
+         output.logprobs = logprobs_lists
++        if self.has_fault:
++            assert self.ep_rank_mask is not None
++            mask = self.ep_rank_mask.cpu().tolist()
++            raise EngineLoopPausedError(
++                f"Fault detected in EP ranks during model execution. "
++                f"Current mask is :{mask}"
++            )
+         return output
+ 
+ 
+@@ -3868,7 +3888,10 @@
+ 
+     @torch.inference_mode
+     def sample_tokens(
+-        self, grammar_output: "GrammarOutput | None"
++        self,
++        grammar_output: "GrammarOutput | None",
++        ep_rank_mask: torch.Tensor | None = None,
++        last_ep_rank_mask: torch.Tensor | None = None,
+     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:
+         if self.execute_model_state is None:
+             kv_connector_output = self.kv_connector_output
+@@ -4088,6 +4111,8 @@
+                 invalid_req_indices=invalid_req_indices,
+                 async_output_copy_stream=self.async_output_copy_stream,
+                 vocab_size=self.input_batch.vocab_size,
++                ep_rank_mask=ep_rank_mask,
++                last_ep_rank_mask=last_ep_rank_mask,
+             )
+         with record_function_or_nullcontext(
+             "gpu_model_runner: set_async_sampled_token_ids"
+@@ -4575,6 +4600,7 @@
+                 drafter_model := getattr(drafter, "model", None)
+             ):
+                 prepare_communication_buffer_for_model(drafter_model)
++
+         mm_config = self.model_config.multimodal_config
+         self.is_multimodal_pruning_enabled = (
+             supports_multimodal_pruning(self.get_model())
+Index: vllm/distributed/device_communicators/base_device_communicator.py
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/vllm/distributed/device_communicators/base_device_communicator.py b/vllm/distributed/device_communicators/base_device_communicator.py
+--- a/vllm/distributed/device_communicators/base_device_communicator.py	(revision bd9b3df2c0332f3dd9c474ab17577f5855d61af2)
++++ b/vllm/distributed/device_communicators/base_device_communicator.py	(revision b63c95f96f55fb068dc4f4c468d209e08ab17717)
+@@ -100,6 +100,18 @@
+         # - raise a clear error if extra_tensors is not supported.
+         raise NotImplementedError
+ 
++    def query_mask(self, mask: torch.Tensor) -> torch.Tensor:
++        # This is used in the fault tolerance feature. The mask is a 1D tensor with
++        # length equal to the world size of the EP group. Each rank will set its own
++        # index to 1 if it detects a fault, and 0 otherwise
++        raise NotImplementedError
++
++    def clean_mask(self):
++        # This is used in the fault tolerance feature. The mask is a 1D tensor with
++        # length matching the EP group world size. Each rank marks its index as 1 on
++        # fault; this method clears all faults back to 0.
++        raise NotImplementedError
++
+     def set_num_sms(self, num_sms: int):
+         pass
+ 
+Index: vllm/v1/worker/dp_utils.py
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/vllm/v1/worker/dp_utils.py b/vllm/v1/worker/dp_utils.py
+--- a/vllm/v1/worker/dp_utils.py	(revision bd9b3df2c0332f3dd9c474ab17577f5855d61af2)
++++ b/vllm/v1/worker/dp_utils.py	(revision aa363d8de531e90053bd898f539f8110d57c7a75)
+@@ -42,15 +42,35 @@
+     cudagraph_mode: int,
+     parallel_config: ParallelConfig,
+ ) -> torch.Tensor:
++    from vllm.v1.engine.exceptions import EngineLoopPausedError
++    from vllm.v1.worker.sentinel.gpu_worker_sentinel import get_pause_event
++
+     dp_size = parallel_config.data_parallel_size
+     dp_rank = parallel_config.data_parallel_rank
+     device, group = _get_device_and_group(parallel_config)
+-    tensor = torch.zeros(4, dp_size, device=device, dtype=torch.int32)
++    should_pause = parallel_config.enable_fault_tolerance and get_pause_event().is_set()
++    tensor = torch.zeros(5, dp_size, device=device, dtype=torch.int32)
+     tensor[0][dp_rank] = orig_num_tokens_per_ubatch
+     tensor[1][dp_rank] = padded_num_tokens_per_ubatch
+     tensor[2][dp_rank] = 1 if should_ubatch else 0
+     tensor[3][dp_rank] = cudagraph_mode
+-    dist.all_reduce(tensor, group=group)
++    tensor[4][dp_rank] = 1 if should_pause else 0
++    handle = dist.all_reduce(tensor, group=group, async_op=True)
++    try:
++        handle.wait()
++    except RuntimeError:
++        should_pause = True
++
++    # If the all reduce failed or if any rank signaled to pause, then we should pause
++    if should_pause or bool(tensor[4].any().item()):
++        # Under async scheduling, batch N+1 can enter this DP all-reduce while
++        # batch N is still computing on device. Depending on Gloo/device timeout
++        # ordering, N+1 may hit timeout first here, but its output future can still
++        # be queued behind batch N in engine core and not be consumed immediately.
++        raise EngineLoopPausedError(
++            "Pausing workers due to fault tolerance signal from DP ranks."
++        )
++
+     return tensor
+ 
+ 
+Index: vllm/v1/core/sched/scheduler.py
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+--- a/vllm/v1/core/sched/scheduler.py	(revision aa363d8de531e90053bd898f539f8110d57c7a75)
++++ b/vllm/v1/core/sched/scheduler.py	(revision b63c95f96f55fb068dc4f4c468d209e08ab17717)
+@@ -489,7 +489,7 @@
+                     else:
+                         preempted_req = self.running.pop()
+ 
+-                    self._preempt_request(preempted_req, scheduled_timestamp)
++                    self.preempt_request(preempted_req, scheduled_timestamp)
+                     preempted_reqs.append(preempted_req)
+                     if preempted_req == request:
+                         # No more request to preempt. Cannot schedule this request.
+@@ -926,7 +926,7 @@
+             self._update_after_schedule(scheduler_output)
+         return scheduler_output
+ 
+-    def _preempt_request(self, request: Request, timestamp: float) -> None:
++    def preempt_request(self, request: Request, timestamp: float) -> None:
+         """Preempt a request and put it back to the waiting queue.
+ 
+         NOTE: The request should be popped from the running queue outside of this
+@@ -1852,7 +1852,7 @@
+             # running queue in FIFO order.
+             while self.running:
+                 request = self.running.pop()
+-                self._preempt_request(request, timestamp)
++                self.preempt_request(request, timestamp)
+                 # NOTE(zhuohan): For async scheduling, we need to discard the latest
+                 # output token on the fly to avoid a redundant repetitive output token.
+                 request.num_output_placeholders = 0
+Index: vllm/model_executor/model_loader/default_loader.py
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/vllm/model_executor/model_loader/default_loader.py b/vllm/model_executor/model_loader/default_loader.py
+--- a/vllm/model_executor/model_loader/default_loader.py	(revision 3751124bd8ae0b640908c3bd7f62034509173b83)
++++ b/vllm/model_executor/model_loader/default_loader.py	(revision 7f967c5e6acebde7907ba678280125d77cf20ca8)
+@@ -319,7 +319,7 @@
+             and parallel_config.enable_ep_weight_filter
+         ):
+             return
+-        
++
+         # When EPLB is enabled, redundant physical expert slots may map to
+         # logical experts that belong to other ranks in the default partition.
+         # The weight loader needs to see ALL logical expert weights so it can
+diff --git a/tests/v1/fault_tolerance/__init__.py b/tests/v1/fault_tolerance/__init__.py
+new file mode 100644
+diff --git a/vllm/entrypoints/serve/fault_tolerance/__init__.py b/vllm/entrypoints/serve/fault_tolerance/__init__.py
+new file mode 100644
+diff --git a/vllm/v1/worker/sentinel/__init__.py b/vllm/v1/worker/sentinel/__init__.py
+new file mode 100644

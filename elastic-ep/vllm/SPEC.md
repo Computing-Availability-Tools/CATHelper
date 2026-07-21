@@ -8,7 +8,7 @@
 
 ### 1.1 软件定位
 
-vLLM Elastic EP 使 vLLM 能够**容忍 NPU 故障而无需重启 vLLM 实例**。当 NPU 卡掉线或变得不健康时，系统自动检测故障、暂停受影响的 DP rank、缩容并重新分配专家，在剩余健康 NPU 上恢复服务。
+vLLM Elastic EP 使 vLLM 能够在DP(data parallel)+EP(expert parallel)的部署模式下，出现故障后，推理进程进入暂停状态不退出，通过重试恢复服务，或者通过将故障点所在的DP组缩容掉的方式，将故障隔离出去，提供在线弹性能力。
 
 ### 1.2 技术栈
 
@@ -44,21 +44,21 @@ vLLM Elastic EP 使 vLLM 能够**容忍 NPU 故障而无需重启 vLLM 实例**�
 
 | 方法 | 说明 | 适用场景 |
 |------|------|----------|
-| 弹性缩容（scale down） | 隔离故障 NPU，动态调整资源分配，在剩余健康 NPU 上继续服务 | 不可恢复的硬件故障（设备崩溃、UCE 等） |
+| 弹性缩容（scale down） | 隔离故障 GPU/NPU，动态调整资源分配，在剩余健康 GPU/NPU 上继续服务 | 不可恢复的硬件故障（设备崩溃、UCE 等） |
 | 重试（retry） | 清理工作进程状态、重置 rank mask、重建通信组，重新执行推理 | 短暂性故障（网络抖动、瞬时通信超时等） |
 
 
 ### 2.4 功能需求
 
 1. **故障上报**：故障发生后引擎不再立即退出，通过 ZMQ 向外报告异常详情与引擎健康状态，为上层框架提供故障诊断能力
-2. **暂停操作**：故障发生时暂停健康 DP rank，防止级联失败；利用 FT kernel 的 dispatch/combine mask 机制，健康 rank 在 all2all 通信中自动屏蔽故障 rank
-3. **重试恢复**：针对瞬时性和可恢复故障，清理工作进程状态、重置 rank mask、重建 Gloo 通信组，恢复推理服务
-4. **优雅缩容**：故障不可恢复时，移除故障 DP rank，重新分配专家（EPLB），重载权重，重新初始化通信组，在剩余健康 NPU 上恢复服务
+2. **暂停操作**：故障发生时暂停健康 DP rank，防止级联失败；
+3. **重试恢复**：针对瞬时性和可恢复故障，清理工作进程状态、重建 Gloo 通信组，恢复推理服务
+4. **优雅缩容**：故障不可恢复时，移除故障 DP rank，重新分配专家（EPLB），重载权重，重建通信组，在剩余健康 GPU/NPU 上恢复服务
 
 ### 2.5 容错工作流
 
 ```
-NPU卡掉线 / 引擎崩溃
+NPU卡掉线 / 引擎崩溃等
          |
          v
 +-----------+-----------+
@@ -72,7 +72,6 @@ NPU卡掉线 / 引擎崩溃
 +-----------+-----------+
 | 2. 暂停操作            |
 |   - 停止健康 DP rank   |
-|   - 设置 DP rank mask  |
 |   - 等待外部指令       |
 +-----------+-----------+
          |
@@ -99,32 +98,24 @@ NPU卡掉线 / 引擎崩溃
 
 ## 3. 开发阶段划分
 
-### Upstream 基础能力
+### Phase 1 — 核心容错框架
 
-| 序号 | 能力 | 说明 |
-|------|------|------|
-| U.1 | 故障上报框架 | ZMQ 故障通道、哨兵注册与健康状态发布 |
-| U.2 | pause 指令工作流 | DP rank mask、FT kernel dispatch/combine mask |
-| U.3 | retry 清理与重置 | 工作进程状态清理、通信组重建、瞬时错误恢复 |
-
-### Phase 1 — 核心容错框架（含 scale down 扩展）
-
-**目标**：在上游基础能力之上，扩展 scale down 缩容能力。
+**目标**：从零搭建完整容错框架，包括故障上报、pause、retry、scale down 全部能力。
 
 | 序号 | 任务 | 说明 |
 |------|------|------|
 | 1.1 | 项目初始化 | 目录结构，补丁框架 |
-| 1.2 | 核心：ZMQ 通信 | DEALER/ROUTER/PUB/SUB 通道 |
-| 1.3 | 故障上报框架 | 哨兵注册、故障消息定义 |
-| 1.4 | pause 指令实现 | rank mask、FT kernel 适配 |
-| 1.5 | retry 实现 | 状态清理、通信组重建 |
-| 1.6 | scale down 工作流 | 暂停 → 重分配专家 → 重载权重 → 初始化通信 |
+| 1.2 | ZMQ 通信 | DEALER/ROUTER/PUB/SUB 通道 |
+| 1.3 | 故障上报框架 | 哨兵注册、故障消息定义、健康状态发布 |
+| 1.4 | pause 指令实现 | 设置全局 pause 事件 → NPU `stop_device`（释放 NPU 设备资源），健康 DP rank 暂停请求处理 |
+| 1.5 | retry 实现 | 状态清理、通信组重建、瞬时错误恢复 |
+| 1.6 | scale down 工作流 | 暂停 → 重分配专家 → 重载权重 → 重建通信 |
 | 1.7 | REST API | `/fault_tolerance/apply`, `/fault_tolerance/status` |
 | 1.8 | Phase 1 完整测试 | 输出测试报告 |
 
 ### Phase 2 — 外部监控与完善
 
-**目标**：增加外部 NPU 硬件故障监控，完善量化模型支持。
+**目标**：增加外部 NPU 硬件故障监控，完善量化&MTP模型支持。
 
 | 序号 | 任务 | 说明 |
 |------|------|------|
@@ -153,7 +144,7 @@ pytest tests/v1/fault_tolerance/
 ### 4.2 测试覆盖范围
 
 - **单元测试**：`tests/v1/fault_tolerance/`，覆盖 ClientSentinel、EngineCoreSentinel、NPUWorkerSentinel 三个哨兵类的所有 public 方法（正常路径、异常路径、边界条件）
-- **端到端测试**：在DP8/TP1 配置下注入 RuntimeError 和进程杀死两类故障，验证 pause → retry/scale_down 完整容错链路
+- **端到端测试**：在DP4/TP1 配置下注入 RuntimeError 和进程杀死两类故障，验证 pause → retry/scale_down 完整容错链路
 
 ---
 
@@ -227,9 +218,9 @@ pytest tests/v1/fault_tolerance/
 
 | 指令 | 参数 | 描述 |
 |------|------|------|
-| `pause` | `timeout`, `exclude_engine_index`（可选） | 暂停所有健康 DP rank。利用 FT kernel 的 dispatch/combine mask，健康 rank 在 all2all 通信中超时后自动屏蔽故障 rank，然后 Sentinel 设置 pause 标志停止请求处理 |
-| `retry` | `timeout` | 仅针对瞬时性可恢复故障。清理工作进程状态（input batch、model state）、重置 rank mask、重建 Gloo 通信组、恢复推理 |
-| `scale_down` | `timeout`, `exclude_dp_ranks` | 永久故障恢复。移除指定的故障 rank，更新 rank membership（单调降级），通过 EPLB 重新分配专家（含冗余专家），重载权重，重建通信组 |
+| `pause` | `timeout`, `exclude_engine_index`（可选） | 暂停所有健康 DP rank。 |
+| `retry` | `timeout` | 仅针对瞬时性可恢复故障。通过清理工作进程状态（input batch、model state等）、重建 Gloo 通信组等恢复推理服务 |
+| `scale_down` | `timeout`, `exclude_dp_ranks` | 永久故障恢复。移除指定的故障DP rank来恢复推理服务 |
 
 #### GET /fault_tolerance/status
 
