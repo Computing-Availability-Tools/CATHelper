@@ -70,7 +70,6 @@
 - 通过 ZMQ 将故障信息转发给 ClientSentinel
 - 接收并执行 ClientSentinel 的指令（pause/retry/scale_down）
 - 与 WorkerSentinels 通信，执行工作进程级操作
-- 管理 EP rank mask，通过 `set_ep_rank_mask` 控制 all2all 通信中的可见 rank
 - 执行 retry 清理流程（状态重置、Gloo 通信组重建）
 
 #### 1.2.3 WorkerSentinel（底层）
@@ -78,7 +77,6 @@
 - 每个工作进程（NPU 设备）一个，运行在工作进程中
 - 通过 ZMQ 接收 EngineCoreSentinel 的命令
 - 在 NPU 级别执行暂停/重试/缩容操作
-- 管理 EP Rank 掩码，通过 `set_ep_rank_mask` 实现 DP rank mask → FT kernel dispatch/combine mask 的映射，在 all2all 通信中自动屏蔽故障 rank
 - 在 scale down 过程中执行权重卸载/加载操作
 
 ### 1.3 容错工作流
@@ -95,8 +93,7 @@
                            │
                            v
                     ┌──────┴──────┐
-                     │  暂停操作    │
-                     │  DP rank mask│
+                     │  暂停操作   │
                     │  等待指令   │
                     └──────┬──────┘
                            │
@@ -105,13 +102,23 @@
                     └──────┬──────┘
                            │
               ┌────────────┼────────────┐
-              v            v            v
-      ┌───────┴┐   ┌──────┴──────┐   ┌─┴──────────┐
-      │ retry  │   │ scale_down  │   │  超时退出   │
-      │ (清理) │   │ (7阶段工作流)│   │ (抛异常)    │
-      │ (重置) │   │ (EPLB重分配)│   └────────────┘
-      │ (重建) │   │ (重载权重)  │
-      └────┬───┘   └──────┬──────┘
+               v            v            v
+       ┌───────┴┐   ┌──────┴──────────────┐   ┌─┴──────────┐
+       │ retry  │   │ scale_down          │   │  超时退出   │
+       │ (清理) │   │ ①专家分布重算       │   │ (抛异常)    │
+       │ (重置) │   │ ②专家权重重载       │   └────────────┘
+       │ (重建) │   │ ③专家路由重建       │
+       └────┬───┘   │ ④并行参数更新       │
+            │       │ ⑤CPU Gloo通信组重建 │
+            │       │ ⑥MC2 Mask参数更新   │
+            │       │ ⑦MoE配置更新        │
+            │       └──────────┬──────────┘
+            └──────┬───────────┘
+                   v
+            ┌──────┴──────┐
+            │  恢复服务    │
+            │  发布新状态  │
+            └─────────────┘
            └──────┬───────┘
                   v
            ┌──────┴──────┐
@@ -123,7 +130,7 @@
 #### 带外部监控器（NPU 硬件故障）
 
 监控器（`scale_down.py`）使用 DCMI 轮询 NPU 健康状态。当检测到卡故障时：
-1. 监控器发送 `pause` 指令，冻结受影响的 DP Rank
+1. 监控器发送 `pause` 指令，暂停所有健康的 DP Rank
 2. 监控器发送 `scale_down` 指令，移除故障 Rank
 3. vLLM 在剩余健康 NPU 上重新分配专家
 
@@ -161,29 +168,38 @@ NPU卡掉线/引擎崩溃
    EngineCoreSentinel              scale_down.py
          │                         (外部监控器)
          v
-  ┌──────┴──────┐
-  │ 指令分发     │
-  │ pause/retry │
-  │ /scale_down │
-  └──────┬──────┘
-         |
-         v
-  ┌──────┴──────┐
-  │ WorkerSentinel │
-  │ set_ep_rank_  │
-  │ mask / 卸载/ │
-  │ 加载权重     │
-  └──────┬──────┘
-         |
-         v
-  ┌──────┴──────────┐
-  │ ScaleDownHelper  │
-  │ 7 阶段工作流     │
-  │ (Pause → Prepare │
-  │ → Unload → Load  │
-  │ → Init → Resume  │
-  │ → Report)        │
-  └──────┬──────────┘
+   ┌──────┴──────┐
+   │ 指令分发     │
+   │ pause/retry │
+   │ /scale_down │
+   └──────┬──────┘
+          |
+          v
+   ┌──────┴──────────┐
+   │ NPUWorkerSentinel │
+   │ pause: stop_device│
+   │ retry: clean_    │
+   │   states + 重建  │
+   │   DP通信组       │
+   │ scale_down:      │
+   │   →ScaleDownHelper│
+   └──────┬──────────┘
+          |
+          v
+   ┌──────┴──────────┐
+   │ ScaleDownHelper  │
+   │ 7 阶段工作流     │
+   │ ①专家分布重算   │
+   │ ②专家权重重载   │
+   │ ③专家路由重建   │
+   │ ④并行参数更新   │
+   │ ⑤CPU GLOO重    │
+   │   建通信组      │
+   │ ⑥MC2 Mask更    │
+   │   新算子参数    │
+   │ ⑦MoE专家配置   │
+   │   更新          │
+   └──────┬──────────┘
          |
          v
    ┌─────┴─────┐
@@ -200,8 +216,8 @@ NPU卡掉线/引擎崩溃
 ├─────────────────────────────┬───────────────────────┤
 │ 带外部监控器                 │ 不带监控器             │
 ├─────────────────────────────┼───────────────────────┤
-│ DCMI 轮询 NPU 健康状态      │                        │
-│ 自动检测卡故障              │ 捕获异常                │
+│ DCMI 轮询 NPU 健康状态      │    捕获异常             │
+│ 自动检测卡故障              │    进程暂停             │
 │ 自动发送 pause/scale_down   │ 手动通过 REST API 操作  │
 │ 完全自动化                  │ 灵活性更高              │
 └─────────────────────────────┴───────────────────────┘
@@ -238,7 +254,7 @@ class FaultToleranceInstruction:
 EngineCoreSentinel 收到指令后，通过 `handle_instruction` 分发到对应执行函数：
 - `pause_handler`: 设置 DP rank mask，冻结请求处理
 - `retry_handler`: 清理工作进程状态，重置 rank mask，重建通信
-- `scale_down_handler`: 触发 ScaleDownHelper 7 阶段工作流
+- `scale_down_handler`: 触发 ScaleDownHelper 7 阶段工作流：专家分布重算 → 专家权重重载 → 专家路由重建 → 并行参数更新 → CPU Gloo 通信组重建 → MC2 算子 Mask 参数更新 → MoE 专家配置更新
 
 #### 故障上报机制
 
@@ -259,19 +275,9 @@ ClientSentinel 记录故障后通过 ZMQ PUB 广播 health_status 消息给所�
 #### retry 清理机制
 
 针对瞬时性错误（transient error），retry 指令执行以下恢复步骤：
-1. 清理工作进程状态（重置 fault_signal_q、重置 request_queue）
-2. 重置 EP rank mask 为全 1（恢复 full mask）
-3. 重建 Gloo 通信组（重新初始化 hccl_world）
-4. 恢复请求处理
-
-#### rank mask 层叠
-
-DP rank mask 与 FT kernel dispatch/combine mask 通过 `set_ep_rank_mask` 层叠：
-```
-DP rank mask (bitmask) → FT kernel dispatch mask → all2all 通信过滤
-                        → FT kernel combine mask → all2all 结果合并
-```
-健康 rank 设置 mask 后，所有 all2all 和 allreduce 操作自动跳过故障 rank，防止级联失败。
+1. `clean_states`：清除 pause 事件，`stop_device` + `restart_device` 重新初始化 NPU 设备，`reinit_process_group` 重置分发通信组，清理 worker 状态（execute_model_state、kv_connector_output、input_batch）
+2. 重建 Gloo 通信组：调用 `stateless_init_torch_distributed_process_group` 重新初始化 DP cpu_group
+3. 恢复请求处理
 
 #### 优雅降级
 
@@ -292,6 +298,12 @@ elastic-ep/vllm/
 ├── patches/
 │   ├── vllm_scale_down.patch          # vLLM v0.18.0 核心容错框架补丁
 │   └── vllm_ascend_scale_down.patch   # vllm-ascend v0.18.0 昇腾特定适配补丁
+├── tests/
+│   └── v1/
+│       └── fault_tolerance/
+│           ├── test_client_sentinel.py        # ClientSentinel 单元测试
+│           ├── test_engine_core_sentinel.py    # EngineCoreSentinel 单元测试
+│           └── test_npu_worker_sentinel.py     # NPUWorkerSentinel 单元测试
 ├── README.md                          # 项目说明
 ├── SPEC.md                            # 技术规格说明书
 ├── DESIGN.md                          # 架构与系统设计
