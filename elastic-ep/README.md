@@ -1,40 +1,47 @@
 # vLLM Elastic EP
 
-[中文](README_ZH.md)
+> **vLLM Elastic EP** — vLLM 弹性容错方案
 
-Elastic fault tolerance for [vLLM](https://github.com/vllm-project/vllm) on Huawei Ascend 910C NPU.
+vLLM Elastic EP 使 vLLM 能够在DP(data parallel)+EP(expert parallel)的部署模式下，出现故障后，推理进程进入暂停状态不退出，通过重试恢复服务，或者通过将故障点所在的DP组缩容掉的方式，将故障隔离出去，提供在线弹性能力。
 
-## Overview
+## 版本信息
 
-vLLM Elastic EP enables vLLM to **survive NPU failures** without restarting. When an NPU card drops or becomes unhealthy, the system detects the fault, pauses affected data-parallel ranks, scales down by redistributing experts, and resumes serving on the remaining healthy NPUs.
+| 项目 | 说明 |
+|------|------|
+| 版本号 | v0.1.0 |
+| 发布时间 | 2026-07-16 |
+| 发布人 | sunnytao-blue |
+| 平台支持 | Linux (ARM, Ascend NPU) |
+| 许可证 | Apache License 2.0 |
 
-## Key Features
+## 功能特性
 
-| Feature | Description |
-|---------|-------------|
-| **Fault Reporting** | Engine crashes caught and reported via ZMQ within seconds |
-| **Graceful Scale-Down** | Pauses affected ranks, redistributes experts, reloads weights |
-| **External API Control** | REST API for pause, retry, and scale_down instructions |
+| 特性 | 说明 |
+|------|------|
+| **容错框架** | 三级哨兵架构（ClientSentinel / EngineCoreSentinel / NPUWorkerSentinel），支持通过 REST API 与外部的实例故障管理中心协同 |
+| **故障上报** | 提供主动（外部实例故障管理中心通过 REST API）和被动（vLLM内部通过 ZMQ ）2种方式上报故障到Client层 |
+| **优雅容错** | 故障发生时暂停实例，通过执行重试、缩容恢复指令实现快速自愈 |
 
-## Latest Version
+## 技术栈
 
-| Version | Date | Releaser |
-|---------|------|----------|
-| v0.1.0 | 2026-07-16 | a798347923 |
+| 项目 | 选型 |
+|------|------|
+| 语言 | Python 3.10+ |
+| 框架 | vLLM v0.18.0 + vllm-ascend v0.18.0 |
+| 通信 | ZMQ (DEALER/ROUTER/PUB/SUB) |
+| 配置 | CLI 参数 + JSON |
+| 外部依赖 | zmq, msgspec, requests |
+| NPU 监控 | DCMI（可选，不启动时框架仍会拦截引擎异常、自动暂停，并等待 REST API 指令） |
 
-See [RELEASE_NOTES.md](RELEASE_NOTES.md) for full release history.
+## 快速上手
 
-## Quick Start
+### 前置条件
 
-### Prerequisites
+- 当前版本仅支持华为昇腾A3服务器
 
-- Huawei Ascend 910C
-- Docker with access to `quay.io/ascend/vllm-ascend:v0.18.0-a3`
-- DCMI library (optional, only for NPU hardware monitor)
+### 安装
 
-### Installation
-
-#### Step 1: Pull the Official Docker Image
+#### Step 1：拉取官方 vLLM Ascend Docker 镜像
 
 ```bash
 docker pull quay.io/ascend/vllm-ascend:v0.18.0-a3
@@ -46,7 +53,7 @@ docker run -it --net=host --ipc=host --privileged=true \
     quay.io/ascend/vllm-ascend:v0.18.0-a3 bash
 ```
 
-#### Step 2: Apply the Patches
+#### Step 2：打容错框架补丁
 
 ```bash
 cd /vllm-workspace/vllm
@@ -58,7 +65,7 @@ git fetch --all && git checkout v0.18.0 && git reset --hard 4a533861
 git apply /path/to/patches/vllm_ascend_scale_down.patch
 ```
 
-#### Step 3: Install
+#### Step 3：安装vllm和vllm-ascend
 
 ```bash
 cd /vllm-workspace/vllm
@@ -66,46 +73,47 @@ VLLM_TARGET_DEVICE=empty pip install -e .
 
 cd /vllm-workspace/vllm-ascend
 git submodule update --init --recursive
-# Fix: triton-ascend 3.2.1 is only required for v0.20+; downgrade to 3.2.0
+# 修复Bug：triton-ascend 3.2.1 仅适用于 vllm-ascend v0.20.0+，当前使用v0.18.0版本，triton-ascend需要降级到 3.2.0，否则安装会报错。
+# https://github.com/vllm-project/vllm-ascend/issues/9794
 sed -i 's/triton-ascend==3.2.1/triton-ascend==3.2.0/' pyproject.toml
 pip install -e .
 ```
 
-### Usage
+### 使用
 
-Reference scripts are provided under `examples/Fault-Tolerance-scale/`:
+项目提供拉起带容错功能的vLLM服务参考脚本位于 `examples/fault_tolerance_scale/` 目录下：
 
-| Script | Description |
-|--------|-------------|
-| `serve_qwen.sh` | Start vLLM service with fault tolerance enabled |
-| `scale_down.py` | NPU hardware fault monitor (optional) |
+| 脚本 | 说明 |
+|------|------|
+| `serve_qwen.sh` | 启动带容错功能的 vLLM 服务 |
+| `scale_down.py` | NPU 硬件故障监控和处理程序（可选：用户自行选择故障恢复策略时无需运行） |
 
-> **Note:** Before running `serve_qwen.sh`, you must configure the model parameters (`LOCAL_MODEL_PATH`, `MODEL_NAME`, etc.) in the script or override them via command-line arguments to match your environment.
+> **注意：** 运行前需根据实际环境修改脚本中的模型权重路径（`LOCAL_MODEL_PATH`、`MODEL_NAME` 等参数），或通过命令行参数覆盖。
 
-#### Start vLLM Service
+#### 启动 vLLM 服务
 
 ```bash
-bash examples/Fault-Tolerance-scale/serve_qwen.sh \
+bash examples/fault_tolerance_scale/serve_qwen.sh \
     --dp 4 --re 48 --fault-port 22867 --recovery-timeout 120 --port 8006
 ```
 
-#### Start the Monitor (Optional)
+#### 启动监控（可选）
+监控程序是可选的。不启动时，框架仍会拦截引擎异常、自动暂停，并等待通过 REST API 手动发送 `retry`(重试) 或 `scale_down`(缩容)：
 
 ```bash
-python examples/Fault-Tolerance-scale/scale_down.py \
+python examples/fault_tolerance_scale/scale_down.py \
     --npu-ids 0,1,2,3 --interval-time 3 \
     --external-fault-notify-port 22867 --port 8006
 ```
 
-The monitor is optional. Without it, the framework still catches engine exceptions, auto-pauses, and waits for manual `retry` or `scale_down` via the REST API:
 
-**Query current fault tolerance status:**
+**查询当前容错状态：**
 
 ```bash
 curl http://localhost:8006/fault_tolerance/status
 ```
 
-**Retry (restart all DP ranks):**
+**重试（重启所有 DP rank）：**
 
 ```bash
 curl -X POST http://localhost:8006/fault_tolerance/apply \
@@ -113,7 +121,7 @@ curl -X POST http://localhost:8006/fault_tolerance/apply \
     -d '{"instruction":"retry","params":{"timeout":30}}'
 ```
 
-**Scale down (exclude specific DP ranks):**
+**缩容（排除指定 DP rank）：**
 
 ```bash
 curl -X POST http://localhost:8006/fault_tolerance/apply \
@@ -121,55 +129,73 @@ curl -X POST http://localhost:8006/fault_tolerance/apply \
     -d '{"instruction":"scale_down","params":{"timeout":30,"exclude_dp_ranks":[2]}}'
 ```
 
-## Feature Status
+## 特性兼容情况
 
-| Feature | Status | Notes |
-|---------|--------|-------|
-| Dynamic EPLB | Fully supported | Expert placement re-balanced after fault via EPLB framework |
-| Quantized models (W8A8) | Supported | Ascend-format W8A8 quantization adapted |
-| Quantized models (W4A8) | Not supported | W4A8 quantization not yet adapted |
-| MTP (Multi-Token Prediction) | Supported | Adapted and tested on GLM5 |
-| `--enforce-eager` mode | Supported | Disabled graph capture, runs in eager mode |
-| PIECEWISE ACL Graph mode | Supported | Chunked graph capture for large models |
+| 特性 | 状态 | 说明 |
+|------|------|------|
+| 动态 EPLB | 已兼容 | 故障后通过 EPLB 框架重新平衡专家放置 |
+| 量化模型（W8A8） | 已兼容 | ModelSlim 格式 W8A8 量化模型已完成适配 |
+| 量化模型（W4A8） | 暂未兼容 | W4A8 量化尚未适配 |
+| MTP（多 Token 预测） | 已兼容 | 已完成适配，在 GLM5.1 上完成测试 |
+| `--enforce-eager` 模式 | 已兼容 | 禁用图捕获 |
+| PIECEWISE ACL Graph 模式 | 已兼容 | 大模型分块图捕获 |
+| FULL Graph 模式 | 暂未兼容 | 大模型整图捕获 |
 
-## Known Issues (v0.1.0)
+## 已测试模型
 
-During the **second scale-down**, the following issues may occasionally occur:
+本特性已在以下模型上完成验证：
 
-1. **Fault weight loading time significantly increases** — reloading weights after a second scale-down may take much longer than the first
-2. **`stop device` cannot stop** — device pause may fail to complete, blocking the scale-down flow
-3. **Worker stuck in `input_event` synchronization** — after recovery, workers may hang waiting on input event synchronization
+| 模型 | 量化 |
+|------|------|
+| DeepSeek-V3 | W8A8 |
+| Qwen3-235B-A22B | W8A8 |
+| GLM-5.1 | W8A8 |
 
-## Tested Models
+其他类型的模型可能存在兼容性问题。
 
-This feature has been verified on the following models:
+## 已知问题（v0.1.0）
 
-- DeepSeek-V3 (DSv3)
-- Qwen3-235B-A22B
-- GLM5
+第二次缩容存在一些偶现问题
 
-Other model types may have compatibility issues.
+## 限制
 
-## Limitations
+| 限制 |
+|------|
+|当前版本仅支持华为昇腾 A3 服务器 |
+|必须开启 Expert Parallel（`--enable-expert-parallel`）才能使用容错特性 |
+|仅支持 tensor parallel size 为 1 |
+|当前版本不支持扩容 |
+|不支持 Pipeline Parallel |
+|冗余专家数限制(缩容)：健康卡上的冗余专家总数必须大于故障卡上的非冗余专家数量 |
 
-| Limitation | Description |
-|------------|-------------|
-| Ascend 910C only | Currently only supports Huawei Ascend 910C NPU |
-| EP required | Must enable Expert Parallel (`--enable-expert-parallel`) to use fault tolerance features |
-| TP = 1 only | Scale-down only supports tensor-parallel size of 1 |
-| No scale-up | Cannot add NPU capacity back after scale-down |
-| Pipeline parallel unsupported | PP is not compatible with scale-down |
-| Redundant experts budget (scale-down) | Healthy cards' total redundant experts must exceed failed card's non-redundant experts |
+## 文档
 
-## Documentation
+| 文档 | 说明 |
+|------|------|
+| [SPEC.md](SPEC.md) | 技术规格与需求 |
+| [DESIGN.md](DESIGN.md) | 架构与系统设计 |
+| [RELEASE_NOTES.md](RELEASE_NOTES.md) | 版本发布记录 |
+| [TEST_REPORT.md](TEST_REPORT.md) | 系统测试报告 |
 
-| Document | Description |
-|----------|-------------|
-| [SPEC.md](SPEC.md) | Specifications, configuration, and REST API reference |
-| [DESIGN.md](DESIGN.md) | Architecture and system design |
-| [RELEASE_NOTES.md](RELEASE_NOTES.md) | Version release history |
-| [TEST_REPORT.md](TEST_REPORT.md) | System test reports |
+### 项目结构
 
-## License
-
-Apache License 2.0
+```
+elastic-ep/vllm/
+├── examples/
+│   └── fault_tolerance_scale/
+│       ├── serve_qwen.sh              # 启动带容错功能的 vLLM 服务
+│       └── scale_down.py              # NPU 硬件故障监控和处理程序
+├── patches/
+│   ├── vllm_scale_down.patch          # vLLM v0.18.0 核心容错框架补丁
+│   └── vllm_ascend_scale_down.patch   # vllm-ascend v0.18.0 昇腾特定适配补丁
+├── tests/
+│   └── v1/
+│       └── fault_tolerance/
+│           ├── test_client_sentinel.py        # ClientSentinel 单元测试
+│           ├── test_engine_core_sentinel.py    # EngineCoreSentinel 单元测试
+│           └── test_npu_worker_sentinel.py     # NPUWorkerSentinel 单元测试
+├── README.md                          # 项目说明
+├── SPEC.md                            # 技术规格说明书
+├── DESIGN.md                          # 架构与系统设计
+├── RELEASE_NOTES.md                   # 版本发布记录
+└── TEST_REPORT.md                     # 系统测试报告
