@@ -241,14 +241,7 @@ pytest tests/v1/fault_tolerance/
 
 ### 5.4 通信通道
 
-| 通道 | 协议 | 方向 | 用途 |
-|------|------|------|------|
-| 引擎故障套接字 | ZMQ DEALER/ROUTER | 引擎 -> ClientSentinel | 报告引擎异常（fault_report 消息） |
-| 哨兵注册 | ZMQ DEALER/ROUTER | EngineCore -> ClientSentinel | 启动时注册 sentinel_id/pid/rank 信息 |
-| 故障状态 PUB/SUB | ZMQ PUB/SUB | ClientSentinel -> 外部 | 广播引擎健康状态（health_status 消息） |
-| 容错请求/结果 | ZMQ DEALER/PUSH | ClientSentinel -> 引擎 | 分发 pause/retry/scale_down 指令 |
-| Worker进程命令 | ZMQ ROUTER/DEALER | EngineCore -> Worker | Worker级控制 |
-| HTTP API | REST | 外部 -> API 服务器 | 外部容错控制 |
+> 通信通道详见 [DESIGN.md §2.3 通信通道](DESIGN.md#23-通信通道)。
 
 ---
 
