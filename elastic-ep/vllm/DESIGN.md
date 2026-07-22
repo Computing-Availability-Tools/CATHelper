@@ -25,8 +25,8 @@
               |                       |
               v                       v
       +-------+-----------------------+--------+
-      |          ClientSentinel                 |
-      |  （每个 vLLM 实例一个）                  |
+      |          ClientSentinel               |
+      |  （每个 vLLM 实例一个）                 |
       |  - 通过 ZMQ 接收故障报告                |
       |  - 发布引擎健康状态                     |
       |  - 分发暂停/重试/缩容指令               |
@@ -39,12 +39,12 @@
 +-----+------+  +-----+------+  +-----+-----+
       |                |               |
 +-----+----------------+---------------+-----+
-|           EngineCore（run_busy_loop）        |
+|       EngineCore（run_busy_loop）           |
 |   使用 @fault_tolerant_wrapper 包装         |
 +-----+----------------+---------------+-----+
       |                |               |
 +-----+------+  +-----+------+  +-----+------+
-|   工作进程  |  |   工作进程  |  |   工作进程  |
+|   Worker   |  |   Worker   |  |   Worker   |
 |  Sentinel  |  |  Sentinel  |  |  Sentinel  |
 |   (NPU)    |  |   (NPU)    |  |   (NPU)    |
 +------------+  +------------+  +------------+
@@ -72,7 +72,7 @@
 - 与 WorkerSentinels 通信，执行工作进程级操作
 - 执行重试清理流程（状态重置、Gloo 通信组重建）
 
-#### 1.2.3 WorkerSentinel（底层）
+#### 1.2.3 NPUWorkerSentinel（底层）
 
 - 每个工作进程（NPU 设备）一个，运行在工作进程中
 - 通过 ZMQ 接收 EngineCoreSentinel 的命令
@@ -290,6 +290,7 @@ elastic-ep/vllm/
 ├── tests/
 │   └── v1/
 │       └── fault_tolerance/
+│           ├── __init__.py
 │           ├── test_client_sentinel.py        # ClientSentinel 单元测试
 │           ├── test_engine_core_sentinel.py    # EngineCoreSentinel 单元测试
 │           └── test_npu_worker_sentinel.py     # NPUWorkerSentinel 单元测试
@@ -317,7 +318,7 @@ elastic-ep/vllm/
 | 哨兵注册 | ZMQ DEALER/ROUTER | EngineCore -> ClientSentinel | 启动时注册哨兵身份（注册消息） |
 | 故障状态 发布/订阅 | ZMQ 发布/订阅 | ClientSentinel -> 外部 | 广播引擎健康状态（健康状态消息） |
 | 容错请求/结果 | ZMQ DEALER/PUSH | ClientSentinel -> 引擎 | 分发暂停/重试/缩容指令 |
-| 工作进程命令 | ZMQ ROUTER/DEALER | EngineCore -> 工作进程 | 工作进程级控制（rank mask 等） |
+| Worker进程命令 | ZMQ ROUTER/DEALER | EngineCore -> Worker | Worker级控制（rank mask 等） |
 | HTTP API | REST | 外部 -> API 服务器 | 外部容错控制 |
 
 

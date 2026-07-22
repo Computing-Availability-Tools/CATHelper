@@ -48,14 +48,14 @@ vLLM Elastic EP 使 vLLM 能够在DP(data parallel)+EP(expert parallel)的部署
 | 重试（retry） | 清理工作进程状态、重置 rank mask、重建通信组，重新执行推理 | 短暂性故障（网络抖动、瞬时通信超时等） |
 
 
-### 2.4 功能需求
+### 2.3 功能需求
 
 1. **故障上报**：故障发生后引擎不再立即退出，通过 ZMQ 向外报告异常详情与引擎健康状态，为上层框架提供故障诊断能力
 2. **暂停操作**：故障发生时暂停健康 DP rank，防止级联失败；
 3. **重试恢复**：针对瞬时性和可恢复故障，清理工作进程状态、重建 Gloo 通信组，恢复推理服务
 4. **优雅缩容**：故障不可恢复时，移除故障 DP rank，重新分配专家（EPLB），重载权重，重建通信组，在剩余健康 GPU/NPU 上恢复服务
 
-### 2.5 容错工作流
+### 2.4 容错工作流
 
 ```
 NPU卡掉线 / 引擎崩溃等
@@ -64,7 +64,7 @@ NPU卡掉线 / 引擎崩溃等
 +-----------+-----------+
 | 1. 故障报告            |
 |   - ZMQ 故障上报通道   |
-|   - 哨兵注册与健康状态  |
+|   - Sentinel 注册与健康状态  |
 |   - 外部 SUB 订阅通知  |
 +-----------+-----------+
          |
@@ -128,7 +128,7 @@ NPU卡掉线 / 引擎崩溃等
 
 ## 4. 测试要求
 
-#### 4.1 单元测试
+### 4.1 单元测试
 
 ```bash
 pytest tests/v1/fault_tolerance/
@@ -140,7 +140,7 @@ pytest tests/v1/fault_tolerance/
 2. 每次变更后更新 `TEST_REPORT.md`，记录单元测试与端到端测试结果
 3. 端到端测试在 NPU 物理机上执行，使用 `serve_qwen.sh` 部署后注入故障验证
 
-### 4.2 测试覆盖范围
+### 4.3 测试覆盖范围
 
 - **单元测试**：`tests/v1/fault_tolerance/`，覆盖 ClientSentinel、EngineCoreSentinel、NPUWorkerSentinel 三个哨兵类的所有 public 方法（正常路径、异常路径、边界条件）
 - **端到端测试**：在DP4/TP1 配置下注入 RuntimeError 和进程杀死两类故障，验证 pause → retry/scale_down 完整容错链路
@@ -247,7 +247,7 @@ pytest tests/v1/fault_tolerance/
 | 哨兵注册 | ZMQ DEALER/ROUTER | EngineCore -> ClientSentinel | 启动时注册 sentinel_id/pid/rank 信息 |
 | 故障状态 PUB/SUB | ZMQ PUB/SUB | ClientSentinel -> 外部 | 广播引擎健康状态（health_status 消息） |
 | 容错请求/结果 | ZMQ DEALER/PUSH | ClientSentinel -> 引擎 | 分发 pause/retry/scale_down 指令 |
-| 工作进程命令 | ZMQ ROUTER/DEALER | EngineCore -> 工作进程 | 工作进程级控制（EP rank mask 等） |
+| Worker进程命令 | ZMQ ROUTER/DEALER | EngineCore -> Worker | Worker级控制（EP rank mask 等） |
 | HTTP API | REST | 外部 -> API 服务器 | 外部容错控制 |
 
 ---
