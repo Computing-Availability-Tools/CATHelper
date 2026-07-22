@@ -24,14 +24,7 @@ vLLM Elastic EP 使 vLLM 能够在DP(data parallel)+EP(expert parallel)的部署
 
 ## 技术栈
 
-| 项目 | 选型 |
-|------|------|
-| 语言 | Python 3.10+ |
-| 框架 | vLLM v0.18.0 + vllm-ascend v0.18.0 |
-| 通信 | ZMQ (DEALER/ROUTER/PUB/SUB) |
-| 配置 | CLI 参数 + JSON |
-| 外部依赖 | zmq, msgspec, requests |
-| NPU 监控 | DCMI（可选，不启动时框架仍会拦截引擎异常、自动暂停，并等待 REST API 指令） |
+> 完整技术栈与依赖详见 [SPEC.md §1.2 技术栈](SPEC.md#12-技术栈) 和 [SPEC.md §6.1 依赖要求](SPEC.md#61-依赖要求)。
 
 ## 快速上手
 
@@ -159,14 +152,7 @@ curl -X POST http://localhost:8006/fault_tolerance/apply \
 
 ## 限制
 
-| 限制 |
-|------|
-|当前版本仅支持华为昇腾 A3 服务器 |
-|必须开启 Expert Parallel（`--enable-expert-parallel`）才能使用容错特性 |
-|仅支持 tensor parallel size 为 1 |
-|当前版本不支持扩容 |
-|不支持 Pipeline Parallel |
-|冗余专家数限制(缩容)：健康卡上的冗余专家总数必须大于故障卡上的非冗余专家数量 |
+> 详见 [SPEC.md §6.2 限制](SPEC.md#62-限制)。
 
 ## 文档
 
@@ -179,23 +165,4 @@ curl -X POST http://localhost:8006/fault_tolerance/apply \
 
 ### 项目结构
 
-```
-elastic-ep/vllm/
-├── examples/
-│   └── fault_tolerance_scale/
-│       ├── serve_qwen.sh              # 启动带容错功能的 vLLM 服务
-│       └── scale_down.py              # NPU 硬件故障监控和处理程序
-├── patches/
-│   ├── vllm_scale_down.patch          # vLLM v0.18.0 核心容错框架补丁
-│   └── vllm_ascend_scale_down.patch   # vllm-ascend v0.18.0 昇腾特定适配补丁
-├── tests/
-│   └── v1/
-│       └── fault_tolerance/
-│           ├── test_client_sentinel.py        # ClientSentinel 单元测试
-│           ├── test_engine_core_sentinel.py    # EngineCoreSentinel 单元测试
-│           └── test_npu_worker_sentinel.py     # NPUWorkerSentinel 单元测试
-├── README.md                          # 项目说明
-├── SPEC.md                            # 技术规格说明书
-├── DESIGN.md                          # 架构与系统设计
-├── RELEASE_NOTES.md                   # 版本发布记录
-└── TEST_REPORT.md                     # 系统测试报告
+> 详见 [DESIGN.md §2.1 目录结构](DESIGN.md#21-目录结构)。

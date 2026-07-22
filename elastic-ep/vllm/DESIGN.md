@@ -314,11 +314,11 @@ elastic-ep/vllm/
 
 | 通道 | 协议 | 方向 | 用途 |
 |------|------|------|------|
-| 引擎故障套接字 | ZMQ DEALER/ROUTER | 引擎 -> ClientSentinel | 报告引擎异常（故障报告消息） |
-| 哨兵注册 | ZMQ DEALER/ROUTER | EngineCore -> ClientSentinel | 启动时注册哨兵身份（注册消息） |
-| 故障状态 发布/订阅 | ZMQ 发布/订阅 | ClientSentinel -> 外部 | 广播引擎健康状态（健康状态消息） |
-| 容错请求/结果 | ZMQ DEALER/PUSH | ClientSentinel -> 引擎 | 分发暂停/重试/缩容指令 |
-| Worker进程命令 | ZMQ ROUTER/DEALER | EngineCore -> Worker | Worker级控制（rank mask 等） |
+| 引擎故障套接字 | ZMQ DEALER/ROUTER | 引擎 -> ClientSentinel | 报告引擎异常（fault_report 消息） |
+| 哨兵注册 | ZMQ DEALER/ROUTER | EngineCore -> ClientSentinel | 启动时注册 sentinel_id/pid/rank 信息 |
+| 故障状态 PUB/SUB | ZMQ PUB/SUB | ClientSentinel -> 外部 | 广播引擎健康状态（health_status 消息） |
+| 容错请求/结果 | ZMQ DEALER/PUSH | ClientSentinel -> 引擎 | 向EngineCore分发 pause/retry/scale_down 指令 |
+| Worker进程命令 | ZMQ ROUTER/DEALER | EngineCore -> Worker | 向Worker下发 pause/retry/scale_down 指令 |
 | HTTP API | REST | 外部 -> API 服务器 | 外部容错控制 |
 
 
