@@ -39,7 +39,7 @@
 +-----+------+  +-----+------+  +-----+-----+
       |                |               |
 +-----+----------------+---------------+-----+
-|           EngineCore（繁忙循环）             |
+|           EngineCore（循环）             |
 |   使用 @fault_tolerant_wrapper 包装         |
 +-----+----------------+---------------+-----+
       |                |               |
@@ -57,155 +57,144 @@
 #### 1.2.1 ClientSentinel（顶层）
 
 - 每个 vLLM 实例一个，运行在 API 服务器进程中
-- 通过 ZMQ ROUTER 接收所有 EngineCoreSentinel 的故障报告（fault_report 消息，含 sentinel_id/pid/rank/err_type/traceback）
-- 接收 EngineCore 启动时的哨兵注册请求（register 消息，含 sentinel_id/pid/rank/num_ping_pongs）
-- 向外部系统发布引擎健康状态（ZMQ PUB，health_status 消息）
-- 向引擎分发容错指令（pause/retry/scale_down）
+- 通过 ZMQ ROUTER 接收所有 EngineCoreSentinel 的故障报告（故障报告含哨兵标识符、进程ID、DP rank id、错误类型、错误追踪堆栈等信息）
+- 接收 EngineCore 启动时的哨兵注册请求（注册消息，含哨兵标识符、进程ID、DP rank id、心跳次数）
+- 向外部系统发布引擎健康状态（ZMQ 发布，健康状态消息）
+- 向引擎分发容错指令（暂停/重试/缩容）
 - 处理外部 REST API 请求（`/fault_tolerance/apply`, `/fault_tolerance/status`）
 
 #### 1.2.2 EngineCoreSentinel（中间层）
 
-- 每个数据并行 Rank 一个，运行在 EngineCore 进程中
-- 通过 `fault_signal_q` 监控引擎异常
+- 每个数据并行 Rank 一个EngineCoreSentinel，运行在 EngineCore 进程中
+- 通过故障信号队列监控引擎异常
 - 通过 ZMQ 将故障信息转发给 ClientSentinel
-- 接收并执行 ClientSentinel 的指令（pause/retry/scale_down）
+- 接收并执行 ClientSentinel 的指令（暂停/重试/缩容）
 - 与 WorkerSentinels 通信，执行工作进程级操作
-- 执行 retry 清理流程（状态重置、Gloo 通信组重建）
+- 执行重试清理流程（状态重置、Gloo 通信组重建）
 
 #### 1.2.3 WorkerSentinel（底层）
 
 - 每个工作进程（NPU 设备）一个，运行在工作进程中
 - 通过 ZMQ 接收 EngineCoreSentinel 的命令
 - 在 NPU 级别执行暂停/重试/缩容操作
-- 在 scale down 过程中执行权重卸载/加载操作
+- 在缩容中执行专家分布重算、专家权重重载、专家路由重建、并行参数更新、CPU Gloo通信组重建、MC2 Mask参数更新、MoE配置更新等操作
 
 ### 1.3 容错工作流
 
 ```
-                        故障事件
-                           │
-                           v
-                    ┌──────┴──────┐
-                     │  故障上报    │
-                     │  ZMQ 报告   │
-                    │  哨兵注册   │
-                    └──────┬──────┘
-                           │
-                           v
-                    ┌──────┴──────┐
-                     │  暂停操作   │
-                    │  等待指令   │
-                    └──────┬──────┘
-                           │
-                    ┌──────┴──────┐
-                    │  指令决策   │
-                    └──────┬──────┘
-                           │
-              ┌────────────┼────────────┐
-               v            v            v
-       ┌───────┴┐   ┌──────┴──────────────┐   ┌─┴──────────┐
-       │ retry  │   │ scale_down          │   │  超时退出   │
-       │ (清理) │   │ ①专家分布重算       │   │ (抛异常)    │
-       │ (重置) │   │ ②专家权重重载       │   └────────────┘
-       │ (重建) │   │ ③专家路由重建       │
-       └────┬───┘   │ ④并行参数更新       │
-            │       │ ⑤CPU Gloo通信组重建 │
-            │       │ ⑥MC2 Mask参数更新   │
-            │       │ ⑦MoE配置更新        │
-            │       └──────────┬──────────┘
-            └──────┬───────────┘
-                   v
-            ┌──────┴──────┐
-            │  恢复服务    │
-            │  发布新状态  │
-            └─────────────┘
-           └──────┬───────┘
-                  v
-           ┌──────┴──────┐
-           │  恢复服务    │
-           │  发布新状态  │
-           └─────────────┘
+                          故障事件
+                             │
+                             v
+                      ┌──────┴──────┐
+                      │  故障上报    │
+                      │  哨兵注册    │
+                      └──────┬──────┘
+                             │
+                             v
+                      ┌──────┴──────┐
+                      │  暂停操作    │
+                      │  等待指令    │
+                      └──────┬──────┘
+                             │
+                      ┌──────┴──────┐
+                      │  指令决策    │
+                      └──────┬──────┘
+                             │
+                ┌────────────┼────────────┐
+                v            v            v
+        ┌───────┴──┐  ┌──────┴─────────┐  ┌─┴───────────┐
+        │  重试    │  │    缩容        │  │   超时退出   │
+        │ (清理)   │  │ ①专家分布重算  │  │  (抛异常)    │
+        │ (重置)   │  │ ②专家权重重载  │  └─────────────┘
+        │ (重建)   │  │ ③专家路由重建  │
+        └────┬─────┘  │ ④并行参数更新  │
+             │        │ ⑤CPU Gloo通信组重建 │
+             │        │ ⑥MC2 Mask参数更新   │
+             │        │ ⑦MoE配置更新        │
+             │        └──────────┬─────────┘
+             └───────────────────┘
+                             │
+                             v
+                      ┌──────┴──────┐
+                      │  恢复服务    │
+                      │  发布新状态  │
+                      └─────────────┘
 ```
 
 #### 带外部监控器（NPU 硬件故障）
 
 监控器（`scale_down.py`）使用 DCMI 轮询 NPU 健康状态。当检测到卡故障时：
-1. 监控器发送 `pause` 指令，暂停所有健康的 DP Rank
-2. 监控器发送 `scale_down` 指令，移除故障 Rank
-3. vLLM 在剩余健康 NPU 上重新分配专家
+1. 监控器发送 暂停 指令，暂停所有健康的 DP Rank
+2. 监控器发送 缩容 指令，移除故障 DP Rank
+3. vLLM 在剩余健康 NPU 上重新分配专家恢复服务
 
 #### 不带监控器（任何引擎异常）
 
 容错框架在引擎繁忙循环中捕获异常：
-1. `@fault_tolerant_wrapper` 捕获异常
-2. 引擎通过 ZMQ 上报故障（fault_report 消息）
-3. ClientSentinel 获悉后健康 rank 进入 pause 状态
+1. 容错包装器捕获异常
+2. 引擎通过 ZMQ 上报故障（故障报告消息）
+3. ClientSentinel 获悉后健康 rank 进入暂停状态
 4. 引擎暂停并等待指令（最多等待 `engine_recovery_timeout_sec`）
-5. 用户通过 REST API 手动发送 `retry` 或 `scale_down`
+5. 用户通过 REST API 手动发送重试或缩容指令
 
 ### 1.4 数据流
 
 ```
 NPU卡掉线/引擎崩溃
-         |
+         │
          v
   ┌──────┴──────┐
-  │ 故障检测     │
-  │ (DCMI轮询 /  │
+  │  故障检测    │
+  │ (DCMI轮询 / │
   │  异常捕获)   │
   └──────┬──────┘
-         |
+         │
          v
   ┌──────┴──────┐
-  │ 故障上报     │
-  │ ZMQ fault_  │
-  │ report 消息  │
+  │  故障上报    │
+  │  ZMQ 故障   │
+  │  报告消息    │
   └──────┬──────┘
-         |
-         ├──→ ClientSentinel ──→ 外部ZMQ PUB (health_status)
+         │
+         ├──→ ClientSentinel ──→ 外部ZMQ发布（健康状态）
          │                              │
          v                              v
    EngineCoreSentinel              scale_down.py
-         │                         (外部监控器)
+         │                         （外部监控器）
          v
-   ┌──────┴──────┐
-   │ 指令分发     │
-   │ pause/retry │
-   │ /scale_down │
-   └──────┬──────┘
-          |
-          v
-   ┌──────┴──────────┐
-   │ NPUWorkerSentinel │
-   │ pause: stop_device│
-   │ retry: clean_    │
-   │   states + 重建  │
-   │   DP通信组       │
-   │ scale_down:      │
-   │   →ScaleDownHelper│
-   └──────┬──────────┘
-          |
-          v
-   ┌──────┴──────────┐
-   │ ScaleDownHelper  │
-   │ 7 阶段工作流     │
-   │ ①专家分布重算   │
-   │ ②专家权重重载   │
-   │ ③专家路由重建   │
-   │ ④并行参数更新   │
-   │ ⑤CPU GLOO重    │
-   │   建通信组      │
-   │ ⑥MC2 Mask更    │
-   │   新算子参数    │
-   │ ⑦MoE专家配置   │
-   │   更新          │
-   └──────┬──────────┘
-         |
+  ┌──────┴──────┐
+  │  指令分发    │
+  │  暂停/重试  │
+  │  /缩容      │
+  └──────┬──────┘
+         │
          v
-   ┌─────┴─────┐
-   │ 恢复服务   │
-   │ + 健康状态 │
-   └───────────┘
+  ┌──────┴──────────────┐
+  │  NPUWorkerSentinel  │
+  │  暂停: 停止设备     │
+  │  重试: 清理状态     │
+  │    + 重建DP通信组   │
+  │  缩容:              │
+  │    →缩容助手        │
+  └──────┬──────────────┘
+         │
+         v
+  ┌──────┴──────────────┐
+  │  缩容助手（7阶段）  │
+  │  ①专家分布重算      │
+  │  ②专家权重重载      │
+  │  ③专家路由重建      │
+  │  ④并行参数更新      │
+  │  ⑤CPU Gloo通信组重建│
+  │  ⑥MC2 Mask参数更新  │
+  │  ⑦MoE配置更新       │
+  └──────┬──────────────┘
+         │
+         v
+  ┌──────┴──────┐
+  │  恢复服务    │
+  │ + 健康状态  │
+  └─────────────┘
 ```
 
 ### 1.5 两种操作模式
@@ -218,7 +207,7 @@ NPU卡掉线/引擎崩溃
 ├─────────────────────────────┼───────────────────────┤
 │ DCMI 轮询 NPU 健康状态      │    捕获异常             │
 │ 自动检测卡故障              │    进程暂停             │
-│ 自动发送 pause/scale_down   │ 手动通过 REST API 操作  │
+│ 自动发送暂停/缩容指令       │ 手动通过 REST API 操作  │
 │ 完全自动化                  │ 灵活性更高              │
 └─────────────────────────────┴───────────────────────┘
 ```
@@ -234,15 +223,15 @@ NPU卡掉线/引擎崩溃
 
 #### 有状态健康跟踪
 
-ClientSentinel 维护 `engine_status_dict`，跟踪每个引擎的状态：
-- `healthy` - 引擎正常运行
-- `paused` - 引擎暂停，等待指令
-- `unhealthy` - 引擎遇到错误
-- `dead` - 引擎进程已退出
+ClientSentinel 维护引擎状态字典，跟踪每个引擎的状态：
+- 健康 - 引擎正常运行
+- 已暂停 - 引擎暂停，等待指令
+- 不健康 - 引擎遇到错误
+- 已终止 - 引擎进程已退出
 
 #### 指令工作流模型
 
-ClientSentinel 将 pause/retry/scale_down 指令作为 ZMQ 消息发送给 EngineCoreSentinel。指令消息格式：
+ClientSentinel 将暂停/重试/缩容指令作为 ZMQ 消息发送给 EngineCoreSentinel。指令消息格式：
 ```python
 @dataclass
 class FaultToleranceInstruction:
@@ -251,14 +240,14 @@ class FaultToleranceInstruction:
     params: dict              # 指令参数（timeout, exclude_engine_index 等）
 ```
 
-EngineCoreSentinel 收到指令后，通过 `handle_instruction` 分发到对应执行函数：
-- `pause_handler`: 设置 DP rank mask，冻结请求处理
-- `retry_handler`: 清理工作进程状态，重置 rank mask，重建通信
-- `scale_down_handler`: 触发 ScaleDownHelper 7 阶段工作流：专家分布重算 → 专家权重重载 → 专家路由重建 → 并行参数更新 → CPU Gloo 通信组重建 → MC2 算子 Mask 参数更新 → MoE 专家配置更新
+EngineCoreSentinel 收到指令后，通过指令处理器分发到对应执行函数：
+- 暂停处理器：冻结请求处理
+- 重试处理器：清理工作进程状态，重建通信
+- 缩容处理器：触发缩容助手 7 阶段工作流：专家分布重算 → 专家权重重载 → 专家路由重建 → 并行参数更新 → CPU Gloo 通信组重建 → MC2 算子 Mask 参数更新 → MoE 专家配置更新
 
 #### 故障上报机制
 
-引擎通过 ZMQ 发送 fault_report 消息到 ClientSentinel，格式：
+引擎通过 ZMQ 发送故障报告消息到 ClientSentinel，格式：
 ```python
 @dataclass
 class FaultReport:
@@ -270,13 +259,13 @@ class FaultReport:
     traceback: str
 ```
 
-ClientSentinel 记录故障后通过 ZMQ PUB 广播 health_status 消息给所有外部订阅者。
+ClientSentinel 记录故障后通过 ZMQ 发布广播健康状态消息给所有外部订阅者。
 
-#### retry 清理机制
+#### 重试清理机制
 
-针对瞬时性错误（transient error），retry 指令执行以下恢复步骤：
-1. `clean_states`：清除 pause 事件，`stop_device` + `restart_device` 重新初始化 NPU 设备，`reinit_process_group` 重置分发通信组，清理 worker 状态（execute_model_state、kv_connector_output、input_batch）
-2. 重建 Gloo 通信组：调用 `stateless_init_torch_distributed_process_group` 重新初始化 DP cpu_group
+针对瞬时性错误（transient error），重试指令执行以下恢复步骤：
+1. 清理状态：清除暂停事件，停止设备 + 重启设备重新初始化 NPU 设备，重置进程组重置分发通信组，清理 worker 状态（模型状态、KV 连接器输出、输入批次等）
+2. 重建 Gloo 通信组：重新初始化 DP cpu_group
 3. 恢复请求处理
 
 #### 优雅降级
@@ -315,10 +304,10 @@ elastic-ep/vllm/
 
 | 通道 | 协议 | 方向 | 用途 |
 |------|------|------|------|
-| 引擎故障套接字 | ZMQ DEALER/ROUTER | 引擎 -> ClientSentinel | 报告引擎异常（fault_report 消息） |
-| 哨兵注册 | ZMQ DEALER/ROUTER | EngineCore -> ClientSentinel | 启动时注册哨兵身份（register 消息） |
-| 故障状态 PUB/SUB | ZMQ PUB/SUB | ClientSentinel -> 外部 | 广播引擎健康状态（health_status 消息） |
-| 容错请求/结果 | ZMQ DEALER/PUSH | ClientSentinel -> 引擎 | 分发 pause/retry/scale_down 指令 |
+| 引擎故障套接字 | ZMQ DEALER/ROUTER | 引擎 -> ClientSentinel | 报告引擎异常（故障报告消息） |
+| 哨兵注册 | ZMQ DEALER/ROUTER | EngineCore -> ClientSentinel | 启动时注册哨兵身份（注册消息） |
+| 故障状态 发布/订阅 | ZMQ 发布/订阅 | ClientSentinel -> 外部 | 广播引擎健康状态（健康状态消息） |
+| 容错请求/结果 | ZMQ DEALER/PUSH | ClientSentinel -> 引擎 | 分发暂停/重试/缩容指令 |
 | 工作进程命令 | ZMQ ROUTER/DEALER | EngineCore -> 工作进程 | 工作进程级控制（rank mask 等） |
 | HTTP API | REST | 外部 -> API 服务器 | 外部容错控制 |
 
@@ -336,12 +325,12 @@ elastic-ep/vllm/
 
 **工作流程：**
 1. 初始化 DCMI，获取所有 NPU 设备列表
-2. 通过 ZMQ SUB 订阅 ClientSentinel 发布的 health_status 消息
+2. 通过 ZMQ 订阅 ClientSentinel 发布的健康状态消息
 3. 每 `interval_time` 秒轮询一次 NPU 健康状态
-4. 检测到 NPU 故障时，通过 REST API 发送 `pause` 指令
-5. 确认引擎暂停后，发送 `scale_down` 指令
+4. 检测到 NPU 故障时，通过 REST API 发送暂停指令
+5. 确认引擎暂停后，发送缩容指令
 6. 监控缩容完成状态
-7. 通过 health_status 确认恢复
+7. 通过健康状态确认恢复
 
 ### 3.2 serve_qwen.sh
 
