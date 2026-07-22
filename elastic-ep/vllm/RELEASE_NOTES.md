@@ -16,7 +16,7 @@
 ### 变更摘要
 
 - **容错框架**：采用三级哨兵层级架构（ClientSentinel、EngineCoreSentinel、WorkerSentinel），支持通过 REST API 与外部的实例故障管理中心协同
-- **故障上报**： 提供主动（外部实例故障管理中心通过 REST API）和被动（vLLM内部通过 ZMQ ）2种方式上报故障到Client层 |
+- **故障上报**： 提供主动（外部实例故障管理中心通过 REST API）和被动（vLLM内部通过 ZMQ）2种方式上报故障到Client层
 - **优雅缩容**： 故障发生时暂停实例，通过执行重试、缩容恢复指令实现快速自愈
 - **ZMQ 通信机制**：基于 ZMQ DEALER/ROUTER/PUB/SUB 的故障报告和指令分发通道
 - **REST API**：提供 `/fault_tolerance/apply`（pause/retry/scale_down）和 `/fault_tolerance/status` 外部控制接口

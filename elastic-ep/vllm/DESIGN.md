@@ -300,6 +300,15 @@ elastic-ep/vllm/
 └── TEST_REPORT.md                     # 系统测试报告
 ```
 
+### 2.2 模块职责
+
+| 模块 | 职责 |
+|------|------|
+| ClientSentinel | 故障接收、状态管理、指令分发 |
+| EngineCoreSentinel | 引擎异常捕获、故障上报、指令执行 |
+| NPUWorkerSentinel | NPU级操作、状态清理、资源重建 |
+| scale_down.py | 外部硬件监控、自动故障响应 |
+
 ### 2.3 通信通道
 
 | 通道 | 协议 | 方向 | 用途 |

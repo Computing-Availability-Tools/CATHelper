@@ -134,8 +134,7 @@ NPU卡掉线 / 引擎崩溃等
 pytest tests/v1/fault_tolerance/
 ```
 
-
-### 4.1 测试流程
+### 4.2 测试流程
 
 1. 提交代码前执行 `pytest tests/v1/fault_tolerance/`，确保所有单元测试通过
 2. 每次变更后更新 `TEST_REPORT.md`，记录单元测试与端到端测试结果
