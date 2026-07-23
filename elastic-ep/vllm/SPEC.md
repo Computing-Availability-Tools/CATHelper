@@ -241,6 +241,7 @@ pytest tests/v1/fault_tolerance/
 | NPU 支持 | 仅支持华为昇腾 A3 服务器 |
 | Expert Parallel | 必须开启（`--enable-expert-parallel`） |
 | Pipeline Parallel | 不支持 |
+| Tensor Parallel | 仅支持 TP=1 |
 | 量化模型 | 仅兼容 W8A8（ModelSlim 格式），W4A8、W4A16 等暂不支持 |
 | FULL Graph 模式 | 暂未兼容，不支持大模型整图捕获 |
 | 冗余专家数 | 健康卡上的冗余专家总数必须大于故障卡上的逻辑专家数量 |

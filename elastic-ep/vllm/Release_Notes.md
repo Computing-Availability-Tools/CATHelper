@@ -33,6 +33,7 @@
 | PIECEWISE ACL Graph 模式 | 已兼容 | 支持大模型分块图捕获 |
 | FULL Graph 模式 | 暂未兼容 | 不支持大模型整图捕获 |
 | Pipeline Parallel | 不支持 | 不支持流水线并行 |
+| Tensor Parallel | 仅支持 TP=1 | 当前版本仅支持 tensor parallel size 为 1 |
 | Expert Parallel | 必须开启 | 容错特性必须开启 Expert Parallel |
 | 冗余专家数 | 有约束 | 健康卡上的冗余专家总数必须大于故障卡上的逻辑专家数量 |
 | NPU支持 | 仅支持华为昇腾 A3 | 当前版本仅支持华为昇腾 A3 服务器 |
