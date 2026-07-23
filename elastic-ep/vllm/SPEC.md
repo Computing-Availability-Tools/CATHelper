@@ -15,12 +15,10 @@
 | 项目 | 选型 |
 |------|------|
 | 开发语言 | Python 3.10+ |
-| 目标平台 | Linux (ARM, Ascend NPU) |
 | 基础框架 | vLLM v0.18.0 + vllm-ascend v0.18.0 |
-| 通信协议 | ZMQ (DEALER/ROUTER/PUB/SUB) |
 | 外部 API | REST (FastAPI) |
 | 配置方式 | CLI 参数 + JSON 字典 |
-| 专家均衡 | EPLB 框架 |
+| 专家均衡 | EPLB |
 | 外部依赖 | zmq, msgspec, requests |
 | 补丁方式 | Git patch (vllm + vllm-ascend) |
 
