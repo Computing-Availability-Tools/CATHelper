@@ -1,4 +1,4 @@
-# vLLM Elastic EP Release Notes
+# Elastic EP Release Notes
 
 > 本文档按时间倒序记录每次发布的版本信息。每次发布在顶部追加，不删除历史记录。
 
@@ -9,26 +9,34 @@
 | 项目 | 说明 |
 |------|------|
 | 版本号 | v0.1.0 |
-| 发布时间 | 2026-07-16 |
+| 发布时间 | 2026-07-24 |
 | 发布人 | sunnytao-blue |
-| 平台支持 | Linux (ARM, Ascend NPU) |
+| 框架支持 | vLLM + vLLM-Ascend |
+| 许可证 | Apache License 2.0 |
 
-### 变更摘要
+### 特性能力摘要
 
-- **容错框架**：采用三级哨兵层级架构（ClientSentinel、EngineCoreSentinel、WorkerSentinel），支持通过 REST API 与外部的实例故障管理中心协同
-- **故障上报**： 提供主动（外部实例故障管理中心通过 REST API）和被动（vLLM内部通过 ZMQ）2种方式上报故障到Client层
-- **优雅缩容**： 故障发生时暂停实例，通过执行重试、缩容恢复指令实现快速自愈
-- **ZMQ 通信机制**：基于 ZMQ DEALER/ROUTER/PUB/SUB 的故障报告和指令分发通道
-- **REST API**：提供 `/fault_tolerance/apply`（pause/retry/scale_down）和 `/fault_tolerance/status` 外部控制接口
+- **外部协同**：通过vLLM内新增的容错框架，支持通过 REST API 与外部（如推理服务化框架）故障管理中心协同容错，REST API支持故障上报、弹性容错命令
+- **故障检测**：支持主动通告（ZMQ）和被动查询（外部故障管理中心REST API查询）2种方式，将容错框架检查到故障上报至外部，由外部决策容错方式
+- **弹性容错**：支持接收外部故障管理中心决策的弹性容错命令，当前版本支持请求重推、缩容恢复两种命令，分别对应网络瞬时故障、卡/节点故障
 - **动态 EPLB 集成**：故障后通过 EPLB 框架重新平衡专家放置
 - **外部 NPU 硬件故障监控**：scale_down.py 通过 DCMI 轮询 NPU 健康状态
-- **量化模型支持**：W8A8 量化模型适配（ModelSlim 格式）
-- **MTP 支持**：多 Token 预测适配，在 GLM5.1 上完成测试
-- **图模式支持**：`--enforce-eager` 模式 + PIECEWISE ACL Graph 模式
 
-### 已知限制
+### 兼容性与限制
 
-1. **第二次缩容存在一些偶现问题**
-2. **W4A8 量化模型**：暂未适配
-3. **FULL Graph 模式**：暂不支持
-4. **扩容**：当前版本不支持扩容
+| 特性 | 状态 | 说明 |
+|------|------|------|
+| 动态 EPLB | 已兼容 | 支持故障后通过 EPLB 框架重新平衡专家放置 |
+| 量化模型 | 部分兼容 | 仅兼容 W8A8（ModelSlim 格式），W4A8、W4A16 等暂不支持 |
+| MTP（多 Token 预测） | 已兼容 | 已完成适配，在 GLM5.1 上完成测试 |
+| Eager 模式 | 已兼容 | 逐算子执行，禁用图捕获 |
+| PIECEWISE ACL Graph 模式 | 已兼容 | 支持大模型分块图捕获 |
+| FULL Graph 模式 | 暂未兼容 | 不支持大模型整图捕获 |
+| 平台支持 | 仅华为昇腾 A3 | 当前版本仅支持华为昇腾 A3 服务器 |
+| Pipeline Parallel | 不支持 | 不支持流水线并行 |
+| Expert Parallel | 必须开启 | 容错特性必须开启 Expert Parallel（`--enable-expert-parallel`） |
+| 冗余专家数 | 有约束 | 健康卡上的冗余专家总数必须大于故障卡上的非冗余专家数量 |
+
+### 已知问题
+
+缩容后，再次缩容存在一些偶现的问题，会导致缩容不成功。

@@ -9,45 +9,26 @@
 
 ### 1.1 分层架构
 
-```
-                        外部监控器
-                       (scale_down.py)
-                             |
-              +-----------+-----------+
-              |                       |
-    ZMQ SUB (故障)        HTTP POST /fault_tolerance/apply
-              |                       |
-              v                       v
-      +-------+-------+     +--------+--------+
-      |   API服务器   |     |    API服务器    |
-      |   (FastAPI)  |     |    (FastAPI)    |
-      +-------+-------+     +--------+--------+
-              |                       |
-              v                       v
-      +-------+-----------------------+--------+
-      |          ClientSentinel               |
-      |  （每个 vLLM 实例一个）                 |
-      |  - 通过 ZMQ 接收故障报告                |
-      |  - 发布引擎健康状态                     |
-      |  - 分发暂停/重试/缩容指令               |
-      +--+------------+------------+------------+
-         |            |            |
-+--------+--+  +-----+------+  +--+--------+
-| EngineCore |  | EngineCore |  | EngineCore|
-|  Sentinel  |  |  Sentinel  |  |  Sentinel |
-| (DP rank 0)|  | (DP rank 1)|  | (DP rank 2)|
-+-----+------+  +-----+------+  +-----+-----+
-      |                |               |
-+-----+----------------+---------------+-----+
-|       EngineCore（run_busy_loop）           |
-|   使用 @fault_tolerant_wrapper 包装         |
-+-----+----------------+---------------+-----+
-      |                |               |
-+-----+------+  +-----+------+  +-----+------+
-|   Worker   |  |   Worker   |  |   Worker   |
-|  Sentinel  |  |  Sentinel  |  |  Sentinel  |
-|   (NPU)    |  |   (NPU)    |  |   (NPU)    |
-+------------+  +------------+  +------------+
+```mermaid
+graph TD
+    Monitor["外部监控器<br/>(scale_down.py)"]
+
+    Monitor -->|"ZMQ SUB<br/>(故障)"| API["API服务器<br/>(FastAPI)"]
+    Monitor -->|"HTTP POST<br/>/fault_tolerance/apply"| API
+
+    API --> Client["ClientSentinel<br/>（每个 vLLM 实例一个）"]
+
+    Client --> ECS0["EngineCoreSentinel<br/>(DP rank 0)"]
+    Client --> ECS1["EngineCoreSentinel<br/>(DP rank 1)"]
+    Client --> ECS2["EngineCoreSentinel<br/>(DP rank 2)"]
+
+    ECS0 --> EC0["EngineCore<br/>(run_busy_loop)<br/>@fault_tolerant_wrapper"]
+    ECS1 --> EC1["EngineCore<br/>(run_busy_loop)<br/>@fault_tolerant_wrapper"]
+    ECS2 --> EC2["EngineCore<br/>(run_busy_loop)<br/>@fault_tolerant_wrapper"]
+
+    EC0 --> W0["Worker Sentinel<br/>(NPU)"]
+    EC1 --> W1["Worker Sentinel<br/>(NPU)"]
+    EC2 --> W2["Worker Sentinel<br/>(NPU)"]
 ```
 
 ### 1.2 哨兵层级架构
@@ -81,52 +62,23 @@
 
 ### 1.3 容错工作流
 
-```
-                          故障事件
-                             │
-                             v
-                      ┌──────┴──────┐
-                      │  故障上报    │
-                      │  哨兵注册    │
-                      └──────┬──────┘
-                             │
-                             v
-                      ┌──────┴──────┐
-                      │  暂停操作    │
-                      │  等待指令    │
-                      └──────┬──────┘
-                             │
-                      ┌──────┴──────┐
-                      │  指令决策    │
-                      └──────┬──────┘
-                             │
-                ┌────────────┼────────────┐
-                v            v            v
-        ┌───────┴──┐  ┌──────┴─────────┐  ┌─┴───────────┐
-        │  重试    │  │    缩容        │  │   超时退出   │
-        │ (清理)   │  │ ①专家分布重算  │  │  (抛异常)    │
-        │ (重置)   │  │ ②专家权重重载  │  └─────────────┘
-        │ (重建)   │  │ ③专家路由重建  │
-        └────┬─────┘  │ ④并行参数更新  │
-             │        │ ⑤CPU Gloo通信组重建 │
-             │        │ ⑥MC2 Mask参数更新   │
-             │        │ ⑦MoE配置更新        │
-             │        └──────────┬─────────┘
-             └───────────────────┘
-                             │
-                             v
-                      ┌──────┴──────┐
-                      │  恢复服务    │
-                      │  发布新状态  │
-                      └─────────────┘
+```mermaid
+flowchart TD
+    A["故障事件"] --> B["故障上报<br/>哨兵注册"]
+    B --> C["暂停操作<br/>等待指令"]
+    C --> D{"指令决策"}
+    D -->|"重试"| E["重试<br/>(清理 / 重置 / 重建)"]
+    D -->|"缩容"| F["缩容<br/>① 专家分布重算<br/>② 专家权重重载<br/>③ 专家路由重建<br/>④ 并行参数更新<br/>⑤ CPU Gloo 通信组重建<br/>⑥ MC2 Mask 参数更新<br/>⑦ MoE 配置更新"]
+    D -->|"超时退出"| G["超时退出<br/>(抛异常)"]
+    E --> H["恢复服务<br/>发布新状态"]
+    F --> H
 ```
 
 #### 带外部监控器（NPU 硬件故障）
 
 监控器（`scale_down.py`）使用 DCMI 轮询 NPU 健康状态。当检测到卡故障时：
-1. 监控器发送 暂停 指令，暂停所有健康的 DP Rank
-2. 监控器发送 缩容 指令，移除故障 DP Rank
-3. vLLM 在剩余健康 NPU 上重新分配专家恢复服务
+1. 监控器发送 缩容 指令，移除故障 DP Rank（暂停由引擎异常自动触发，无需监控器额外发送）
+2. vLLM 在剩余健康 NPU 上重新分配专家恢复服务
 
 #### 不带监控器（任何引擎异常）
 
@@ -139,62 +91,21 @@
 
 ### 1.4 数据流
 
-```
-NPU卡掉线/引擎崩溃
-         │
-         v
-  ┌──────┴──────┐
-  │  故障检测    │
-  │ (DCMI轮询 / │
-  │  异常捕获)   │
-  └──────┬──────┘
-         │
-         v
-  ┌──────┴──────┐
-  │  故障上报    │
-  │  ZMQ 故障   │
-  │  报告消息    │
-  └──────┬──────┘
-         │
-         ├──→ ClientSentinel ──→ 外部ZMQ发布（健康状态）
-         │                              │
-         v                              v
-   EngineCoreSentinel              scale_down.py
-         │                         （外部监控器）
-         v
-  ┌──────┴──────┐
-  │  指令分发    │
-  │  暂停/重试  │
-  │  /缩容      │
-  └──────┬──────┘
-         │
-         v
-  ┌──────┴──────────────┐
-  │  NPUWorkerSentinel  │
-  │  暂停: 停止设备     │
-  │  重试: 清理状态     │
-  │    + 重建DP通信组   │
-  │  缩容:              │
-  │    →缩容助手        │
-  └──────┬──────────────┘
-         │
-         v
-  ┌──────┴──────────────┐
-  │  缩容助手（7阶段）  │
-  │  ①专家分布重算      │
-  │  ②专家权重重载      │
-  │  ③专家路由重建      │
-  │  ④并行参数更新      │
-  │  ⑤CPU Gloo通信组重建│
-  │  ⑥MC2 Mask参数更新  │
-  │  ⑦MoE配置更新       │
-  └──────┬──────────────┘
-         │
-         v
-  ┌──────┴──────┐
-  │  恢复服务    │
-  │ + 健康状态  │
-  └─────────────┘
+```mermaid
+flowchart TD
+    A["NPU 卡掉线 / 引擎崩溃"] --> B["故障检测<br/>(DCMI 轮询 / 异常捕获)"]
+    B --> C["故障上报<br/>ZMQ 故障报告消息"]
+    C --> D["EngineCoreSentinel"]
+    C --> E["ClientSentinel"]
+    C --> F["scale_down.py<br/>(外部监控器)"]
+
+    E --> G["外部 ZMQ 发布<br/>(健康状态)"]
+    G --> F
+
+    D --> H["指令分发<br/>暂停 / 重试 / 缩容"]
+    H --> I["NPUWorkerSentinel<br/>暂停: 停止设备<br/>重试: 清理状态 + 重建 DP 通信组<br/>缩容: → 缩容助手"]
+    I --> J["缩容助手（7 阶段）<br/>① 专家分布重算<br/>② 专家权重重载<br/>③ 专家路由重建<br/>④ 并行参数更新<br/>⑤ CPU Gloo 通信组重建<br/>⑥ MC2 Mask 参数更新<br/>⑦ MoE 配置更新"]
+    J --> K["恢复服务<br/>+ 健康状态"]
 ```
 
 ### 1.5 两种操作模式
@@ -295,10 +206,10 @@ elastic-ep/vllm/
 │           ├── test_engine_core_sentinel.py    # EngineCoreSentinel 单元测试
 │           └── test_npu_worker_sentinel.py     # NPUWorkerSentinel 单元测试
 ├── README.md                          # 项目说明
-├── SPEC.md                            # 技术规格说明书
-├── DESIGN.md                          # 架构与系统设计
+├── SPEC.md                            # 技术规格与需求
+├── DESIGN.md                          # 架构与模块设计
 ├── RELEASE_NOTES.md                   # 版本发布记录
-└── TEST_REPORT.md                     # 系统测试报告
+└── TEST_REPORT.md                     # 测试报告
 ```
 
 ### 2.2 模块职责

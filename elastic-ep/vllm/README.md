@@ -1,36 +1,41 @@
-# vLLM Elastic EP
+# Elastic EP
 
-> **vLLM Elastic EP** — vLLM 弹性容错方案
+> **Elastic EP** — 推理大EP卡级弹性容错
 
-vLLM Elastic EP 使 vLLM 能够在DP(data parallel)+EP(expert parallel)的部署模式下，出现故障后，推理进程进入暂停状态不退出，通过重试恢复服务，或者通过将故障点所在的DP组缩容掉的方式，将故障隔离出去，提供在线弹性能力。
+Elastic EP是CATHelper系列特性之一，实现推理大EP部署的卡级弹性容错，目前仅支持vLLM，后续计划也支持SGLang。 Elastic EP特性实现DP(data parallel)+EP(expert parallel)的部署模式下，卡故障之后，推理实例不退出，而是将故障卡所在的DP域隔离掉，重排专家后剩余DP继续提供推理服务，也支持网络闪断故障后请求重推恢复。
 
 ## 版本信息
 
 | 项目 | 说明 |
 |------|------|
 | 版本号 | v0.1.0 |
-| 发布时间 | 2026-07-16 |
+| 发布时间 | 2026-07-24 |
 | 发布人 | sunnytao-blue |
-| 平台支持 | Linux (ARM, Ascend NPU) |
+| 框架支持 | vLLM + vLLM-Ascend |
 | 许可证 | Apache License 2.0 |
 
 ## 功能特性
 
 | 特性 | 说明 |
 |------|------|
-| **容错框架** | 三级哨兵架构（ClientSentinel / EngineCoreSentinel / NPUWorkerSentinel），支持通过 REST API 与外部的实例故障管理中心协同 |
-| **故障上报** | 提供主动（外部实例故障管理中心通过 REST API）和被动（vLLM内部通过 ZMQ ）2种方式上报故障到Client层 |
-| **优雅容错** | 故障发生时暂停实例，通过执行重试、缩容恢复指令实现快速自愈 |
+| **外部协同** | 通过vLLM内新增的容错框架，支持通过 REST API 与外部(如推理服务化框架)故障管理中心协同容错，REST API支持故障上报、弹性容错命令 |
+| **故障检测** | 支持主动通告（ZMQ）和被动查询（外部故障管理中心REST API查询）2种方式，将容错框架检查到故障上报至外部，由外部决策容错方式 |
+| **弹性容错** | 支持接收外部故障管理中心决策的弹性容错命令，当前版本支持请求重推、缩容恢复两种命令，分别对应网络瞬时故障、卡/节点故障 |
 
 ## 技术栈
 
-> 完整技术栈与依赖详见 [SPEC.md §1.2 技术栈](SPEC.md#12-技术栈) 和 [SPEC.md §6.1 依赖要求](SPEC.md#61-依赖要求)。
+| 项目 | 选型 |
+|------|------|
+| 开发语言 | Python 3.10+ |
+| 基础框架 | vLLM v0.18.0 + vllm-ascend v0.18.0 |
+| 配置方式 | vLLM CLI 启动参数 + JSON 配置文件 |
+| 外部依赖 | 当前版本作为vLLM的patch，无新增依赖 |
 
 ## 快速上手
 
 ### 前置条件
 
-- 当前版本仅支持华为昇腾A3服务器
+- 华为昇腾A3服务器：当前版本仅支持A3
 
 ### 安装
 
@@ -66,73 +71,145 @@ VLLM_TARGET_DEVICE=empty pip install -e .
 
 cd /vllm-workspace/vllm-ascend
 git submodule update --init --recursive
-# 修复Bug：triton-ascend 3.2.1 仅适用于 vllm-ascend v0.20.0+，当前使用v0.18.0版本，triton-ascend需要降级到 3.2.0，否则安装会报错。
-# https://github.com/vllm-project/vllm-ascend/issues/9794
+# 已知issue：triton-ascend 3.2.1 仅适用于 vllm-ascend v0.20.0+，当前使用v0.18.0版本，triton-ascend需要降级到 3.2.0，否则安装会报错。
+# 参考：https://github.com/vllm-project/vllm-ascend/issues/9794
 sed -i 's/triton-ascend==3.2.1/triton-ascend==3.2.0/' pyproject.toml
 pip install -e .
 ```
 
 ### 使用
 
-项目提供拉起带容错功能的vLLM服务参考脚本位于 `examples/fault_tolerance_scale/` 目录下：
+`examples/fault_tolerance_scale/` 目录下提供一个演示demo,可以启动支持容错的vLLM服务、以及一个模拟的外部故障管理中心；
 
 | 脚本 | 说明 |
 |------|------|
-| `serve_qwen.sh` | 启动带容错功能的 vLLM 服务 |
-| `scale_down.py` | NPU 硬件故障监控和处理程序（可选：用户自行选择故障恢复策略时无需运行） |
+| `serve_qwen.sh` | 启动支持弹性容错功能的 vLLM 服务，模型Qwen3-30B-A3-W8A8 |
+| `scale_down.py` | 模拟外部故障管理中心，支持通过DCMI监控NPU故障，并通过REST API触发弹性容错（可选：用户也可以注入故障后，手动通过REST API触发容错） |
+
+**serve_qwen.sh 参数：**
+
+| 参数 | 默认值 | 含义 |
+|------|--------|------|
+| `--dp` | `4` | 数据并行大小，启动的 DP rank 数量 |
+| `--re` | `0` | 冗余专家数量，每个 rank 额外放置的专家数，用于缩容时重新分配 |
+| `--fault-port` | `22867` | 外部故障通知端口，ClientSentinel 通过 ZMQ PUB 广播引擎健康状态 |
+| `--recovery-timeout` | `120` | 引擎恢复超时（秒），故障暂停后等待重试/缩容指令的最长时间，超时则抛异常退出 |
+| `--port` | `8006` | HTTP API 端口，提供推理服务和容错 REST API |
+| `--host` | `0.0.0.0` | 监听地址 |
+| `--model-name` | 见脚本 | 模型在 API 中的展示名称 |
+| `--local-model` | 见脚本 | 本地模型权重路径 |
+| `--gloo-timeout-seconds` | `30` | Gloo 通信组超时（秒），用于通信组重建 |
+
+**scale_down.py 参数：**
+
+| 参数 | 默认值 | 含义 |
+|------|--------|------|
+| `--npu-ids` | `0-15` | 参与推理的 NPU 设备 ID 列表（逗号分隔） |
+| `--interval-time` | `3` | NPU 健康状态轮询间隔（秒） |
+| `--external-fault-notify-port` | `22867` | 订阅引擎健康状态的 ZMQ SUB 端口（需与 vLLM 的 `--fault-port` 一致） |
+| `--port` | `8006` | vLLM API 端口，用于发送暂停/缩容指令 |
+| `--host` | `localhost` | vLLM API 主机地址 |
+| `--recovery-timeout` | `30` | 容错指令的超时等待时间（秒） |
 
 > **注意：** 运行前需根据实际环境修改脚本中的模型权重路径（`LOCAL_MODEL_PATH`、`MODEL_NAME` 等参数），或通过命令行参数覆盖。
 
-#### 启动 vLLM 服务
+---
+
+#### 场景一：启动监控脚本（自动故障响应）
+
+监控脚本通过 DCMI 轮询 NPU 健康状态，检测到故障后自动下发暂停和缩容指令，全程无需人工干预。
+
+**步骤 1：启动支持容错的 vLLM 服务**
 
 ```bash
 bash examples/fault_tolerance_scale/serve_qwen.sh \
     --dp 4 --re 48 --fault-port 22867 --recovery-timeout 120 --port 8006
 ```
 
-#### 启动监控（可选）
-监控程序是可选的。不启动时，框架仍会拦截引擎异常、自动暂停，并等待通过 REST API 手动发送 `retry`(重试) 或 `scale_down`(缩容)：
-
+**步骤 2：启动外部故障光临中心demo(可选)**
+不启动demo时，vLLM内的容错框架仍会拦截异常，并等待容错命令，用户也可以通过REST API手动发送'retry(重试)'或'scale_down(缩容)'
 ```bash
 python examples/fault_tolerance_scale/scale_down.py \
     --npu-ids 0,1,2,3 --interval-time 3 \
     --external-fault-notify-port 22867 --port 8006
 ```
 
+**步骤 3：发送推理请求**
 
-**查询当前容错状态：**
+服务就绪后，正常发送推理请求。
+
+**步骤 4：注入故障**
+
+模拟 NPU 故障，例如 kill 掉某个 Worker 进程。
+
+**步骤 5：等待自动恢复**
+
+监控脚本检测到故障后自动执行：
+1. 通过 REST API 发送暂停指令
+2. 通过查询容错状态确认暂停完成
+3. 发送缩容指令，移除故障 DP rank
+4. 服务在剩余健康 NPU 上恢复，推理继续
+
+---
+
+#### 场景二：不启动监控脚本（手动故障响应）
+
+不启动监控脚本时，框架仍会拦截引擎异常并自动暂停，需通过 REST API 手动发送恢复指令。
+
+**步骤 1：启动支持容错的 vLLM 服务**
+
+```bash
+bash examples/fault_tolerance_scale/serve_qwen.sh \
+    --dp 4 --re 48 --fault-port 22867 --recovery-timeout 120 --port 8006
+```
+
+**步骤 2：发送推理请求**
+
+服务就绪后，正常发送推理请求。
+
+
+**步骤 3：注入故障**
+
+模拟 NPU 故障，例如 kill 掉某个 Worker 进程。
+
+**步骤 4：查询容错状态**
 
 ```bash
 curl http://localhost:8006/fault_tolerance/status
 ```
 
-**重试（重启所有 DP rank）：**
+返回结果中健康 DP rank 状态应为 `paused`，确认暂停成功。
+
+**步骤 5：发送恢复指令**
+
+根据故障类型选择重试或缩容：
 
 ```bash
+# 重试（重启所有 DP rank）
 curl -X POST http://localhost:8006/fault_tolerance/apply \
     -H "Content-Type: application/json" \
     -d '{"instruction":"retry","params":{"timeout":30}}'
-```
 
-**缩容（排除指定 DP rank）：**
-
-```bash
+# 缩容（排除指定 DP rank）
 curl -X POST http://localhost:8006/fault_tolerance/apply \
     -H "Content-Type: application/json" \
     -d '{"instruction":"scale_down","params":{"timeout":30,"exclude_dp_ranks":[2]}}'
 ```
 
-## 特性兼容情况
+## 兼容性与限制
 
 | 特性 | 状态 | 说明 |
 |------|------|------|
-| 动态 EPLB | 已兼容 | 故障后通过 EPLB 框架重新平衡专家放置 |
-| 量化模型（W8A8） | 已兼容 | ModelSlim 格式 W8A8 量化模型已完成适配 |
-| 量化模型（W4A8） | 暂未兼容 | W4A8 量化尚未适配 |
+| 动态 EPLB | 已兼容 | 支持故障后通过 EPLB 框架重新平衡专家放置 |
+| 量化模型 | 部分兼容 | 仅兼容 W8A8（ModelSlim 格式），W4A8、W4A16 等暂不支持 |
 | MTP（多 Token 预测） | 已兼容 | 已完成适配，在 GLM5.1 上完成测试 |
-| `--enforce-eager` 模式 | 已兼容 | 禁用图捕获 |
-| PIECEWISE ACL Graph 模式 | 已兼容 | 大模型分块图捕获 |
-| FULL Graph 模式 | 暂未兼容 | 大模型整图捕获 |
+| Eager 模式 | 已兼容 | 逐算子执行，禁用图捕获 |
+| PIECEWISE ACL Graph 模式 | 已兼容 | 支持大模型分块图捕获 |
+| FULL Graph 模式 | 暂未兼容 | 不支持大模型整图捕获 |
+| 平台支持 | 仅华为昇腾 A3 | 当前版本仅支持华为昇腾 A3 服务器 |
+| Pipeline Parallel | 不支持 | 不支持流水线并行 |
+| Expert Parallel | 必须开启 | 容错特性必须开启 Expert Parallel（`--enable-expert-parallel`） |
+| 冗余专家数 | 有约束 | 健康卡上的冗余专家总数必须大于故障卡上的非冗余专家数量 |
 
 ## 已测试模型
 
@@ -148,20 +225,16 @@ curl -X POST http://localhost:8006/fault_tolerance/apply \
 
 ## 已知问题（v0.1.0）
 
-第二次缩容存在一些偶现问题
-
-## 限制
-
-> 详见 [SPEC.md §6.2 限制](SPEC.md#62-限制)。
+缩容后，再次缩容存在一些偶现的问题，会导致缩容不成功。
 
 ## 文档
 
 | 文档 | 说明 |
 |------|------|
 | [SPEC.md](SPEC.md) | 技术规格与需求 |
-| [DESIGN.md](DESIGN.md) | 架构与系统设计 |
+| [DESIGN.md](DESIGN.md) | 架构与模块设计 |
 | [RELEASE_NOTES.md](RELEASE_NOTES.md) | 版本发布记录 |
-| [TEST_REPORT.md](TEST_REPORT.md) | 系统测试报告 |
+| [TEST_REPORT.md](TEST_REPORT.md) | 测试报告 |
 
 ### 项目结构
 
