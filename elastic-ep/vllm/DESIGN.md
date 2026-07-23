@@ -65,66 +65,101 @@ graph TD
 #### 带外部故障管理中心（NPU 硬件故障）
 
 ```mermaid
-flowchart TD
-    A["NPU 故障发生"] --> B["DCMI 轮询检测到故障<br/>/ ZMQ 收到引擎异常上报"]
-    B --> C["外部故障管理中心<br/>查询容错状态确认暂停"]
-    C --> D["发送 scale_down 指令<br/>(REST API POST /fault_tolerance/apply)"]
-    D --> E["ClientSentinel 分发缩容指令<br/>给健康 EngineCoreSentinel"]
-    E --> F["NPUWorkerSentinel 执行缩容助手"]
-    F --> G["① 专家分布重算<br/>② 专家权重重载<br/>③ 专家路由重建<br/>④ 并行参数更新<br/>⑤ CPU Gloo 通信组重建<br/>⑥ MC2 Mask 参数更新<br/>⑦ MoE 配置更新"]
-    G --> H["恢复推理服务<br/>发布新健康状态"]
+sequenceDiagram
+    autonumber
+    participant NPU as NPU 设备
+    participant W as WorkerSentinel
+    participant EC as EngineCoreSentinel
+    participant CS as ClientSentinel
+    participant MC as 外部故障管理中心
+
+    Note over NPU,MC: 故障检测阶段
+    NPU->>W: NPU 硬件故障 (HBM UCE / 卡掉线)
+    W->>EC: ZMQ 故障上报
+    EC->>CS: ZMQ 故障上报 (sentinel_id, pid, rank, err_type)
+    CS->>CS: 健康 DP rank 进入暂停状态
+    CS->>CS: ZMQ PUB 发布健康状态
+
+    Note over NPU,MC: 故障响应阶段
+    MC->>CS: GET /fault_tolerance/status (轮询状态)
+    CS-->>MC: 返回引擎状态 (含 paused/dead)
+    MC->>CS: POST /fault_tolerance/apply {instruction: scale_down, exclude_dp_ranks: [故障rank]}
+
+    Note over NPU,MC: 缩容执行阶段
+    CS->>EC: ZMQ 分发缩容指令
+    EC->>W: ZMQ 分发缩容指令
+    W->>W: 缩容助手 7 阶段执行
+    Note right of W: ① 专家分布重算<br/>② 专家权重重载<br/>③ 专家路由重建<br/>④ 并行参数更新<br/>⑤ Gloo 通信组重建<br/>⑥ MC2 Mask 更新<br/>⑦ MoE 配置更新
+    W->>EC: 缩容完成
+    EC->>CS: ZMQ 上报恢复状态
+    CS->>CS: ZMQ PUB 发布新健康状态
 ```
 
 #### 不带外部故障管理中心（手动响应）
 
 ```mermaid
-flowchart TD
-    A["引擎异常发生<br/>(任何原因)"] --> B["fault_tolerant_wrapper 捕获异常"]
-    B --> C["EngineCoreSentinel<br/>通过 ZMQ 上报故障给 ClientSentinel"]
-    C --> D["ClientSentinel<br/>健康 DP rank 进入暂停状态"]
-    D --> E["引擎暂停等待指令<br/>(最多 engine_recovery_timeout_sec)"]
-    E --> F{"用户决策"}
-    F -->|"retry"| G["REST API 发送 retry 指令"]
-    F -->|"scale_down"| H["REST API 发送 scale_down 指令<br/>指定 exclude_dp_ranks"]
-    F -->|"超时未操作"| I["抛出原始异常<br/>进程退出"]
-    G --> J["清理状态 + 重建通信组<br/>恢复推理服务"]
-    H --> K["缩容助手 7 阶段<br/>恢复推理服务"]
+sequenceDiagram
+    autonumber
+    participant EC as EngineCoreSentinel
+    participant CS as ClientSentinel
+    participant User as 用户 (REST API)
+
+    Note over EC,User: 故障捕获
+    EC->>EC: fault_tolerant_wrapper 捕获引擎异常
+    EC->>CS: ZMQ 故障上报 (sentinel_id, pid, rank, err_type)
+    CS->>CS: 健康 DP rank 进入暂停状态
+    CS->>CS: ZMQ PUB 发布健康状态
+
+    Note over EC,User: 等待指令 (最多 engine_recovery_timeout_sec)
+    EC->>EC: 引擎暂停，等待容错指令
+
+    alt 用户选择 retry
+        User->>CS: POST /fault_tolerance/apply {instruction: retry}
+        CS->>EC: ZMQ 分发 retry 指令
+        EC->>EC: 清理状态 + 重建 Gloo 通信组
+        EC->>CS: ZMQ 上报恢复状态
+    else 用户选择 scale_down
+        User->>CS: POST /fault_tolerance/apply {instruction: scale_down, exclude_dp_ranks: [2]}
+        CS->>EC: ZMQ 分发缩容指令
+        EC->>EC: 缩容助手 7 阶段执行
+        EC->>CS: ZMQ 上报恢复状态
+    else 超时未操作
+        EC->>EC: 抛出原始异常，进程退出
+    end
 ```
 
 ### 1.4 数据流
 
 ```mermaid
-flowchart TD
-    subgraph 故障检测层
-        A["NPU 故障 / 引擎崩溃"]
-    end
+sequenceDiagram
+    autonumber
+    participant NPU as NPU 设备
+    participant W as WorkerSentinel
+    participant EC as EngineCoreSentinel
+    participant CS as ClientSentinel
+    participant MC as 外部故障管理中心
+    participant User as 用户 (REST API)
 
-    subgraph 引擎层
-        B["Worker Sentinel<br/>检测 NPU 异常"]
-        C["EngineCoreSentinel<br/>捕获引擎异常"]
-    end
+    Note over NPU,User: 上行通道：故障上报
+    NPU->>W: NPU 异常 (硬件故障)
+    W->>EC: ZMQ 故障上报
+    EC->>EC: 引擎异常捕获
+    EC->>CS: ZMQ 故障上报 (sentinel_id, pid, rank, err_type, traceback)
+    CS->>MC: ZMQ PUB 健康状态广播
+    CS->>User: ZMQ PUB 健康状态广播
 
-    subgraph 控制层
-        D["ClientSentinel<br/>状态管理 + 指令分发"]
-    end
+    Note over NPU,User: 下行通道：容错指令
+    MC->>CS: HTTP POST /fault_tolerance/apply
+    User->>CS: HTTP POST /fault_tolerance/apply
+    CS->>EC: ZMQ 指令分发 (pause/retry/scale_down)
+    EC->>W: ZMQ 指令分发 (pause/retry/scale_down)
 
-    subgraph 外部层
-        E["外部故障管理中心<br/>(scale_down.py)"]
-        F["用户 REST API 客户端"]
-    end
-
-    A --> B
-    A --> C
-    B -->|"ZMQ 故障上报"| D
-    C -->|"ZMQ 故障上报"| D
-    D -->|"ZMQ PUB 健康状态"| E
-    E -->|"HTTP POST /fault_tolerance/apply"| D
-    F -->|"HTTP POST /fault_tolerance/apply"| D
-
-    D -->|"ZMQ 指令分发"| C
-    C -->|"ZMQ 指令分发"| B
-
-    B -->|"暂停: stop_device<br/>重试: 清理+重建通信组<br/>缩容: 缩容助手"| G["推理服务恢复"]
+    Note over NPU,User: 执行与恢复
+    W->>W: 执行操作 (stop_device / 清理重建 / 缩容助手)
+    W->>EC: ZMQ 执行结果
+    EC->>CS: ZMQ 恢复状态上报
+    CS->>MC: ZMQ PUB 新健康状态
+    CS->>User: ZMQ PUB 新健康状态
 ```
 
 ### 1.5 关键设计决策
