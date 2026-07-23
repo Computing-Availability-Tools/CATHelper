@@ -73,9 +73,6 @@ flowchart TD
     E --> F["NPUWorkerSentinel 执行缩容助手"]
     F --> G["① 专家分布重算<br/>② 专家权重重载<br/>③ 专家路由重建<br/>④ 并行参数更新<br/>⑤ CPU Gloo 通信组重建<br/>⑥ MC2 Mask 参数更新<br/>⑦ MoE 配置更新"]
     G --> H["恢复推理服务<br/>发布新健康状态"]
-
-    style A fill:#f96
-    style H:#6f9
 ```
 
 #### 不带外部故障管理中心（手动响应）
@@ -92,11 +89,6 @@ flowchart TD
     F -->|"超时未操作"| I["抛出原始异常<br/>进程退出"]
     G --> J["清理状态 + 重建通信组<br/>恢复推理服务"]
     H --> K["缩容助手 7 阶段<br/>恢复推理服务"]
-
-    style A fill:#f96
-    style I fill:#f66
-    style J:#6f9
-    style K:#6f9
 ```
 
 ### 1.4 数据流
@@ -133,9 +125,6 @@ flowchart TD
     C -->|"ZMQ 指令分发"| B
 
     B -->|"暂停: stop_device<br/>重试: 清理+重建通信组<br/>缩容: 缩容助手"| G["推理服务恢复"]
-
-    style A fill:#f96
-    style G:#6f9
 ```
 
 ### 1.5 关键设计决策
