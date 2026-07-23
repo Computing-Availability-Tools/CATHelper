@@ -100,28 +100,35 @@ sequenceDiagram
 ```mermaid
 sequenceDiagram
     autonumber
+    participant W as WorkerSentinel
     participant EC as EngineCoreSentinel
     participant CS as ClientSentinel
     participant User as 用户 (REST API)
 
-    Note over EC,User: 故障捕获
+    Note over W,User: 故障捕获
+    W->>W: 检测 NPU 异常
+    W->>EC: ZMQ 故障上报
     EC->>EC: fault_tolerant_wrapper 捕获引擎异常
     EC->>CS: ZMQ 故障上报 (sentinel_id, pid, rank, err_type)
     CS->>CS: 健康 DP rank 进入暂停状态
     CS->>CS: ZMQ PUB 发布健康状态
 
-    Note over EC,User: 等待指令 (最多 engine_recovery_timeout_sec)
+    Note over W,User: 等待指令 (最多 engine_recovery_timeout_sec)
     EC->>EC: 引擎暂停，等待容错指令
 
     alt 用户选择 retry
         User->>CS: POST /fault_tolerance/apply {instruction: retry}
         CS->>EC: ZMQ 分发 retry 指令
-        EC->>EC: 清理状态 + 重建 Gloo 通信组
+        EC->>W: ZMQ 分发 retry 指令
+        W->>W: 清理状态 + 重建 Gloo 通信组
+        W->>EC: ZMQ 执行结果
         EC->>CS: ZMQ 上报恢复状态
     else 用户选择 scale_down
         User->>CS: POST /fault_tolerance/apply {instruction: scale_down, exclude_dp_ranks: [2]}
         CS->>EC: ZMQ 分发缩容指令
-        EC->>EC: 缩容助手 7 阶段执行
+        EC->>W: ZMQ 分发缩容指令
+        W->>W: 缩容助手 7 阶段执行
+        W->>EC: ZMQ 执行结果
         EC->>CS: ZMQ 上报恢复状态
     else 超时未操作
         EC->>EC: 抛出原始异常，进程退出
