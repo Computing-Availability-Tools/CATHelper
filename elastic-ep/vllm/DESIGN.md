@@ -1,6 +1,6 @@
-# vLLM Elastic EP 设计文档 (DESIGN)
+# Elastic EP 设计文档 (DESIGN)
 
-> 本文档描述 vLLM Elastic EP 的架构设计、模块设计、容错工作流设计。
+> 本文档描述 Elastic EP 的架构设计、模块设计、容错工作流设计。
 > 规格与需求见 [SPEC.md](SPEC.md)。
 
 ---
@@ -11,7 +11,7 @@
 
 ```mermaid
 graph TD
-    Monitor["外部监控器<br/>(scale_down.py)"]
+    Monitor["模拟外部故障管理中心<br/>(scale_down.py)"]
 
     Monitor -->|"ZMQ SUB<br/>(故障)"| API["API服务器<br/>(FastAPI)"]
     Monitor -->|"HTTP POST<br/>/fault_tolerance/apply"| API
@@ -62,68 +62,83 @@ graph TD
 
 ### 1.3 容错工作流
 
+#### 带外部故障管理中心（NPU 硬件故障）
+
 ```mermaid
 flowchart TD
-    A["故障事件"] --> B["故障上报<br/>哨兵注册"]
-    B --> C["暂停操作<br/>等待指令"]
-    C --> D{"指令决策"}
-    D -->|"重试"| E["重试<br/>(清理 / 重置 / 重建)"]
-    D -->|"缩容"| F["缩容<br/>① 专家分布重算<br/>② 专家权重重载<br/>③ 专家路由重建<br/>④ 并行参数更新<br/>⑤ CPU Gloo 通信组重建<br/>⑥ MC2 Mask 参数更新<br/>⑦ MoE 配置更新"]
-    D -->|"超时退出"| G["超时退出<br/>(抛异常)"]
-    E --> H["恢复服务<br/>发布新状态"]
-    F --> H
+    A["NPU 故障发生"] --> B["DCMI 轮询检测到故障<br/>/ ZMQ 收到引擎异常上报"]
+    B --> C["外部故障管理中心<br/>查询容错状态确认暂停"]
+    C --> D["发送 scale_down 指令<br/>(REST API POST /fault_tolerance/apply)"]
+    D --> E["ClientSentinel 分发缩容指令<br/>给健康 EngineCoreSentinel"]
+    E --> F["NPUWorkerSentinel 执行缩容助手"]
+    F --> G["① 专家分布重算<br/>② 专家权重重载<br/>③ 专家路由重建<br/>④ 并行参数更新<br/>⑤ CPU Gloo 通信组重建<br/>⑥ MC2 Mask 参数更新<br/>⑦ MoE 配置更新"]
+    G --> H["恢复推理服务<br/>发布新健康状态"]
+
+    style A fill:#f96
+    style H:#6f9
 ```
 
-#### 带外部监控器（NPU 硬件故障）
+#### 不带外部故障管理中心（手动响应）
 
-监控器（`scale_down.py`）使用 DCMI 轮询 NPU 健康状态。当检测到卡故障时：
-1. 监控器发送 缩容 指令，移除故障 DP Rank（暂停由引擎异常自动触发，无需监控器额外发送）
-2. vLLM 在剩余健康 NPU 上重新分配专家恢复服务
+```mermaid
+flowchart TD
+    A["引擎异常发生<br/>(任何原因)"] --> B["fault_tolerant_wrapper 捕获异常"]
+    B --> C["EngineCoreSentinel<br/>通过 ZMQ 上报故障给 ClientSentinel"]
+    C --> D["ClientSentinel<br/>健康 DP rank 进入暂停状态"]
+    D --> E["引擎暂停等待指令<br/>(最多 engine_recovery_timeout_sec)"]
+    E --> F{"用户决策"}
+    F -->|"retry"| G["REST API 发送 retry 指令"]
+    F -->|"scale_down"| H["REST API 发送 scale_down 指令<br/>指定 exclude_dp_ranks"]
+    F -->|"超时未操作"| I["抛出原始异常<br/>进程退出"]
+    G --> J["清理状态 + 重建通信组<br/>恢复推理服务"]
+    H --> K["缩容助手 7 阶段<br/>恢复推理服务"]
 
-#### 不带监控器（任何引擎异常）
-
-容错框架在引擎繁忙循环中捕获异常：
-1. 容错包装器捕获异常
-2. 引擎通过 ZMQ 上报故障（故障报告消息）
-3. ClientSentinel 获悉后健康 rank 进入暂停状态
-4. 引擎暂停并等待指令（最多等待 `engine_recovery_timeout_sec`）
-5. 用户通过 REST API 手动发送重试或缩容指令
+    style A fill:#f96
+    style I fill:#f66
+    style J:#6f9
+    style K:#6f9
+```
 
 ### 1.4 数据流
 
 ```mermaid
 flowchart TD
-    A["NPU 卡掉线 / 引擎崩溃"] --> B["故障检测<br/>(DCMI 轮询 / 异常捕获)"]
-    B --> C["故障上报<br/>ZMQ 故障报告消息"]
-    C --> D["EngineCoreSentinel"]
-    C --> E["ClientSentinel"]
-    C --> F["scale_down.py<br/>(外部监控器)"]
+    subgraph 故障检测层
+        A["NPU 故障 / 引擎崩溃"]
+    end
 
-    E --> G["外部 ZMQ 发布<br/>(健康状态)"]
-    G --> F
+    subgraph 引擎层
+        B["Worker Sentinel<br/>检测 NPU 异常"]
+        C["EngineCoreSentinel<br/>捕获引擎异常"]
+    end
 
-    D --> H["指令分发<br/>暂停 / 重试 / 缩容"]
-    H --> I["NPUWorkerSentinel<br/>暂停: 停止设备<br/>重试: 清理状态 + 重建 DP 通信组<br/>缩容: → 缩容助手"]
-    I --> J["缩容助手（7 阶段）<br/>① 专家分布重算<br/>② 专家权重重载<br/>③ 专家路由重建<br/>④ 并行参数更新<br/>⑤ CPU Gloo 通信组重建<br/>⑥ MC2 Mask 参数更新<br/>⑦ MoE 配置更新"]
-    J --> K["恢复服务<br/>+ 健康状态"]
+    subgraph 控制层
+        D["ClientSentinel<br/>状态管理 + 指令分发"]
+    end
+
+    subgraph 外部层
+        E["外部故障管理中心<br/>(scale_down.py)"]
+        F["用户 REST API 客户端"]
+    end
+
+    A --> B
+    A --> C
+    B -->|"ZMQ 故障上报"| D
+    C -->|"ZMQ 故障上报"| D
+    D -->|"ZMQ PUB 健康状态"| E
+    E -->|"HTTP POST /fault_tolerance/apply"| D
+    F -->|"HTTP POST /fault_tolerance/apply"| D
+
+    D -->|"ZMQ 指令分发"| C
+    C -->|"ZMQ 指令分发"| B
+
+    B -->|"暂停: stop_device<br/>重试: 清理+重建通信组<br/>缩容: 缩容助手"| G["推理服务恢复"]
+
+    style A fill:#f96
+    style G:#6f9
 ```
 
-### 1.5 两种操作模式
-
-```
-┌─────────────────────────────────────────────────────┐
-│                  操作模式                            │
-├─────────────────────────────┬───────────────────────┤
-│ 带外部监控器                 │ 不带监控器             │
-├─────────────────────────────┼───────────────────────┤
-│ DCMI 轮询 NPU 健康状态      │    捕获异常             │
-│ 自动检测卡故障              │    进程暂停             │
-│ 自动发送暂停/缩容指令       │ 手动通过 REST API 操作  │
-│ 完全自动化                  │ 灵活性更高              │
-└─────────────────────────────┴───────────────────────┘
-```
-
-### 1.6 关键设计决策
+### 1.5 关键设计决策
 
 #### 基于 ZMQ 的通信
 
@@ -194,7 +209,7 @@ elastic-ep/vllm/
 ├── examples/
 │   └── fault_tolerance_scale/
 │       ├── serve_qwen.sh              # 启动带容错功能的 vLLM 服务
-│       └── scale_down.py              # NPU 硬件故障监控和处理程序
+│       └── scale_down.py              # 模拟外部故障管理中心，双路径检测（DCMI + ZMQ）
 ├── patches/
 │   ├── vllm_scale_down.patch          # vLLM v0.18.0 核心容错框架补丁
 │   └── vllm_ascend_scale_down.patch   # vllm-ascend v0.18.0 昇腾特定适配补丁
@@ -208,8 +223,8 @@ elastic-ep/vllm/
 ├── README.md                          # 项目说明
 ├── SPEC.md                            # 技术规格与需求
 ├── DESIGN.md                          # 架构与模块设计
-├── RELEASE_NOTES.md                   # 版本发布记录
-└── TEST_REPORT.md                     # 测试报告
+├── Release_Notes.md                   # 版本发布记录
+└── test_report.md                     # 测试报告
 ```
 
 ### 2.2 模块职责
@@ -219,7 +234,7 @@ elastic-ep/vllm/
 | ClientSentinel | 故障接收、状态管理、指令分发 |
 | EngineCoreSentinel | 引擎异常捕获、故障上报、指令执行 |
 | NPUWorkerSentinel | NPU级操作、状态清理、资源重建 |
-| scale_down.py | 外部硬件监控、自动故障响应 |
+| scale_down.py | 模拟外部故障管理中心，双路径检测（DCMI + ZMQ） |
 
 ### 2.3 通信通道
 
@@ -233,74 +248,31 @@ elastic-ep/vllm/
 | HTTP API | REST | 外部 -> API 服务器 | 外部容错控制 |
 
 
-## 3. 外部监控模块设计
+## 3. 模拟外部故障管理中心模块设计
 
 ### 3.1 scale_down.py
+
+> 脚本说明与参数详见 [README.md §使用](README.md#使用) 和 [SPEC.md §5.1.4](SPEC.md#514-scale_downpy-脚本参数)。
 
 | 项目 | 说明 |
 |------|------|
 | 路径 | `examples/fault_tolerance_scale/scale_down.py` |
-| 功能 | NPU 硬件故障监控和处理（外部监控器） |
+| 功能 | 模拟外部故障管理中心，双路径检测（DCMI 硬件轮询 + ZMQ 引擎健康订阅） |
 | 依赖 | DCMI (`libdcmi.so`), requests, ZMQ |
-| 工作方式 | 定时轮询 DCMI 获取 NPU 健康状态，同时通过 ZMQ SUB 订阅引擎健康状态 |
-
-**工作流程：**
-1. 初始化 DCMI，获取所有 NPU 设备列表
-2. 通过 ZMQ 订阅 ClientSentinel 发布的健康状态消息
-3. 每 `interval_time` 秒轮询一次 NPU 健康状态
-4. 检测到 NPU 故障时，通过 REST API 发送暂停指令
-5. 确认引擎暂停后，发送缩容指令
-6. 监控缩容完成状态
-7. 通过健康状态确认恢复
+| 工作方式 | 定时轮询 DCMI 获取 NPU 健康状态，同时通过 ZMQ SUB 订阅引擎健康状态，检测到故障后自动通过 REST API 发送缩容指令（可选） |
 
 ### 3.2 serve_qwen.sh
+
+> 脚本说明与参数详见 [README.md §使用](README.md#使用) 和 [SPEC.md §5.1.3](SPEC.md#513-serve_qwensh-脚本参数)。
 
 | 项目 | 说明 |
 |------|------|
 | 路径 | `examples/fault_tolerance_scale/serve_qwen.sh` |
 | 功能 | 启动带容错功能的 vLLM 服务 |
-| 参数 | dp/re/host/port/fault-port/recovery-timeout/gloo-timeout-seconds |
 
 ---
 
 ## 4. CLI 与使用场景
 
-### 4.1 启动命令
-
-```bash
-# 启动 vLLM 服务（带容错）
-bash examples/fault_tolerance_scale/serve_qwen.sh \
-    --dp 4 --re 48 --fault-port 22867 --recovery-timeout 120 --port 8006
-```
-
-### 4.2 启动监控（可选）
-
-```bash
-python examples/fault_tolerance_scale/scale_down.py \
-    --npu-ids 0,1,2,3 --interval-time 3 \
-    --external-fault-notify-port 22867 --port 8006
-```
-
-### 4.3 使用场景
-
-#### 场景一：查询当前容错状态
-
-```bash
-curl http://localhost:8006/fault_tolerance/status
-```
-
-#### 场景二：重试（重启所有 DP rank）
-
-```bash
-curl -X POST http://localhost:8006/fault_tolerance/apply \
-    -H "Content-Type: application/json" \
-    -d '{"instruction":"retry","params":{"timeout":30}}'
-```
-
-#### 场景三：缩容（排除指定 DP rank）
-
-```bash
-curl -X POST http://localhost:8006/fault_tolerance/apply \
-    -H "Content-Type: application/json" \
-    -d '{"instruction":"scale_down","params":{"timeout":30,"exclude_dp_ranks":[2]}}'
-```
+> 详细的启动命令、使用场景与 REST API 示例详见 [README.md §使用](README.md#使用)。
+> REST API 规格详见 [SPEC.md §5.3 REST API](SPEC.md#53-rest-api)。

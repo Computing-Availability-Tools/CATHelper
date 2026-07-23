@@ -307,7 +307,7 @@ def main():
     parser.add_argument(
         "--recovery-timeout",
         type=int,
-        default=30,
+        default=120,
         help="Fault recovery timeout",
     )
     parser.add_argument(

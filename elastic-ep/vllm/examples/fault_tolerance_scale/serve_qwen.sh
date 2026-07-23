@@ -13,11 +13,11 @@ RECOVERY_TIMEOUT=120
 
 while [[ $# -gt 0 ]]; do
     case $1 in
-        --dp)
+        --dp-size)
             DATA_PARALLEL_SIZE="$2"
             shift 2
             ;;
-        --re)
+        --redundant-experts)
             REDUNDANT_EXPERTS="$2"
             shift 2
             ;;
@@ -52,8 +52,8 @@ while [[ $# -gt 0 ]]; do
         -h|--help)
             echo "Usage: $0 [OPTIONS]"
             echo "Options:"
-            echo "  --dp SIZE                      Set data parallel size (default: 4)"
-            echo "  --re SIZE                      Set redundant experts (default: 0)"
+            echo "  --dp-size SIZE                 Set data parallel size, i.e. number of DP ranks to launch (default: 4)"
+            echo "  --redundant-experts SIZE       Set number of redundant experts per rank for scale-down redistribution (default: 0)"
             echo "  --host HOST                    Set host address (default: 0.0.0.0)"
             echo "  --port PORT                    Set port number (default: 8006)"
             echo "  --fault-port FAULT_PORT        Set external fault notify port (default: 22867)"

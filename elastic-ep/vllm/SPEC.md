@@ -1,6 +1,6 @@
-# vLLM Elastic EP 技术规格说明书 (SPEC)
+# Elastic EP 技术规格说明书 (SPEC)
 
-> **vLLM Elastic EP** — vLLM 弹性容错方案
+> **Elastic EP** — 推理大EP卡级弹性容错
 
 ---
 
@@ -8,7 +8,7 @@
 
 ### 1.1 软件定位
 
-vLLM Elastic EP 使 vLLM 能够在DP(data parallel)+EP(expert parallel)的部署模式下，出现故障后，推理进程进入暂停状态不退出，通过重试恢复服务，或者通过将故障点所在的DP组缩容掉的方式，将故障隔离出去，提供在线弹性能力。
+> 项目概述见 [README.md](README.md#elastic-ep)。
 
 ### 1.2 技术栈
 
@@ -78,13 +78,13 @@ vLLM Elastic EP 使 vLLM 能够在DP(data parallel)+EP(expert parallel)的部署
 | 1.7 | REST API | `/fault_tolerance/apply`, `/fault_tolerance/status` |
 | 1.8 | Phase 1 完整测试 | 输出测试报告 |
 
-### Phase 2 — 外部监控与完善
+### Phase 2 — 外部故障管理中心与完善
 
-**目标**：增加外部 NPU 硬件故障监控，完善量化&MTP模型支持。
+**目标**：增加模拟外部故障管理中心，完善量化&MTP模型支持。
 
 | 序号 | 任务 | 说明 |
 |------|------|------|
-| 2.1 | DCMI 硬件监控 | scale_down.py 轮询 NPU 健康状态 |
+| 2.1 | 外部故障管理中心 | scale_down.py 双路径检测（DCMI 硬件轮询 + ZMQ 引擎健康订阅） |
 | 2.2 | W8A8 量化适配 | ModelSlim 格式 W8A8 量化模型适配 |
 | 2.3 | MTP 适配 | 多 Token 预测适配 |
 | 2.4 | Phase 2 完整测试 | 更新测试报告 |
@@ -102,7 +102,7 @@ pytest tests/v1/fault_tolerance/
 ### 4.2 测试流程
 
 1. 提交代码前执行 `pytest tests/v1/fault_tolerance/`，确保所有单元测试通过
-2. 每次变更后更新 `TEST_REPORT.md`，记录单元测试与端到端测试结果
+2. 每次变更后更新 `test_report.md`，记录单元测试与端到端测试结果
 3. 端到端测试在 NPU 物理机上执行，使用 `serve_qwen.sh` 部署后注入故障验证
 
 ### 4.3 测试覆盖范围
@@ -138,15 +138,26 @@ pytest tests/v1/fault_tolerance/
 
 | 参数 | 默认值 | 描述 |
 |------|--------|------|
-| `--dp` | `4` | 数据并行大小 |
-| `--re` | `0` | 冗余专家数量 |
+| `--dp-size` | `4` | 数据并行大小，即启动的 DP rank 数量 |
+| `--redundant-experts` | `0` | 每个 rank 的冗余专家数量，缩容存在限制健康卡上的冗余专家总数必须大于故障卡上的逻辑专家数量 |
 | `--host` | `0.0.0.0` | 服务器主机地址 |
 | `--port` | `8006` | 服务器端口 |
 | `--fault-port` | `22867` | 外部故障通知端口 |
 | `--model-name` | `/qwen-ai/Qwen3-30B-A3B-W8A8` | 模型名称或路径 |
 | `--local-model` | `nytopop/Qwen3-30B-A3B.w8a8` | 本地模型路径 |
-| `--recovery-timeout` | `120` | 引擎恢复超时时间（秒） |
-| `--gloo-timeout-seconds` | `30` | Gloo 通信组超时时间（秒） |
+| `--recovery-timeout` | `120` | 引擎恢复超时时间（秒），故障暂停后等待重试/缩容指令的最长时间，超时则抛异常退出 |
+| `--gloo-timeout-seconds` | `30` | DP 域 Gloo CPU 通信组超时（秒）。故障 rank 同步阻塞时健康 rank 会等待此超时，需小于 `--recovery-timeout` 以避免容错指令超时 |
+
+#### 5.1.4 scale_down.py 脚本参数
+
+| 参数 | 默认值 | 描述 |
+|------|--------|------|
+| `--npu-ids` | `0-15` | 参与推理的 NPU 设备 ID 列表（逗号分隔） |
+| `--interval-time` | `3` | NPU 健康状态轮询间隔（秒） |
+| `--external-fault-notify-port` | `22867` | 订阅引擎健康状态的 ZMQ SUB 端口（需与 vLLM 的 `--fault-port` 一致） |
+| `--port` | `8006` | vLLM API 端口，用于发送暂停/缩容指令 |
+| `--host` | `localhost` | vLLM API 主机地址 |
+| `--recovery-timeout` | `120` | 容错指令的超时等待时间（秒） |
 
 ### 5.2 配置文件
 
@@ -219,7 +230,7 @@ pytest tests/v1/fault_tolerance/
 | zmq | ZMQ 通信 | 容错框架核心通信通道 |
 | msgspec | 消息序列化 | 高性能序列化框架 |
 | requests | HTTP 请求 | 外部 REST API 调用 |
-| DCMI (`libdcmi.so`) | NPU 硬件监控 | 可选，仅监控程序需要 |
+| DCMI (`libdcmi.so`) | NPU 硬件状态查询 | 可选，仅模拟外部故障管理中心需要 |
 
 ### 6.2 限制
 
