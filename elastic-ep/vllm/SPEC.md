@@ -139,7 +139,7 @@ pytest tests/v1/fault_tolerance/
 | 参数 | 默认值 | 描述 |
 |------|--------|------|
 | `--dp-size` | `4` | 数据并行大小，即启动的 DP rank 数量 |
-| `--redundant-experts` | `0` | 每个 rank 的冗余专家数量，缩容存在限制健康卡上的冗余专家总数必须大于故障卡上的逻辑专家数量 |
+| `--redundant-experts` | `0` | 每个 rank 的冗余专家数量，缩容时有限制：全部健康卡上的冗余专家的总数必须大于故障卡上的逻辑专家数量 |
 | `--host` | `0.0.0.0` | 服务器主机地址 |
 | `--port` | `8006` | 服务器端口 |
 | `--fault-port` | `22867` | 外部故障通知端口 |
@@ -239,9 +239,10 @@ pytest tests/v1/fault_tolerance/
 | 限制 | 说明 |
 |------|------|
 | NPU 支持 | 仅支持华为昇腾 A3 服务器 |
-| Expert Parallel | 必须开启（`--enable-expert-parallel`） |
+| Expert Parallel | 必须开启专家并行 |
 | Pipeline Parallel | 不支持 |
 | Tensor Parallel | 仅支持 TP=1 |
+| 动态 EPLB | 已兼容，支持故障后通过 EPLB 框架重新平衡专家放置 |
 | 量化模型 | 仅兼容 W8A8（ModelSlim 格式），W4A8、W4A16 等暂不支持 |
 | FULL Graph 模式 | 暂未兼容，不支持大模型整图捕获 |
 | 冗余专家数 | 健康卡上的冗余专家总数必须大于故障卡上的逻辑专家数量 |

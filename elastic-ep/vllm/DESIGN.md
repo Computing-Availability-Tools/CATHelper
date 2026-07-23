@@ -13,10 +13,10 @@
 graph TD
     Monitor["模拟外部故障管理中心<br/>(scale_down.py)"]
 
-    Monitor -->|"ZMQ SUB<br/>(故障)"| API["API服务器<br/>(FastAPI)"]
-    Monitor -->|"HTTP POST<br/>/fault_tolerance/apply"| API
+    Monitor -->|"ZMQ SUB<br/>(健康状态)"| Client
+    Monitor -->|"HTTP POST<br/>/fault_tolerance/apply"| Client
 
-    API --> Client["ClientSentinel<br/>（每个 vLLM 实例一个）"]
+    Client["ClientSentinel<br/>（每个 vLLM 实例一个）"]
 
     Client --> ECS0["EngineCoreSentinel<br/>(DP rank 0)"]
     Client --> ECS1["EngineCoreSentinel<br/>(DP rank 1)"]
@@ -91,7 +91,7 @@ sequenceDiagram
     CS->>EC: ZMQ 分发缩容指令
     EC->>W: ZMQ 分发缩容指令
     W->>W: 缩容助手 7 阶段执行
-    Note right of W: ① 专家分布重算<br/>② 专家权重重载<br/>③ 专家路由重建<br/>④ 并行参数更新<br/>⑤ Gloo 通信组重建<br/>⑥ MC2 Mask 更新<br/>⑦ MoE 配置更新
+    Note right of W: ① 专家分布重算<br/>② 专家权重重载<br/>③ 专家路由重建<br/>④ 并行参数更新<br/>⑤ CPU Gloo 通信组重建<br/>⑥ MC2 Mask 更新<br/>⑦ MoE 配置更新
     W->>EC: 缩容完成
     EC->>CS: ZMQ 上报恢复状态
     CS->>CS: ZMQ PUB 发布新健康状态
@@ -149,9 +149,8 @@ sequenceDiagram
     participant EC as EngineCoreSentinel
     participant CS as ClientSentinel
     participant MC as 外部故障管理中心
-    participant User as 用户 (REST API)
 
-    Note over NPU,User: 上行通道：故障上报
+    Note over NPU,MC: 上行通道：故障上报
     NPU->>W: NPU 异常 (硬件故障)
     W->>EC: ZMQ 故障上报
     EC->>EC: 引擎异常捕获
@@ -159,20 +158,19 @@ sequenceDiagram
     CS->>EC: ZMQ 自动下发 pause 指令
     EC->>EC: 执行 pause，进入暂停状态
     CS->>MC: ZMQ PUB 健康状态广播
-    CS->>User: ZMQ PUB 健康状态广播
 
     Note over NPU,User: 下行通道：容错指令
+    MC->>CS: GET /fault_tolerance/status (轮询状态)
     MC->>CS: HTTP POST /fault_tolerance/apply
     User->>CS: HTTP POST /fault_tolerance/apply
     CS->>EC: ZMQ 指令分发 (retry/scale_down)
     EC->>W: ZMQ 指令分发 (retry/scale_down)
 
-    Note over NPU,User: 执行与恢复
+    Note over NPU,MC: 执行与恢复
     W->>W: 执行操作 (stop_device / 清理重建 / 缩容助手)
     W->>EC: ZMQ 执行结果
     EC->>CS: ZMQ 恢复状态上报
     CS->>MC: ZMQ PUB 新健康状态
-    CS->>User: ZMQ PUB 新健康状态
 ```
 
 ### 1.5 关键设计决策

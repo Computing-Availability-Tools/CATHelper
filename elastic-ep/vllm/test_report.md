@@ -1,6 +1,6 @@
-# CATHelper (vLLM Elastic EP) 测试报告
+# Elastic EP 测试报告
 
-> **项目**: CATHelper — vLLM Elastic EP 容错框架
+> **项目**: CATHelper — Elastic EP 容错框架
 > **版本**: Phase 1
 > **日期**: 2026-07-21
 > **测试执行**: OpenCode + Pytest
