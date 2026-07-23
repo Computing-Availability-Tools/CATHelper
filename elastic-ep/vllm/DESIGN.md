@@ -77,7 +77,9 @@ sequenceDiagram
     NPU->>W: NPU 硬件故障 (HBM UCE / 卡掉线)
     W->>EC: ZMQ 故障上报
     EC->>CS: ZMQ 故障上报 (sentinel_id, pid, rank, err_type)
-    CS->>CS: 健康 DP rank 进入暂停状态
+    CS->>CS: 健康 DP rank 进入不健康状态
+    CS->>EC: ZMQ 自动下发 pause 指令
+    EC->>EC: 执行 pause，进入暂停状态
     CS->>CS: ZMQ PUB 发布健康状态
 
     Note over NPU,MC: 故障响应阶段
@@ -110,7 +112,9 @@ sequenceDiagram
     W->>EC: ZMQ 故障上报
     EC->>EC: fault_tolerant_wrapper 捕获引擎异常
     EC->>CS: ZMQ 故障上报 (sentinel_id, pid, rank, err_type)
-    CS->>CS: 健康 DP rank 进入暂停状态
+    CS->>CS: 健康 DP rank 进入不健康状态
+    CS->>EC: ZMQ 自动下发 pause 指令
+    EC->>EC: 执行 pause，进入暂停状态
     CS->>CS: ZMQ PUB 发布健康状态
 
     Note over W,User: 等待指令 (最多 engine_recovery_timeout_sec)
@@ -152,14 +156,16 @@ sequenceDiagram
     W->>EC: ZMQ 故障上报
     EC->>EC: 引擎异常捕获
     EC->>CS: ZMQ 故障上报 (sentinel_id, pid, rank, err_type, traceback)
+    CS->>EC: ZMQ 自动下发 pause 指令
+    EC->>EC: 执行 pause，进入暂停状态
     CS->>MC: ZMQ PUB 健康状态广播
     CS->>User: ZMQ PUB 健康状态广播
 
     Note over NPU,User: 下行通道：容错指令
     MC->>CS: HTTP POST /fault_tolerance/apply
     User->>CS: HTTP POST /fault_tolerance/apply
-    CS->>EC: ZMQ 指令分发 (pause/retry/scale_down)
-    EC->>W: ZMQ 指令分发 (pause/retry/scale_down)
+    CS->>EC: ZMQ 指令分发 (retry/scale_down)
+    EC->>W: ZMQ 指令分发 (retry/scale_down)
 
     Note over NPU,User: 执行与恢复
     W->>W: 执行操作 (stop_device / 清理重建 / 缩容助手)
@@ -182,8 +188,8 @@ sequenceDiagram
 
 ClientSentinel 维护引擎状态字典，跟踪每个引擎的状态：
 - 健康 - 引擎正常运行
-- 已暂停 - 引擎暂停，等待指令
-- 不健康 - 引擎遇到错误
+- 不健康 - 引擎遇到错误，自动下发 pause 指令
+- 已暂停 - pause 指令执行成功，引擎暂停等待 retry/scale_down 指令
 - 已终止 - 引擎进程已退出
 
 #### 指令工作流模型
