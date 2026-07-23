@@ -139,41 +139,7 @@ sequenceDiagram
     end
 ```
 
-### 1.4 数据流
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant NPU as NPU 设备
-    participant W as WorkerSentinel
-    participant EC as EngineCoreSentinel
-    participant CS as ClientSentinel
-    participant MC as 外部故障管理中心
-
-    Note over NPU,MC: 上行通道：故障上报
-    NPU->>W: NPU 异常 (硬件故障)
-    W->>EC: ZMQ 故障上报
-    EC->>EC: 引擎异常捕获
-    EC->>CS: ZMQ 故障上报 (sentinel_id, pid, rank, err_type, traceback)
-    CS->>EC: ZMQ 自动下发 pause 指令
-    EC->>EC: 执行 pause，进入暂停状态
-    CS->>MC: ZMQ PUB 健康状态广播
-
-    Note over NPU,User: 下行通道：容错指令
-    MC->>CS: GET /fault_tolerance/status (轮询状态)
-    MC->>CS: HTTP POST /fault_tolerance/apply
-    User->>CS: HTTP POST /fault_tolerance/apply
-    CS->>EC: ZMQ 指令分发 (retry/scale_down)
-    EC->>W: ZMQ 指令分发 (retry/scale_down)
-
-    Note over NPU,MC: 执行与恢复
-    W->>W: 执行操作 (stop_device / 清理重建 / 缩容助手)
-    W->>EC: ZMQ 执行结果
-    EC->>CS: ZMQ 恢复状态上报
-    CS->>MC: ZMQ PUB 新健康状态
-```
-
-### 1.5 关键设计决策
+### 1.4 关键设计决策
 
 #### 基于 ZMQ 的通信
 
