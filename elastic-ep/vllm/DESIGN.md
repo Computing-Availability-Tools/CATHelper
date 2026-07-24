@@ -11,7 +11,7 @@
 
 ```mermaid
 graph TD
-    Monitor["模拟外部故障管理中心<br/>(scale_down.py)"]
+    Monitor["模拟外部故障管理中心<br/>(scale_down_demo.py)"]
 
     Monitor -->|"ZMQ SUB<br/>(健康状态)"| Client
     Monitor -->|"HTTP POST<br/>/fault_tolerance/apply"| Client
@@ -209,8 +209,8 @@ ClientSentinel 记录故障后通过 ZMQ 发布广播健康状态消息给所有
 elastic-ep/vllm/
 ├── examples/
 │   └── fault_tolerance_scale/
-│       ├── serve_qwen.sh              # 启动带容错功能的 vLLM 服务
-│       └── scale_down.py              # 模拟外部故障管理中心，双路径检测（DCMI + ZMQ）+ 下发缩容指令
+│       ├── ft_vllm_serve_qwen.sh              # 启动带容错功能的 vLLM 服务
+│       └── scale_down_demo.py              # 模拟外部故障管理中心，双路径检测（DCMI + ZMQ）+ 下发缩容指令
 ├── patches/
 │   ├── vllm_scale_down.patch          # vLLM v0.18.0 核心容错框架补丁
 │   └── vllm_ascend_scale_down.patch   # vllm-ascend v0.18.0 昇腾特定适配补丁
@@ -235,7 +235,7 @@ elastic-ep/vllm/
 | ClientSentinel | 故障接收、状态管理、指令分发 |
 | EngineCoreSentinel | 引擎异常捕获、故障上报、指令执行 |
 | NPUWorkerSentinel | NPU级操作、状态清理、资源重建 |
-| scale_down.py | 模拟外部故障管理中心，双路径故障检测（DCMI硬件轮询 + ZMQ引擎健康订阅），检测到故障后下发容错命令（缩容） |
+| scale_down_demo.py | 模拟外部故障管理中心，双路径故障检测（DCMI硬件轮询 + ZMQ引擎健康订阅），检测到故障后下发容错命令（缩容） |
 
 ### 2.3 通信通道
 
@@ -251,24 +251,24 @@ elastic-ep/vllm/
 
 ## 3. 模拟外部故障管理中心模块设计
 
-### 3.1 scale_down.py
+### 3.1 scale_down_demo.py
 
 > 脚本说明与参数详见 [README.md §使用](README.md#使用) 和 [SPEC.md §5.1.4](SPEC.md#514-scale_downpy-脚本参数)。
 
 | 项目 | 说明 |
 |------|------|
-| 路径 | `examples/fault_tolerance_scale/scale_down.py` |
+| 路径 | `examples/fault_tolerance_scale/scale_down_demo.py` |
 | 功能 | 模拟外部故障管理中心，双路径故障检测（DCMI硬件轮询 + ZMQ引擎健康订阅）+ 下发容错命令（缩容） |
 | 依赖 | DCMI (`libdcmi.so`), requests, ZMQ |
 | 工作方式 | 定时轮询 DCMI 获取 NPU 健康状态，同时通过 ZMQ SUB 订阅引擎健康状态，检测到故障后自动通过 REST API 发送缩容指令（可选） |
 
-### 3.2 serve_qwen.sh
+### 3.2 ft_vllm_serve_qwen.sh
 
 > 脚本说明与参数详见 [README.md §使用](README.md#使用) 和 [SPEC.md §5.1.3](SPEC.md#513-serve_qwensh-脚本参数)。
 
 | 项目 | 说明 |
 |------|------|
-| 路径 | `examples/fault_tolerance_scale/serve_qwen.sh` |
+| 路径 | `examples/fault_tolerance_scale/ft_vllm_serve_qwen.sh` |
 | 功能 | 启动带容错功能的 vLLM 服务 |
 
 ---

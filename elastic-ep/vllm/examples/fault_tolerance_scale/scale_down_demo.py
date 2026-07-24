@@ -14,6 +14,7 @@ from ctypes import POINTER, byref, c_int, c_uint, cdll
 
 import requests
 import zmq
+import msgspec
 
 DCMI_LIB_PATH = os.environ.get("DCMI_LIB_PATH", "/usr/local/dcmi/libdcmi.so")
 try:
@@ -58,19 +59,17 @@ lib.dcmi_get_device_health.restype = c_int
 
 ALL_NPUS = []
 active_npus = []
+dp_to_npu = {}
+npu_to_dp = {}
 active_npus_lock = threading.Lock()
 
 
 def get_npu_by_dp(dp_rank):
-    return active_npus[dp_rank]
+    return dp_to_npu.get(dp_rank, -1)
 
 
 def get_dp_by_npu(npu_id):
-    with active_npus_lock:
-        try:
-            return active_npus.index(npu_id)
-        except ValueError:
-            return -1
+    return npu_to_dp.get(npu_id, -1)
 
 
 def is_valid_card_id(card_id):
@@ -178,10 +177,11 @@ def listen_fault_event(host, port):
 
         _fault_event_socket.connect(endpoint)
         _fault_event_endpoint = endpoint
-    message = _fault_event_socket.recv_string()
-    json_part = message.split("|")[1]
-    status_dict = json.loads(json_part)
-    dead_engine = [int(idx) for idx, status in status_dict.items() if status == "Dead"]
+    frames = _fault_event_socket.recv_multipart()
+    decoder = msgspec.msgpack.Decoder()
+    msg = decoder.decode(frames[-1])
+    engines = msg.get("engines", [])
+    dead_engine = [int(e["id"]) for e in engines if e.get("status") == "dead"]
     return dead_engine
 
 
@@ -254,6 +254,7 @@ def start_monitor_engine_status(host, port, timeout, external_fault_notify_port)
         scale(host, port, timeout, exclude_dp_ranks)
         with active_npus_lock:
             npus_to_remove = {get_npu_by_dp(dp_rank) for dp_rank in exclude_dp_ranks}
+            npus_to_remove.discard(-1)
             active_npus = [npu for npu in active_npus if npu not in npus_to_remove]
 
 
@@ -330,9 +331,11 @@ def main():
     )
 
     args = parser.parse_args()
-    global ALL_NPUS, active_npus
+    global ALL_NPUS, active_npus, dp_to_npu, npu_to_dp
     ALL_NPUS = args.npu_ids
     active_npus = ALL_NPUS.copy()
+    dp_to_npu = {i: npu_id for i, npu_id in enumerate(ALL_NPUS)}
+    npu_to_dp = {npu_id: i for i, npu_id in enumerate(ALL_NPUS)}
 
     monitor_thread = threading.Thread(
         target=start_monitor_engine_status,

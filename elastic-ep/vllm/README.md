@@ -68,14 +68,14 @@ pip install -e .
 
 | 脚本 | 说明 |
 |------|------|
-| `serve_qwen.sh` | 启动支持弹性容错功能的 vLLM 服务，模型Qwen3-30B-A3-W8A8 |
-| `scale_down.py` | 模拟外部故障管理中心，内置两条检测路径：1）DCMI 轮询 NPU 硬件状态，检测卡掉线、HBM UCE 等硬件故障；2）ZMQ 订阅引擎健康状态，接收引擎异常上报（包括 kill 进程等软件故障），检测到故障后自动通过 REST API 发送缩容指令（可选） |
+| `ft_vllm_serve_qwen.sh` | 启动支持弹性容错功能的 vLLM 服务，模型Qwen3-30B-A3-W8A8 |
+| `scale_down_demo.py` | 模拟外部故障管理中心，内置两条检测路径：1）DCMI 轮询 NPU 硬件状态，检测卡掉线、HBM UCE 等硬件故障；2）ZMQ 订阅引擎健康状态，接收引擎异常上报（包括 kill 进程等软件故障），检测到故障后自动通过 REST API 发送缩容指令（可选） |
 
-**serve_qwen.sh 参数：**
+**ft_vllm_serve_qwen.sh 参数：**
 
 > 详见 [SPEC.md §5.1.3](SPEC.md#513-serve_qwensh-脚本参数)。
 
-**scale_down.py 参数：**
+**scale_down_demo.py 参数：**
 
 > 详见 [SPEC.md §5.1.4](SPEC.md#514-scale_downpy-脚本参数)。
 
@@ -90,14 +90,14 @@ pip install -e .
 **步骤 1：启动支持容错的 vLLM 服务**
 
 ```bash
-bash examples/fault_tolerance_scale/serve_qwen.sh \
+bash examples/fault_tolerance_scale/ft_vllm_serve_qwen.sh \
     --dp-size 4 --redundant-experts 48 --fault-port 22867 --recovery-timeout 120 --port 8006
 ```
 
 **步骤 2：启动外部故障管理中心demo(可选)**
 不启动demo时，vLLM内的容错框架仍会拦截异常，并等待容错命令，用户也可以通过REST API手动发送'retry(重试)'或'scale_down(缩容)'
 ```bash
-python examples/fault_tolerance_scale/scale_down.py \
+python examples/fault_tolerance_scale/scale_down_demo.py \
     --npu-ids 0,1,2,3 --interval-time 3 \
     --external-fault-notify-port 22867 --port 8006
 ```
@@ -125,7 +125,7 @@ python examples/fault_tolerance_scale/scale_down.py \
 **步骤 1：启动支持容错的 vLLM 服务**
 
 ```bash
-bash examples/fault_tolerance_scale/serve_qwen.sh \
+bash examples/fault_tolerance_scale/ft_vllm_serve_qwen.sh \
     --dp-size 4 --redundant-experts 48 --fault-port 22867 --recovery-timeout 120 --port 8006
 ```
 
