@@ -82,7 +82,7 @@
 
 | 序号 | 任务 | 说明 |
 |------|------|------|
-| 2.1 | 外部故障管理中心 | scale_down.py 双路径故障检测（DCMI硬件轮询 + ZMQ引擎健康订阅）+ 下发容错命令（缩容） |
+| 2.1 | 外部故障管理中心 | scale_down_demo.py 双路径故障检测（DCMI硬件轮询 + ZMQ引擎健康订阅）+ 下发容错命令（缩容） |
 | 2.2 | W8A8 量化适配 | ModelSlim 格式 W8A8 量化模型适配 |
 | 2.3 | MTP 适配 | 多 Token 预测适配 |
 | 2.4 | Phase 2 完整测试 | 更新测试报告 |
@@ -101,7 +101,7 @@ pytest tests/v1/fault_tolerance/
 
 1. 提交代码前执行 `pytest tests/v1/fault_tolerance/`，确保所有单元测试通过
 2. 每次变更后更新 `test_report.md`，记录单元测试与端到端测试结果
-3. 端到端测试在 NPU 物理机上执行，使用 `serve_qwen.sh` 部署后注入故障验证
+3. 端到端测试在 NPU 物理机上执行，使用 `ft_vllm_serve_qwen.sh` 部署后注入故障验证
 
 ### 4.3 测试覆盖范围
 
@@ -132,7 +132,7 @@ pytest tests/v1/fault_tolerance/
 | `internal_fault_report_port` | `22866` | 引擎向 ClientSentinel 报告故障的端口（内部 ZMQ） |
 | `external_fault_notify_port` | `22867` | ClientSentinel 发布故障通知的端口（外部 ZMQ PUB） |
 
-#### 5.1.3 serve_qwen.sh 脚本参数
+#### 5.1.3 ft_vllm_serve_qwen.sh 脚本参数
 
 | 参数 | 默认值 | 描述 |
 |------|--------|------|
@@ -146,7 +146,7 @@ pytest tests/v1/fault_tolerance/
 | `--recovery-timeout` | `120` | 引擎恢复超时时间（秒），故障暂停后等待重试/缩容指令的最长时间，超时则抛异常退出 |
 | `--gloo-timeout-seconds` | `30` | DP 域 Gloo CPU 通信组超时（秒）。故障 rank 同步阻塞时健康 rank 会等待此超时，需小于 `--recovery-timeout` 以避免容错指令超时 |
 
-#### 5.1.4 scale_down.py 脚本参数
+#### 5.1.4 scale_down_demo.py 脚本参数
 
 | 参数 | 默认值 | 描述 |
 |------|--------|------|
