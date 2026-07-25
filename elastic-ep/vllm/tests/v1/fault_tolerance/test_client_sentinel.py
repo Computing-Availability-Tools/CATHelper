@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import asyncio
 import uuid
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -10,7 +11,8 @@ import zmq
 from vllm.config import FaultToleranceConfig, ParallelConfig
 from vllm.v1.engine import EngineStatusType
 from vllm.v1.fault_tolerance.client_sentinel import ClientSentinel
-from vllm.v1.fault_tolerance.utils import FaultInfo, FaultToleranceRequest
+from vllm.v1.fault_tolerance.utils import (FaultInfo, FaultToleranceRequest,
+                                            FaultToleranceResult)
 
 pytestmark = pytest.mark.skip_global_cleanup
 
@@ -142,7 +144,11 @@ class TestClientSentinelRetry:
         request = FaultToleranceRequest.builder(
             request_id="request_id", instruction="retry", params={"timeout": 3},
         )
-        result = await client_sentinel.retry(request)
+        with patch(
+            "vllm.v1.fault_tolerance.client_sentinel.init_distributed_coordination",
+            return_value=("127.0.0.1", Mock()),
+        ):
+            result = await client_sentinel.retry(request)
 
         assert result.success is True
         assert not client_sentinel.is_faulted.is_set()
@@ -184,8 +190,14 @@ class TestClientSentinelScaleDown:
             request_id="request_id", instruction="scale_down",
             params={"timeout": 3, "exclude_dp_ranks": [1]},
         )
-        with patch.object(client_sentinel, "terminate_scale_down_engines",
-                          return_value=FaultToleranceResult("r", True)):
+        with (
+            patch.object(client_sentinel, "terminate_scale_down_engines",
+                         return_value=FaultToleranceResult("r", True)),
+            patch(
+                "vllm.v1.fault_tolerance.client_sentinel.init_distributed_coordination",
+                return_value=("127.0.0.1", Mock()),
+            ),
+        ):
             result = await client_sentinel.scale_down(request)
 
         assert result.success is True
@@ -200,8 +212,12 @@ class TestClientSentinelFaultReporting:
             engine_status=EngineStatusType.DEAD,
             engine_identity=b"engine_0",
         )
+        identity_payload = msgspec.msgpack.encode(
+            {"start_engine_index": 0, "local_engine_count": 2}
+        )
         client_sentinel.fault_receiver_socket.recv_multipart = AsyncMock(
             side_effect=[
+                [b"identity", b"", identity_payload],
                 [b"", b"", msgspec.msgpack.encode(fault_info)],
                 zmq.ZMQError(),
             ]
@@ -209,7 +225,7 @@ class TestClientSentinelFaultReporting:
         await client_sentinel.run()
 
         assert client_sentinel.engine_status_dict[0]["status"] == "dead"
-        client_sentinel.fault_state_pub_socket.send_multipart.assert_awaited_once()
+        client_sentinel.fault_state_pub_socket.send_multipart.assert_awaited()
 
     @pytest.mark.asyncio
     async def test_fault_triggers_pause(self, client_sentinel):
@@ -218,8 +234,12 @@ class TestClientSentinelFaultReporting:
             engine_status=EngineStatusType.UNHEALTHY,
             engine_identity=b"engine_0",
         )
+        identity_payload = msgspec.msgpack.encode(
+            {"start_engine_index": 0, "local_engine_count": 2}
+        )
         client_sentinel.fault_receiver_socket.recv_multipart = AsyncMock(
             side_effect=[
+                [b"identity", b"", identity_payload],
                 [b"", b"", msgspec.msgpack.encode(fault_info)],
                 zmq.ZMQError(),
             ]

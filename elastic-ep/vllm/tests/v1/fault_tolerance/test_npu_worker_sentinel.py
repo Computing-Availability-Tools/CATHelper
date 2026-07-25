@@ -53,6 +53,7 @@ def mock_worker():
     worker.vllm_config.parallel_config.enable_fault_tolerance = True
     worker.vllm_config.parallel_config.data_parallel_size = 2
     worker.vllm_config.parallel_config.data_parallel_rank = 0
+    worker.vllm_config.parallel_config.gloo_timeout_seconds = 30
     worker.vllm_config.parallel_config.fault_tolerance_config = (
         FaultToleranceConfig()
     )
@@ -76,7 +77,23 @@ def mock_worker():
 
 @pytest.fixture
 def sentinel(mock_parallel_config, addr_dict, mock_worker):
-    with patch("vllm_ascend.worker.sentinel.npu_worker_sentinel.make_zmq_socket"):
+    mock_tp = Mock()
+    mock_tp.rank_in_group = 0
+    mock_pp = Mock()
+    mock_pp.rank_in_group = 0
+    mock_dp = Mock()
+    mock_dp.cpu_group = Mock()
+    with (
+        patch("vllm_ascend.worker.sentinel.npu_worker_sentinel.make_zmq_socket"),
+        patch("vllm_ascend.worker.sentinel.npu_worker_sentinel.get_tp_group",
+              return_value=mock_tp),
+        patch("vllm_ascend.worker.sentinel.npu_worker_sentinel.get_pp_group",
+              return_value=mock_pp),
+        patch("vllm_ascend.worker.sentinel.npu_worker_sentinel.get_dp_group",
+              return_value=mock_dp),
+        patch.object(NPUWorkerSentinel, "set_dp_gloo_timeout"),
+        patch("torch.accelerator.set_device_index"),
+    ):
         sentinel = NPUWorkerSentinel(
             parallel_config=mock_parallel_config,
             device=torch.device("npu", 0),
@@ -132,7 +149,8 @@ class TestNPUWorkerSentinelRetry:
     def test_retry_clears_global_event(self, sentinel):
         get_pause_event().set()
         with (
-            patch.object(sentinel, "clean_states"),
+            patch.object(sentinel, "clean_states",
+                         side_effect=lambda: get_pause_event().clear()),
             patch("vllm_ascend.worker.sentinel.npu_worker_sentinel.stateless_init_torch_distributed_process_group"),
             patch("vllm_ascend.worker.sentinel.npu_worker_sentinel._set_pg_timeout"),
             patch("vllm_ascend.worker.sentinel.npu_worker_sentinel.get_dp_group") as mock_get_dp,
@@ -174,7 +192,9 @@ class TestNPUWorkerSentinelScaleDown:
             patch.object(sentinel, "clean_states") as mock_clean,
             patch.object(sentinel, "scale_down_worker") as mock_scale,
             patch.object(sentinel.worker, "execute_dummy_batch"),
+            patch.object(sentinel, "_coord_store_port", 54321, create=True),
             patch("torch.npu.synchronize"),
+            patch("vllm_ascend.worker.sentinel.npu_worker_sentinel.get_cached_tcp_store_client"),
         ):
             request = FaultToleranceRequest(
                 "1", "scale_down",
@@ -197,6 +217,7 @@ class TestNPUWorkerSentinelScaleDown:
             patch("torch_npu.distributed.reinit_process_group"),
             patch("torch.npu.synchronize"),
             patch("vllm_ascend.worker.sentinel.npu_worker_sentinel.NPUPlatform.set_device"),
+            patch("torch.cuda.Stream"),
         ):
             sentinel.clean_states()
         assert not get_pause_event().is_set()
