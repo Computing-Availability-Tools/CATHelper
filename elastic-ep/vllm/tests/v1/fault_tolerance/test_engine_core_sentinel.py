@@ -13,7 +13,8 @@ from vllm.config import FaultToleranceConfig, ParallelConfig, VllmConfig
 from vllm.v1.engine import EngineCoreRequestType, EngineStatusType
 from vllm.v1.engine.exceptions import EngineLoopPausedError
 from vllm.v1.fault_tolerance import EngineCoreSentinel
-from vllm.v1.fault_tolerance.utils import FaultInfo, FaultToleranceRequest
+from vllm.v1.fault_tolerance.utils import (FaultInfo, FaultToleranceRequest,
+                                            FaultToleranceResult)
 
 pytestmark = pytest.mark.skip_global_cleanup
 
@@ -44,6 +45,7 @@ def mock_parallel_config():
     config.pipeline_parallel_size = 1
     config.local_engines_only = False
     config.gloo_timeout_seconds = 5
+    config.data_parallel_master_port = 12345
     config.fault_tolerance_config = FaultToleranceConfig(engine_recovery_timeout_sec=60)
     return config
 
@@ -51,6 +53,8 @@ def mock_parallel_config():
 def make_sentinel(parallel_config, addr_dict, sentinel_identity=b"engine_sentinel_0"):
     input_queue = queue.Queue()
     engine_core = Mock()
+    engine_core.vllm_config = Mock(spec=VllmConfig)
+    engine_core.vllm_config.parallel_config = parallel_config
     return EngineCoreSentinel(
         parallel_config,
         engine_index=0,
@@ -58,7 +62,7 @@ def make_sentinel(parallel_config, addr_dict, sentinel_identity=b"engine_sentine
         engine_fault_socket_addr=addr_dict["engine_fault_socket_addr"],
         sentinel_identity=sentinel_identity,
         worker_cmd_addr=addr_dict["worker_cmd_addr"],
-        engine_core=engine_core,
+        engine=engine_core,
     )
 
 
@@ -176,7 +180,7 @@ class TestEngineCoreSentinelRetry:
         sentinel = make_sentinel(mock_parallel_config, addr_dict)
         sentinel.busy_loop_paused.set()
         with patch.object(sentinel, "_execute_command_on_workers",
-                          return_value=FaultToleranceRequest("r", "retry", {"timeout": 5})):
+                          return_value=FaultToleranceResult("r", True)):
             request = FaultToleranceRequest(
                 "1", "retry", {"timeout": 5, "coord_store_port": 54321},
             )
@@ -259,7 +263,9 @@ class TestEngineCoreSentinelScaleDown:
                 "coord_store_port": 54321,
             },
         )
-        result = sentinel.scale_down(request)
+        with patch.object(sentinel, "_execute_command_on_workers",
+                          return_value=FaultToleranceResult("1", False)):
+            result = sentinel.scale_down(request)
         assert result.success is False
         sentinel.shutdown()
 
