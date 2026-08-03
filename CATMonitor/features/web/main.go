@@ -51,7 +51,7 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 	go func() {
-		logger.Info("web server starting (snapshot read-only consumer)", "addr", bound, "snapshot_dir", *dir, "catmonitor_config", *configPath)
+		logger.Info("web server starting (snapshot read-only consumer)", "addr", bound, "snapshot_dir", *dir, "config_path", *configPath)
 		if err := httpServer.Serve(ln); err != nil && err != http.ErrServerClosed {
 			logger.Error("http server error", "error", err)
 			cancel()
