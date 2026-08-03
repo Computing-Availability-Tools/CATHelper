@@ -49,6 +49,10 @@ func main() {
 		runCollect()
 	case "health":
 		runHealth()
+	case "stress":
+		if code := runStress(os.Args[2:]); code != 0 {
+			os.Exit(code)
+		}
 	case "list":
 		runList()
 	case "version":
@@ -68,6 +72,7 @@ Commands:
   daemon       Start daemon process (default)
   collect      Collect metrics once and print
   health       Run health check and print report
+  stress       Run an explicit stress benchmark job
   list         List all registered collectors
   version      Show version information
 
