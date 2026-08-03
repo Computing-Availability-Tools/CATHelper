@@ -17,6 +17,7 @@ CATMonitor 是 CAT (Computing Availability Tools) 系列软件之一，用于采
 
 - **多部件采集**：CPU / 内存 / 硬盘 / GPU / NPU / 网卡 / 机箱 共 7 个部件，**204 个指标**（详见 [指标清单](docs/CATMonitor_indi_list.md)）
 - **健康度评估**：基于采集指标自动计算 0-100 健康分，自动检测 GPU/NPU 切换权重方案
+- **可靠性压测**：Linux 上显式运行 STREAM / HPL / HPCG；CLI 与本机 Web 共享作业、报告和互斥锁，不直接修改健康总分
 - **Snapshot 统一生产**：daemon 作为唯一 snapshot 生产者，产出 per-component `snapshot_<comp>.json` + 全局 `snapshot.json`（health/collectors/intervals/system_specs）；只读特性（web/dfee）消费快照而不再各自采集，避免重复跑硬件
 - **Web 仪表盘**：独立 `catmonitor-web` 二进制，**只读消费** daemon 产出的 snapshot，可视化单机健康度与各部件指标，默认端口 9527
 - **能效监控（dfee）**：独立 `catmonitor-dfee` 二进制，**只读消费** snapshot 渲染能效指标实时图表 SPA（卡片拖拽缩放、多选下拉筛选、模块折叠），默认端口 9528
@@ -59,12 +60,13 @@ cp configs/catmonitor.yaml /etc/catmonitor/catmonitor.yaml
 catmonitor daemon
 
 # 启动只读消费者（消费 daemon 产出的 snapshot，不自行采集）
-catmonitor-web -addr :9527 -snapshot-dir /var/lib/catmonitor/snapshot
+catmonitor-web -addr 127.0.0.1:9527 -snapshot-dir /var/lib/catmonitor/snapshot
 catmonitor-dfee -addr :9528 -snapshot-dir /var/lib/catmonitor/snapshot
 
 # 单次采集 / 健康检查 / 采集器列表
 catmonitor collect -o table
 catmonitor health -o table
+catmonitor stress run --bench stream -c /etc/catmonitor/catmonitor.yaml -o table
 catmonitor list
 ```
 
@@ -96,6 +98,7 @@ catmonitor list
 | [docs/CATMonitor_indi_list.md](docs/CATMonitor_indi_list.md) | 采集指标清单（204 项） |
 | [docs/test_report.md](docs/test_report.md) | 测试报告（无 NPU/GPU 系统测试） |
 | [features/health/HEALTH_SPEC.md](features/health/HEALTH_SPEC.md) | 健康度评估规格 |
+| [features/stress/README.md](features/stress/README.md) | 可靠性压测入口、规格、设计与部署验收文档 |
 | [features/web/Web_SPEC.md](features/web/Web_SPEC.md) | Web 仪表盘规格 |
 | [features/dfee/dfee_SPEC.md](features/dfee/dfee_SPEC.md) | 能效监控模块规格 |
 | [features/exporter/exporter_SPEC.md](features/exporter/exporter_SPEC.md) | Prometheus 导出模块规格 |
@@ -114,6 +117,7 @@ CATMonitor/
 │   ├── config/ platform/ storage/   # 配置 / 平台适配 / 数据存储(JSONL)
 ├── features/                # 特性层
 │   ├── health/              #   健康度评估
+│   ├── stress/              #   STREAM/HPL/HPCG 可靠性压测
 │   ├── snapshot/            #   Snapshot 统一生产（PerCompWriter + GlobalWriter + 原子写/只读读）
 │   ├── web/                 #   Web 仪表盘（catmonitor-web，只读消费 snapshot）
 │   ├── dfee/                #   能效监控（catmonitor-dfee 独立二进制，package main，只读消费 snapshot）
