@@ -3,7 +3,7 @@
 ## 1. 组件边界
 
 ```text
-catmonitor stress ─────────────────┐
+catmonitor ─> stress/cli.Run ──────┐
                                   ├─> stress.Manager ─> benchmark_check.sh
 catmonitor-web ─> stress.Register ┘          │
        │                           describe ──┤  (只读 profile / preflight)
@@ -16,6 +16,10 @@ catmonitor-web ─> stress.Register ┘          │
 及嵌入式 SPA。`features/web` 保持 daemon snapshot 的只读消费者，只额外创建
 Manager 并调用 `stress.Register`；它不恢复进程内采集、Web YAML 或配置写回。
 `stress` 不 import `health`、`web` 或 daemon；daemon 也不读取或执行 stress。
+
+命令行适配位于 `features/stress/cli` 子包，负责参数、默认配置路径和 stdout/stderr
+格式；`cmd/catmonitor/main.go` 只分发顶层 `stress` 命令。子包可以依赖
+`internal/config` 与父级 `stress`，避免让父级领域包反向依赖主配置而形成循环依赖。
 
 ## 2. 配置所有权
 

@@ -19,6 +19,7 @@ import (
 	"github.com/Computing-Availability-Tools/CATMonitor/features/health"
 	"github.com/Computing-Availability-Tools/CATMonitor/features/snapshot"
 	"github.com/Computing-Availability-Tools/CATMonitor/features/stragglerout"
+	stresscli "github.com/Computing-Availability-Tools/CATMonitor/features/stress/cli"
 	"github.com/Computing-Availability-Tools/CATMonitor/internal/collector"
 	"github.com/Computing-Availability-Tools/CATMonitor/internal/config"
 	"github.com/Computing-Availability-Tools/CATMonitor/internal/metrics"
@@ -50,7 +51,7 @@ func main() {
 	case "health":
 		runHealth()
 	case "stress":
-		if code := runStress(os.Args[2:]); code != 0 {
+		if code := stresscli.Run(os.Args[2:], setupLogger(), os.Stdout, os.Stderr); code != 0 {
 			os.Exit(code)
 		}
 	case "list":

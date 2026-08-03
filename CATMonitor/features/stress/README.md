@@ -2,6 +2,7 @@
 
 `features/stress` 是与 `health`、`dfee` 同级的独立特性。它只在用户显式请求后
 运行 STREAM、HPL 或 HPCG，不进入 daemon 周期，也不直接修改健康总分。
+CLI 参数解析与结果展示位于 `features/stress/cli` 子包，主程序只挂载 `stress` 命令。
 
 ```bash
 catmonitor stress -o table

@@ -25,6 +25,7 @@ catmonitor stress -o table
 成功或帮助返回 0，参数错误返回 2，
 配置、资产、执行或结果错误返回 1。`-o json` 回显完整报告，`-o table`
 将状态映射为 `OK` 等表格标签并把各数值拆成独立行。
+命令行适配实现位于 `features/stress/cli`；`cmd/catmonitor` 只负责顶层命令分发。
 
 唯一领域配置位于 CATMonitor 主配置顶层：
 

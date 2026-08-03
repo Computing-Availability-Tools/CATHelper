@@ -1,4 +1,5 @@
-package main
+// Package cli implements the catmonitor stress command adapter.
+package cli
 
 import (
 	"encoding/json"
@@ -6,8 +7,8 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log/slog"
 	"math"
-	"os"
 	"sort"
 	"strings"
 	"text/tabwriter"
@@ -18,47 +19,48 @@ import (
 	"github.com/Computing-Availability-Tools/CATMonitor/internal/platform"
 )
 
-func runStress(args []string) int {
-	if stressHelpRequested(args) {
-		printStressUsage()
+// Run parses and executes the top-level catmonitor stress command.
+func Run(args []string, logger *slog.Logger, stdout, stderr io.Writer) int {
+	if helpRequested(args) {
+		printUsage(stdout)
 		return 0
 	}
 
-	configPath, names, output, err := parseStressArgs(args)
+	configPath, names, output, err := parseArgs(args)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "stress:", err)
+		fmt.Fprintln(stderr, "stress:", err)
 		return 2
 	}
 	cfg, err := config.Load(configPath)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "stress: load config:", err)
+		fmt.Fprintln(stderr, "stress: load config:", err)
 		return 1
 	}
 
-	manager := stress.NewManagerWithLogger(cfg.Stress, setupLogger())
+	manager := stress.NewManagerWithLogger(cfg.Stress, logger)
 	report, err := manager.StartWithOptions(names, stress.RunOptions{Initiator: stress.InitiatorCLI})
 	if err != nil {
 		if errors.Is(err, stress.ErrBusy) && report.JobID != "" {
-			fmt.Fprintf(os.Stderr, "stress: %v (job_id=%s initiator=%s)\n", err, report.JobID, report.Initiator)
+			fmt.Fprintf(stderr, "stress: %v (job_id=%s initiator=%s)\n", err, report.JobID, report.Initiator)
 			return 1
 		}
-		fmt.Fprintln(os.Stderr, "stress:", err)
+		fmt.Fprintln(stderr, "stress:", err)
 		return 1
 	}
 	for report.Status == stress.StatusRunning {
 		time.Sleep(200 * time.Millisecond)
 		report, err = manager.Job(report.JobID)
 		if err != nil {
-			fmt.Fprintln(os.Stderr, "stress:", err)
+			fmt.Fprintln(stderr, "stress:", err)
 			return 1
 		}
 	}
 
 	if output == "table" {
-		printStressTable(report)
+		printTable(stdout, report)
 	} else {
 		data, _ := json.MarshalIndent(report, "", "  ")
-		fmt.Println(string(data))
+		fmt.Fprintln(stdout, string(data))
 	}
 	if report.Status != stress.StatusHealthy {
 		return 1
@@ -66,7 +68,7 @@ func runStress(args []string) int {
 	return 0
 }
 
-func stressHelpRequested(args []string) bool {
+func helpRequested(args []string) bool {
 	for _, arg := range args {
 		if arg == "-h" || arg == "--help" {
 			return true
@@ -75,8 +77,8 @@ func stressHelpRequested(args []string) bool {
 	return false
 }
 
-func printStressUsage() {
-	fmt.Println(`Usage:
+func printUsage(output io.Writer) {
+	fmt.Fprintln(output, `Usage:
   catmonitor stress [--bench hpl,hpcg,stream] [-c config.yaml] [-o json|table]
 
 Run explicitly enabled Linux stress benchmarks.
@@ -90,7 +92,7 @@ Options:
   -h, --help        Show this help`)
 }
 
-func parseStressArgs(args []string) (string, []string, string, error) {
+func parseArgs(args []string) (string, []string, string, error) {
 	fs := flag.NewFlagSet("stress", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	configPath := platform.ConfigPath()
@@ -125,9 +127,9 @@ func parseStressArgs(args []string) (string, []string, string, error) {
 	return configPath, names, output, nil
 }
 
-func printStressTable(report stress.Report) {
-	fmt.Printf("\nCATMonitor Stress Report  %s\n", report.HealthCondition)
-	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+func printTable(output io.Writer, report stress.Report) {
+	fmt.Fprintf(output, "\nCATMonitor Stress Report  %s\n", report.HealthCondition)
+	w := tabwriter.NewWriter(output, 0, 0, 2, ' ', 0)
 	fmt.Fprintln(w, "Benchmark\tStatus\tDuration\tMetric\tValue\tMessage")
 	for _, result := range report.Benchmarks {
 		keys := make([]string, 0, len(result.Values))
@@ -137,25 +139,25 @@ func printStressTable(report stress.Report) {
 		sort.Strings(keys)
 		if len(keys) == 0 {
 			fmt.Fprintf(w, "%s\t%s\t%s\t-\t-\t%s\n",
-				result.Name, stressStatusLabel(result.Status), formatStressDuration(result.DurationMS), result.Message)
+				result.Name, statusLabel(result.Status), formatDuration(result.DurationMS), result.Message)
 			continue
 		}
 		for i, key := range keys {
 			name, status, duration, message := "", "", "", ""
 			if i == 0 {
 				name = result.Name
-				status = stressStatusLabel(result.Status)
-				duration = formatStressDuration(result.DurationMS)
+				status = statusLabel(result.Status)
+				duration = formatDuration(result.DurationMS)
 				message = result.Message
 			}
 			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n",
-				name, status, duration, key, formatStressValue(result.Values[key]), message)
+				name, status, duration, key, formatValue(result.Values[key]), message)
 		}
 	}
 	_ = w.Flush()
 }
 
-func stressStatusLabel(status stress.Status) string {
+func statusLabel(status stress.Status) string {
 	switch status {
 	case stress.StatusHealthy:
 		return "OK"
@@ -168,11 +170,11 @@ func stressStatusLabel(status stress.Status) string {
 	}
 }
 
-func formatStressDuration(milliseconds int64) string {
+func formatDuration(milliseconds int64) string {
 	return (time.Duration(milliseconds) * time.Millisecond).String()
 }
 
-func formatStressValue(value float64) string {
+func formatValue(value float64) string {
 	if math.Trunc(value) == value {
 		return fmt.Sprintf("%.0f", value)
 	}

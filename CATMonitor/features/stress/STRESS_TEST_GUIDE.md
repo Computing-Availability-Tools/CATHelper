@@ -33,10 +33,10 @@
 
 ```bash
 bash -n features/stress/benchmark_check.sh
-gofmt -w features/stress
-go test ./features/stress ./features/web ./cmd/catmonitor ./internal/config
-go test -race ./features/stress ./features/web
-go vet ./features/stress ./features/web ./cmd/catmonitor ./internal/config
+gofmt -w features/stress features/stress/cli
+go test ./features/stress/... ./features/web ./cmd/catmonitor ./internal/config
+go test -race ./features/stress/... ./features/web
+go vet ./features/stress/... ./features/web ./cmd/catmonitor ./internal/config
 ```
 
 按目标架构验证构建：

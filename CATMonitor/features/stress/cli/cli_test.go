@@ -1,4 +1,4 @@
-package main
+package cli
 
 import (
 	"reflect"
@@ -7,8 +7,8 @@ import (
 	"github.com/Computing-Availability-Tools/CATMonitor/features/stress"
 )
 
-func TestParseStressArgs(t *testing.T) {
-	path, names, output, err := parseStressArgs([]string{
+func TestParseArgs(t *testing.T) {
+	path, names, output, err := parseArgs([]string{
 		"--bench", "stream,hpcg", "-c", "test.yaml", "-o", "table",
 	})
 	if err != nil {
@@ -19,21 +19,21 @@ func TestParseStressArgs(t *testing.T) {
 	}
 }
 
-func TestParseStressArgsRejectsInvalidInput(t *testing.T) {
+func TestParseArgsRejectsInvalidInput(t *testing.T) {
 	for _, args := range [][]string{
 		{"--bench", "stream,", "-o", "json"},
 		{"--bench", "stream", "-o", "yaml"},
 		{"run"},
 		{"unexpected"},
 	} {
-		if _, _, _, err := parseStressArgs(args); err == nil {
+		if _, _, _, err := parseArgs(args); err == nil {
 			t.Fatalf("args %v unexpectedly accepted", args)
 		}
 	}
 }
 
-func TestParseStressArgsUsesDefaults(t *testing.T) {
-	path, names, output, err := parseStressArgs(nil)
+func TestParseArgsUsesDefaults(t *testing.T) {
+	path, names, output, err := parseArgs(nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -42,17 +42,17 @@ func TestParseStressArgsUsesDefaults(t *testing.T) {
 	}
 }
 
-func TestStressStatusAndValueFormatting(t *testing.T) {
-	if got := stressStatusLabel(stress.StatusHealthy); got != "OK" {
+func TestStatusAndValueFormatting(t *testing.T) {
+	if got := statusLabel(stress.StatusHealthy); got != "OK" {
 		t.Fatalf("healthy label=%q", got)
 	}
-	if got := stressStatusLabel(stress.StatusTimeLimitReached); got != "OK (time limit)" {
+	if got := statusLabel(stress.StatusTimeLimitReached); got != "OK (time limit)" {
 		t.Fatalf("time-limit label=%q", got)
 	}
-	if got := formatStressValue(12); got != "12" {
+	if got := formatValue(12); got != "12" {
 		t.Fatalf("integer value=%q", got)
 	}
-	if got := formatStressValue(12.345); got != "12.35" {
+	if got := formatValue(12.345); got != "12.35" {
 		t.Fatalf("decimal value=%q", got)
 	}
 }
