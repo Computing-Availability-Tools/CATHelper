@@ -66,7 +66,7 @@ catmonitor-dfee -addr :9528 -snapshot-dir /var/lib/catmonitor/snapshot
 # 单次采集 / 健康检查 / 采集器列表
 catmonitor collect -o table
 catmonitor health -o table
-catmonitor stress run --bench stream -c /etc/catmonitor/catmonitor.yaml -o table
+catmonitor stress -o table
 catmonitor list
 ```
 

@@ -18,10 +18,11 @@
 规范命令为：
 
 ```bash
-catmonitor stress run --bench hpl,hpcg,stream -c config.yaml -o table
+catmonitor stress -o table
 ```
 
-空参数和 `--help` 只显示帮助，不启动默认作业。成功或帮助返回 0，参数错误返回 2，
+无参数时从主配置读取 `default_benchmarks` 并启动作业；`--help` 只显示帮助。
+成功或帮助返回 0，参数错误返回 2，
 配置、资产、执行或结果错误返回 1。`-o json` 回显完整报告，`-o table`
 将状态映射为 `OK` 等表格标签并把各数值拆成独立行。
 
@@ -44,8 +45,9 @@ stress:
 ```
 
 `enabled` 控制整个特性；`web_enabled` 仅授权 Web 发起高负载作业，CLI 不依赖
-它。新版只读 Web 进程默认从平台路径加载同一份 CATMonitor 主配置；查找顺序为
-显式 `-config`、`CATMONITOR_CONFIG` 环境变量、平台默认路径。Web
+它。CLI 与新版只读 Web 都从平台路径加载同一份 CATMonitor 主配置；显式覆盖项
+分别为 CLI 的 `-c/--config` 和 Web 的 `-config`，未指定时依次读取
+`CATMONITOR_CONFIG` 环境变量与平台默认路径。Web
 不复制 `stress:`，也不恢复已经移除的 Web 专用 YAML 配置。
 
 YAML 不接收 benchmark 可执行路径。具体执行器、环境变量、MPI/NUMA 参数和

@@ -3,7 +3,7 @@
 ## 1. 组件边界
 
 ```text
-catmonitor stress run ─────────────┐
+catmonitor stress ─────────────────┐
                                   ├─> stress.Manager ─> benchmark_check.sh
 catmonitor-web ─> stress.Register ┘          │
        │                           describe ──┤  (只读 profile / preflight)
@@ -106,4 +106,4 @@ Content-Type、自定义动作头、同源校验、64 KiB 请求上限、未知�
 MPI 实现负责。
 
 stress 在进入主干前没有发布旧的 health 子命令或 API，因此只提供
-`catmonitor stress run`、`/stress/` 和 `/api/stress/*`，不保留未发布预览接口。
+`catmonitor stress`、`/stress/` 和 `/api/stress/*`，不保留未发布预览接口。

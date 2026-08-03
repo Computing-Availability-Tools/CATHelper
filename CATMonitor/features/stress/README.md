@@ -4,9 +4,7 @@
 运行 STREAM、HPL 或 HPCG，不进入 daemon 周期，也不直接修改健康总分。
 
 ```bash
-catmonitor stress run --bench stream \
-  -c /etc/catmonitor/catmonitor.yaml \
-  -o table
+catmonitor stress -o table
 ```
 
 Web 入口为 `http://127.0.0.1:9527/stress/`。它拥有自己的嵌入式 SPA 和

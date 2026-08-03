@@ -19,17 +19,12 @@ import (
 )
 
 func runStress(args []string) int {
-	if len(args) == 0 || stressHelpRequested(args) {
+	if stressHelpRequested(args) {
 		printStressUsage()
 		return 0
 	}
-	if args[0] != "run" {
-		fmt.Fprintf(os.Stderr, "stress: unknown subcommand %q\n", args[0])
-		printStressUsage()
-		return 2
-	}
 
-	configPath, names, output, err := parseStressRunArgs(args[1:])
+	configPath, names, output, err := parseStressArgs(args)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "stress:", err)
 		return 2
@@ -82,9 +77,11 @@ func stressHelpRequested(args []string) bool {
 
 func printStressUsage() {
 	fmt.Println(`Usage:
-  catmonitor stress run [--bench hpl,hpcg,stream] [-c config.yaml] [-o json|table]
+  catmonitor stress [--bench hpl,hpcg,stream] [-c config.yaml] [-o json|table]
 
 Run explicitly enabled Linux stress benchmarks.
+Without --bench, run default_benchmarks from the CATMonitor configuration.
+Without --config, load CATMONITOR_CONFIG or the platform default path.
 
 Options:
   -b, --bench       Comma-separated benchmark names
@@ -93,8 +90,8 @@ Options:
   -h, --help        Show this help`)
 }
 
-func parseStressRunArgs(args []string) (string, []string, string, error) {
-	fs := flag.NewFlagSet("stress run", flag.ContinueOnError)
+func parseStressArgs(args []string) (string, []string, string, error) {
+	fs := flag.NewFlagSet("stress", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	configPath := platform.ConfigPath()
 	benchmarks := ""

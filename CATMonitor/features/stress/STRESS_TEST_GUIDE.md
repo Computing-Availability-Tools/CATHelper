@@ -6,7 +6,7 @@
 
 当前正式接口：
 
-- CLI：`catmonitor stress run`
+- CLI：`catmonitor stress`
 - Web：`/stress/`
 - API：`/api/stress/*`
 - 配置：CATMonitor 主配置顶层 `stress:`
@@ -106,7 +106,7 @@ GOTOOLCHAIN=local GOPROXY=off GOSUMDB=off \
   -o "$BUILD_DIR/catmonitor-web" ./features/web
 
 "$BUILD_DIR/catmonitor" version
-"$BUILD_DIR/catmonitor" stress run --help
+"$BUILD_DIR/catmonitor" stress --help
 ```
 
 如果 `go mod verify` 因未缓存的非构建依赖失败，最终以两个 `GOPROXY=off go build`
@@ -331,14 +331,11 @@ done
 ```bash
 cd "$CAT_ROOT"
 
-./bin/catmonitor stress run --bench stream \
-  -c /etc/catmonitor/catmonitor.yaml -o table
+./bin/catmonitor stress --bench stream -o table
 
-./bin/catmonitor stress run --bench hpcg \
-  -c /etc/catmonitor/catmonitor.yaml -o table
+./bin/catmonitor stress --bench hpcg -o table
 
-./bin/catmonitor stress run --bench hpl \
-  -c /etc/catmonitor/catmonitor.yaml -o table
+./bin/catmonitor stress --bench hpl -o table
 ```
 
 需要机器可读输出时使用 `-o json`。表格中的成功状态显示为 `OK`，JSON 使用稳定

@@ -185,7 +185,7 @@ Flags:
 | 常驻采集 + Prometheus | `catmonitor daemon` |
 | 一次性巡检（指标） | `catmonitor collect -o table` |
 | 一次性健康体检 | `catmonitor health` |
-| Linux 可靠性压测 | `catmonitor stress run --bench stream -c /etc/catmonitor/catmonitor.yaml -o table` |
+| Linux 可靠性压测 | `catmonitor stress -o table` |
 | 查看采集器清单 | `catmonitor list` |
 | 查看版本 | `catmonitor version` |
 | Web 仪表盘 | `catmonitor-web`（独立二进制，见 §4） |
@@ -256,9 +256,9 @@ Server Type:    accelerated
 ### 3.5 stress — 可靠性压测
 
 ```bash
-catmonitor stress run --help
-catmonitor stress run --bench stream \
-  -c /etc/catmonitor/catmonitor.yaml -o table
+catmonitor stress --help
+catmonitor stress -o table                  # 运行 YAML 的 default_benchmarks
+catmonitor stress --bench stream -o table   # 覆盖本次运行项目
 ```
 
 stress 只在用户显式请求时运行。主配置只定义功能开关、共享报告、项目和最大
