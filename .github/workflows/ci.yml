@@ -1,0 +1,59 @@
+name: CI Pipeline Gate
+
+on:
+  push:
+    branches: [main, 'feature/**', 'fix/**']
+  pull_request:
+    branches: [main, 'feature/**', 'fix/**']
+
+jobs:
+  catmonitor:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23.x'
+          cache-dependency-path: CATMonitor/go.sum
+      - name: Build
+        run: go build ./...
+        working-directory: CATMonitor
+      - name: Vet
+        run: go vet ./...
+        working-directory: CATMonitor
+      - name: Test
+        run: go test ./...
+        working-directory: CATMonitor
+
+  straggler:
+    runs-on: ubuntu-latest
+    env:
+      CGO_ENABLED: '0'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23.x'
+          cache-dependency-path: feature/straggler/go.sum
+      - name: Build
+        run: go build ./...
+        working-directory: feature/straggler
+      - name: Vet
+        run: go vet ./...
+        working-directory: feature/straggler
+      - name: Test
+        run: go test ./...
+        working-directory: feature/straggler
+
+  elastic-ep-demo:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: pip install requests
+      - name: Run unit tests
+        run: python -m unittest discover -s . -p 'test_*.py' -v
+        working-directory: feature/elastic-ep/examples/fault_tolerance_scale

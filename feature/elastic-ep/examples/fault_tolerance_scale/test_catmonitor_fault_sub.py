@@ -64,14 +64,18 @@ class TestEventHandler(unittest.TestCase):
         npu_to_dp = build_npu_to_dp([0, 1, 2, 3])
         return CatMonitorFaultSubscriber(cfg, npu_to_dp)
 
-    def test_card_drop_triggers_pause_then_scale(self):
+    def test_card_drop_triggers_scale_down_after_pause(self):
         sub = self._make_subscriber()
-        with mock.patch.object(sub, "_vllm_apply", return_value=True) as apply:
+        with (
+            mock.patch.object(sub, "_vllm_apply", return_value=True) as apply,
+            mock.patch.object(sub, "_wait_for_pause", return_value=True) as wait_pause,
+        ):
             sub._handle_event(
                 {"type": "card_drop", "npu_id": "2", "recovered": False}
             )
+            wait_pause.assert_called_once_with([2])
             instructions = [c.args[0] for c in apply.call_args_list]
-            self.assertEqual(instructions, ["pause", "scale_down"])
+            self.assertEqual(instructions, ["scale_down"])
 
     def test_unknown_npu_skipped(self):
         sub = self._make_subscriber()
@@ -92,15 +96,18 @@ class TestEventHandler(unittest.TestCase):
 
     def test_duplicate_persistent_fault_skipped(self):
         sub = self._make_subscriber()
-        with mock.patch.object(sub, "_vllm_apply", return_value=True) as apply:
+        with (
+            mock.patch.object(sub, "_vllm_apply", return_value=True) as apply,
+            mock.patch.object(sub, "_wait_for_pause", return_value=True),
+        ):
             sub._handle_event(
                 {"type": "card_drop", "npu_id": "3", "recovered": False}
             )
             sub._handle_event(
                 {"type": "card_drop", "npu_id": "3", "recovered": False}
             )
-            # First event does pause+scale (2 calls); duplicate adds 0.
-            self.assertEqual(apply.call_count, 2)
+            # First event does wait_for_pause+scale_down (1 call); duplicate adds 0.
+            self.assertEqual(apply.call_count, 1)
 
 
 class TestWebhookRoundTrip(unittest.TestCase):
@@ -115,6 +122,23 @@ class TestWebhookRoundTrip(unittest.TestCase):
         class _VLLMHandler(BaseHTTPRequestHandler):
             def log_message(self, fmt, *args):
                 pass
+
+            def do_GET(self):
+                # _wait_for_pause() polls /fault_tolerance/status; report all
+                # DP ranks paused so the flow proceeds to scale_down.
+                body = json.dumps(
+                    {"dp_ranks": [
+                        {"id": 0, "status": "paused"},
+                        {"id": 1, "status": "paused"},
+                        {"id": 2, "status": "paused"},
+                        {"id": 3, "status": "paused"},
+                    ]}
+                ).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
 
             def do_POST(self):
                 length = int(self.headers.get("Content-Length", 0))
@@ -178,10 +202,9 @@ class TestWebhookRoundTrip(unittest.TestCase):
                 timeout=5,
             )
             time.sleep(0.3)
-            # vLLM should have received pause then scale_down.
+            # vLLM should have received scale_down after pause completes.
             instructions = [c["instruction"] for c in self.vllm_calls]
-            self.assertIn("pause", instructions)
-            self.assertIn("scale_down", instructions)
+            self.assertEqual(instructions, ["scale_down"])
             # The scale_down payload should exclude DP rank 2 (NPU 2 -> rank 2).
             scale_call = next(c for c in self.vllm_calls if c["instruction"] == "scale_down")
             self.assertEqual(scale_call["params"]["exclude_dp_ranks"], [2])
