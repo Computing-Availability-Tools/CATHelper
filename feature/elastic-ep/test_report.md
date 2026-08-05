@@ -163,9 +163,9 @@
 
 | 测试 | 结果 |
 |------|:----:|
-| `test_catmonitor_fault_sub.py`（10 用例） | PASS |
+| `test_catmonitor_fault_sub.py`（38 用例） | PASS |
 
-覆盖：NPU→DP 映射、故障类型/NPU ID 解析、card_drop→pause+scale_down、recovery→retry、未知 NPU 跳过、持续故障去重、**端到端 webhook 往返**（mock CATMonitor POST → 订阅器 → mock vLLM 收到 pause+scale_down 且 exclude_dp_ranks 正确）。
+覆盖：NPU→DP 映射（含 A3 双卡 DIE）、故障类型/NPU ID 解析、card_drop→pause+scale_down、recovery→retry、未知 NPU 跳过、持续故障去重、**端到端 webhook 往返**（mock CATMonitor POST → 订阅器 → mock vLLM 收到 pause+scale_down 且 exclude_dp_ranks 正确）、**_wait_for_pause 真实 status 结构（空 engines 轮询、unhealthy 满足、空闲 healthy 触发一次手动 pause、非 healthy 不触发）**、**动态映射（方案 A：缩容成功后剔除故障 DIE 卡并重排 rank、失败保持映射、已剔除 DIE 事件与 recovered 跳过、连续两次缩容重排）**、**并发防重（同一 DIE 不同故障类型并发只缩容一次；不同 DIE 并行不受影响）**、**recovered 与缩容互斥（缩容进行中到达的 recovered 事件被忽略、不发 stale retry，缩容成功后 `_on_scale_down_success` 才清 `_active_faults` 并剔除 DIE）**。
 
 运行：`cd examples/fault_tolerance_scale && python3 -m unittest test_catmonitor_fault_sub -v`。
 

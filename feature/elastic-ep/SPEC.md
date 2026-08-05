@@ -150,7 +150,10 @@ pytest tests/v1/fault_tolerance/
 
 | 参数 | 默认值 | 描述 |
 |------|--------|------|
-| `--npu-ids` | `0-15` | 参与推理的 NPU 设备 ID 列表（`0-15` 范围或 `0,1,5` 列表），仅用于 NPU→DP rank 映射（不再用于 DCMI 轮询） |
+| `--npu-ids` | 自动推导 | CATMonitor/DIE 设备 ID（A3 为 `0-7`，8 个 DIE），订阅这些 DIE 的故障事件；缺省时由 `--visible-devices` 与 `--npu-per-die` 推导。**注意：这是 DIE 编号，不是物理卡编号** |
+| `--npu-per-die` | `2` | 每个 DIE 承载的物理卡数（A3=2，DIE `d` 承载物理卡 `d*npu-per-die` ~ `d*npu-per-die+npu-per-die-1`，如 DIE 5 = 卡 10,11） |
+| `--visible-devices` | `0-15` | vLLM 可见的物理卡 ID（对应 `ASCEND_RT_VISIBLE_DEVICES`，按 DP rank 顺序）；DP rank `r` 绑定 `visible_devices[r]` |
+| `--dp-size` | `len(--visible-devices)` | vLLM 数据并行大小（DP rank 数量），须 ≤ 可见卡数；默认用全部可见卡 |
 | `--external-fault-notify-port` | `22867` | 订阅引擎健康状态的 ZMQ SUB 端口（需与 vLLM 的 `--fault-port` 一致） |
 | `--port` | `8006` | vLLM API 端口，用于发送暂停/缩容指令 |
 | `--host` | `localhost` | vLLM API 主机地址 |
@@ -161,8 +164,15 @@ pytest tests/v1/fault_tolerance/
 | `--callback-port` | `9102` | 本地 webhook 监听端口（接收 CATMonitor 故障推送） |
 | `--advertise-url` | `http://localhost:9102/fault_event` | 注册给 CATMonitor 的回调 URL（跨机填 `http://<可达IP>:9102/fault_event`） |
 | `--fault-types` | `card_drop,npu_error_code,hbm_uce,roce_link_down` | 订阅的 CATMonitor 故障类型（逗号分隔） |
+| `--ignore-error-codes` | `0x80f38003` | 视为良性的 DCMI 错误码（逗号分隔，hex 不区分大小写）；`npu_error_code` 事件的错误码**全部**命中此列表时才忽略不缩容，含任一非良性码仍触发缩容（默认码为业务中止后的 bus error，不影响 vLLM） |
 | `--debounce-ms` | `0` | 订阅级去抖窗口（毫秒） |
 | `--min-severity` | `warning` | 最低订阅严重级别（warning/critical） |
+
+> **A3 编号体系说明：** CATMonitor 事件的 `npu_id` 是 DCMI **DIE** 编号（8 个，`0-7`），而 vLLM DP rank 按**物理卡**编号（16 张，`0-15`，`ASCEND_RT_VISIBLE_DEVICES` 下标）。脚本据此把每个故障 DIE 映射到其全部物理卡对应的 DP rank 列表（`--npu-per-die=2` 时 DIE 5 → rank 10,11），缩容时一并排除；不在部署内的 DIE 事件直接跳过。
+
+> **动态映射（缩容后重排）：** vLLM 每次 `scale_down` 成功后会把剩余引擎按原顺序重排为连续 rank `0..N-1`，且不暴露引擎↔物理卡映射。管理器据此**动态维护部署映射**：缩容成功后从部署中剔除故障 DIE 的全部物理卡，按存活顺序重建 NPU→DP 映射；已被剔除 DIE 的后续事件（含 recovered）直接跳过，不再 scale_down/retry。该机制由 demo 传入 `--visible-devices`/`--dp-size`/`--npu-per-die`/`--npu-ids` 自动启用。
+
+> **并发防重与 recovered 互斥（同一 DIE）：** webhook 事件各自线程处理，去重仅按同类型匹配，因此对同一 DIE 实施"缩容进行中"互斥：已在该 DIE 缩容流程中时，后续非 recovered 事件（无论类型）直接跳过，避免第二轮针对已剔除 rank 的重复缩容；**recovered 事件同样受互斥保护**——空闲场景缩容窗口较长，此间到达的 `recovered=true` 若 pop 掉 `_active_faults` 会发出指向被剔除引擎的 stale `retry`（vLLM 对不存在的引擎超时 → 500 并拖垮并行缩容），故缩容进行中到达的 recovered 直接忽略，`_active_faults` 只在缩容成功后清理。不同 DIE 仍可并行缩容。
 
 > 已移除 `--interval-time`（DCMI 轮询专用，不再需要）。
 

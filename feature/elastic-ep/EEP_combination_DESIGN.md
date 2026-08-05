@@ -711,9 +711,16 @@ GET /faultsub/events?since=2026-07-28T10:00:00Z&type=card_drop
 | FaultEvent.type | EEP 动作 | 说明 |
 |----------------|---------|------|
 | `card_drop` / `npu_health`(Critical) / `hbm_uce` / `ddr_uce` | pause → scale_down（exclude_dp_ranks） | 不可恢复硬件故障，缩容 |
-| `npu_error_code`（非卡掉线） | pause → 查 status → scale_down 或 retry | 视错误码严重程度 |
+| `npu_error_code`（错误码全部命中 `--ignore-error-codes`） | 忽略，不缩容 | 良性错误码（默认 `0x80f38003`，业务中止后的 bus error）不影响 vLLM |
+| `npu_error_code`（含任一非良性码） | pause → scale_down（exclude_dp_ranks） | 视为硬件故障，直接缩容（pause 由 vLLM 容错框架内部处理，缩容前等待其完成） |
 | `roce_link_down`（recovered=true） | retry | 网络闪断重推恢复 |
-| `roce_link_down`（持续） | pause → 等待/人工 | 链路未恢复不自动缩容 |
+| `roce_link_down`（持续） | 仅记录，不缩容 | 链路未恢复不自动缩容；不发送 pause 指令 |
+
+> **DIE→DP rank 映射（A3 关键修正）：** CATMonitor 事件的 `npu_id` 是 **DIE** 编号（A3 为 `0-7`），vLLM 的 DP rank 按**物理卡**编号（`0-15`，对应 `ASCEND_RT_VISIBLE_DEVICES` 下标）。故障 DIE 会映射为其承载的全部物理卡的 DP rank 列表（`--npu-per-die=2` 时 DIE 5 → 卡 10,11 → rank 10,11），`scale_down`/`retry` 一次性排除全部相关 rank；物理卡不在部署内的 DIE（事件 `npu_id` 无 rank 映射）直接跳过。
+>
+> **动态映射（方案 A，缩容后重排）：** vLLM 每次 `scale_down` 成功后按原顺序把剩余引擎重排为连续 rank `0..N-1`（patch `get_mapping`/`update_config`），且不暴露引擎↔物理卡映射，静态映射在重排后会过期指向错误 rank。EEP 侧因此动态维护部署拓扑：缩容成功后从存活物理卡列表剔除故障 DIE 的全部卡，按存活顺序重建 `npu_to_dp`；已剔除 DIE 的后续事件（含 recovered）映射为空、直接跳过，不再触发 scale_down/retry。
+>
+> **并发防重（同一 DIE）：** `ThreadingHTTPServer` 每个 webhook 事件独立线程处理，而故障去重只按**同类型**匹配——同一 DIE 的不同故障类型（如非良性 `npu_error_code` 后紧接 `card_drop`）并发到达时，会各自启动一轮 `_wait_for_pause`+`scale_down`，后一轮会针对第一轮已剔除的 rank 再次缩容（vLLM 对不存在的引擎等响应超时 → 500）。EEP 侧按 NPU 加"缩容进行中"互斥：同一 DIE 已在缩容流程中时，后续事件（无论类型）直接跳过；不同 DIE 仍可并行缩容。**recovered 同样受互斥保护**：空闲场景缩容窗口较长（手动 pause），`recovered=true` 事件若此时到达并 pop 掉 `_active_faults`，会发出指向被剔除引擎的 stale `retry`（vLLM 对不存在的引擎超时 → 500，拖垮并行缩容）；因此缩容进行中到达的 recovered 直接忽略，`_active_faults` 只在缩容成功后由 `_on_scale_down_success` 清理。
 
 ---
 

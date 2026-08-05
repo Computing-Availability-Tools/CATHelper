@@ -84,7 +84,7 @@ pip install -e .
 
 > **前置依赖（新增）：** 故障管理中心需依赖 **CATMonitor daemon**（启用 `faultsub` 特性）提供 NPU 故障事件。先构建并启动 CATMonitor：
 > ```bash
-> cd CATHelper/CATMonitor && make build          # 需 NPU 环境加 -tags dcmi
+> cd CATHelper/CATMonitor && GOFLAGS=-tags=dcmi make build   # NPU 环境需加 dcmi 构建标签
 > export PATH=$PATH:./bin
 > mkdir -p /etc/catmonitor/
 > cp configs/catmonitor.yaml /etc/catmonitor/catmonitor.yaml
@@ -110,11 +110,12 @@ bash examples/fault_tolerance_scale/ft_vllm_serve_qwen.sh \
 不启动demo时，vLLM内的容错框架仍会拦截异常，并等待容错命令，用户也可以通过REST API手动发送'retry(重试)'或'scale_down(缩容)'
 ```bash
 python examples/fault_tolerance_scale/scale_down_demo.py \
-    --npu-ids 0,1,2,3 \
+    --dp-size 4 \
     --catmonitor-host localhost --catmonitor-rest-port 9101 \
     --callback-port 9102 --advertise-url http://localhost:9102/fault_event \
     --external-fault-notify-port 22867 --port 8006
 ```
+`--dp-size` 须与 vLLM 一致（默认取全部可见卡）；`--npu-ids` 缺省时按 `ASCEND_RT_VISIBLE_DEVICES`（默认 `0-15`）与 `--npu-per-die 2` 自动推导 A3 的 8 个 DIE。
 
 **步骤 3：发送推理请求**
 
@@ -128,8 +129,8 @@ python examples/fault_tolerance_scale/scale_down_demo.py \
 
 模拟的外部故障管理中心检测到故障后自动执行：
 1. CATMonitor 采集 NPU 指标并判定故障（卡掉线/HBM UCE/RoCE 链路等），经 HTTP webhook 推送 `FaultEvent` 给故障管理中心
-2. 故障管理中心映射 NPU→DP rank，通过查询容错状态确认暂停完成
-3. 发送缩容指令，移除故障 DP rank
+2. 故障管理中心把故障 DIE（如 DIE 5 = 物理卡 10,11）映射为对应 DP rank 列表（rank 10,11），通过查询容错状态确认暂停完成
+3. 发送缩容指令，一次性移除故障 DIE 的全部 DP rank
 4. 服务在剩余健康 NPU 上恢复，推理继续
 
 ---

@@ -10,8 +10,8 @@ This is the integration entry point. It runs two fault-detection paths:
       A ``CatMonitorFaultSubscriber`` subscribes to CATMonitor's fault
       subscription API. CATMonitor collects NPU health/error codes/ECC/roce
       link state and pushes ``FaultEvent`` JSON via HTTP webhook to this
-      process, which maps NPU id -> DP rank and issues ``pause``/``scale_down``
-      (or ``retry`` on recovery) to vLLM.
+      process, which maps the faulted DIE to its DP ranks and issues
+      ``scale_down`` (or ``retry`` on recovery) to vLLM.
 
   Path 2 (unchanged, EEP-internal boundary):
       ``start_monitor_engine_status`` subscribes via ZMQ SUB to vLLM's engine
@@ -24,6 +24,7 @@ Usage: see README.md §使用. The DCMI library is no longer required.
 
 import argparse
 import json
+import os
 import sys
 import threading
 import time
@@ -38,7 +39,7 @@ from catmonitor_fault_sub import (
     ALL_FAULT_TYPES,
     CatMonitorFaultSubscriber,
     FaultSubscriberConfig,
-    build_npu_to_dp,
+    build_npu_to_dp_ranks,
     parse_fault_types,
     parse_npu_ids,
 )
@@ -118,7 +119,9 @@ def wait_for_pause(host, port, exclude_dp_ranks, poll_interval=2, max_wait=120):
                 rank_status = rank.get("status", "")
                 if rank_id in exclude_dp_ranks:
                     continue
-                if rank_status not in ("paused", "dead"):
+                # vLLM's scale_down rejects only retained engines that are
+                # still "healthy"; paused/dead/unhealthy all satisfy it.
+                if rank_status not in ("paused", "dead", "unhealthy"):
                     all_paused = False
                     break
             if all_paused:
@@ -145,6 +148,26 @@ def start_monitor_engine_status(host, port, timeout, external_fault_notify_port)
                 scaled_down_ranks.update(new_ranks)
 
 
+def parse_error_codes(raw: str) -> List[str]:
+    """Parse a comma-separated DCMI error-code list into lowercase hex codes."""
+    return [c.strip().lower() for c in raw.split(",") if c.strip()]
+
+
+def default_visible_devices() -> List[int]:
+    """Visible physical NPU card IDs in DP-rank order, taken from
+    ``ASCEND_RT_VISIBLE_DEVICES`` when set (fall back to ``0-15`` on a
+    16-card A3)."""
+    raw = os.environ.get("ASCEND_RT_VISIBLE_DEVICES")
+    if raw:
+        try:
+            parsed = parse_npu_ids(raw)
+            if parsed:
+                return parsed
+        except ValueError:
+            pass
+    return list(range(16))
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="External fault manager for vLLM Elastic-EP fault tolerance "
@@ -167,8 +190,31 @@ def main():
     parser.add_argument(
         "--npu-ids",
         type=parse_npu_ids,
-        default=list(range(16)),
-        help="NPU device IDs participating in inference (for NPU->DP mapping)",
+        default=None,
+        help="CATMonitor/DIE device IDs to subscribe for fault events "
+             "(A3: 0-7 for 8 DIE). Default: derived from --visible-devices",
+    )
+    parser.add_argument(
+        "--npu-per-die",
+        type=int,
+        default=2,
+        help="Physical NPU cards per DIE (A3: 2; DIE d hosts physical cards "
+             "d*npu-per-die .. d*npu-per-die+npu-per-die-1)",
+    )
+    parser.add_argument(
+        "--visible-devices",
+        type=parse_npu_ids,
+        default=default_visible_devices(),
+        help="Physical NPU card IDs visible to vLLM "
+             "(ASCEND_RT_VISIBLE_DEVICES, used when set), in DP-rank order "
+             "(default: 0-15 on a 16-card A3)",
+    )
+    parser.add_argument(
+        "--dp-size",
+        type=int,
+        default=None,
+        help="vLLM data-parallel size (number of DP ranks; must be <= "
+             "len(visible-devices)). Default: len(visible-devices)",
     )
     # CATMonitor subscription (Path 1) arguments.
     parser.add_argument(
@@ -203,6 +249,14 @@ def main():
         help="Comma-separated CATMonitor fault types to subscribe to",
     )
     parser.add_argument(
+        "--ignore-error-codes",
+        type=parse_error_codes,
+        default=["0x80f38003"],
+        help="Comma-separated DCMI error codes to ignore; npu_error_code events "
+             "whose codes are ALL in this list are not scaled down "
+             "(default: 0x80f38003, a benign bus error after business abort)",
+    )
+    parser.add_argument(
         "--debounce-ms", type=int, default=0, help="Per-subscription debounce (ms)"
     )
     parser.add_argument(
@@ -213,10 +267,30 @@ def main():
     )
     args = parser.parse_args()
 
-    npu_to_dp = build_npu_to_dp(args.npu_ids)
+    dp_size = args.dp_size if args.dp_size is not None else len(args.visible_devices)
+    if dp_size < 1 or dp_size > len(args.visible_devices):
+        parser.error(
+            f"--dp-size {dp_size} out of range "
+            f"(visible devices: {len(args.visible_devices)})"
+        )
+
+    # CATMonitor reports faults per DIE (npu_id = DIE id, e.g. 0-7 on A3);
+    # vLLM ranks are per physical card. Map each DIE to the DP ranks of the
+    # physical cards it hosts so scale_down excludes the right ranks.
+    npu_ids = args.npu_ids
+    if npu_ids is None:
+        npu_ids = sorted(
+            {p // args.npu_per_die for p in args.visible_devices[:dp_size]}
+        )
+    npu_to_dp = build_npu_to_dp_ranks(
+        npu_ids, args.npu_per_die, args.visible_devices, dp_size
+    )
     print(
         f"NPU->DP mapping: {npu_to_dp} "
-        f"({len(args.npu_ids)} NPUs, fault types={args.fault_types})"
+        f"({len(npu_ids)} DIE subscribed, dp-size={dp_size}, "
+        f"visible-devices={args.visible_devices}, "
+        f"fault types={args.fault_types}, "
+        f"ignore-error-codes={args.ignore_error_codes})"
     )
 
     # Path 1: CATMonitor fault-event subscription.
@@ -229,12 +303,20 @@ def main():
         callback_port=args.callback_port,
         advertise_url=args.advertise_url,
         fault_types=args.fault_types,
-        npu_ids=args.npu_ids,
+        npu_ids=npu_ids,
         debounce_ms=args.debounce_ms,
         min_severity=args.min_severity,
         recovery_timeout=args.recovery_timeout,
+        ignore_error_codes=args.ignore_error_codes,
     )
-    subscriber = CatMonitorFaultSubscriber(cfg, npu_to_dp)
+    subscriber = CatMonitorFaultSubscriber(
+        cfg,
+        npu_to_dp,
+        visible_devices=list(args.visible_devices),
+        dp_size=dp_size,
+        npu_per_die=args.npu_per_die,
+        npu_ids=list(npu_ids),
+    )
     subscriber.start(block=False)
 
     # Path 2: vLLM engine-health ZMQ SUB (unchanged EEP-internal boundary).

@@ -94,7 +94,7 @@ vllm serve "$LOCAL_MODEL_PATH" \
     --gloo-timeout-seconds "$GLOO_TIMEOUT" \
     --enable-auto-tool-choice \
     --tool-call-parser hermes \
-    --additional-config '{"eplb_config":{"dynamic_eplb": true, "num_redundant_experts":'${REDUNDANT_EXPERTS}'}}' \
+    --additional-config '{"eplb_config":{"dynamic_eplb": false, "num_redundant_experts":'${REDUNDANT_EXPERTS}'}}' \
     --quantization ascend \
     --host "$HOST" \
     --port "$PORT" \
