@@ -135,6 +135,7 @@ const (
 	MethodDirect   DetectionMethod = "direct"   // direct comparison (e.g. freq)
 	MethodAbsolute DetectionMethod = "absolute" // > threshold → anomaly
 	MethodMAD      DetectionMethod = "mad"      // robust median/MAD Z-score
+	MethodCluster  DetectionMethod = "cluster"  // majority-mode clustering
 )
 
 // MetricMeta describes the detection parameters for a single metric.
@@ -149,13 +150,13 @@ type MetricMeta struct {
 
 // MetricMetaRegistry maps each metric to its meta-information.
 var MetricMetaRegistry = map[MetricName]MetricMeta{
-	MetricTemp:           {Name: MetricTemp, Category: CatCompute, Direction: DirHigh, SpaceMethod: MethodZScore, TimeMethod: MethodMAD},
-	MetricPower:          {Name: MetricPower, Category: CatCompute, Direction: DirHigh, SpaceMethod: MethodZScore, TimeMethod: MethodMAD},
+	MetricTemp:           {Name: MetricTemp, Category: CatCompute, Direction: DirHigh, SpaceMethod: MethodCluster, TimeMethod: MethodMAD},
+	MetricPower:          {Name: MetricPower, Category: CatCompute, Direction: DirHigh, SpaceMethod: MethodCluster, TimeMethod: MethodMAD},
 	MetricAICoreFreq:     {Name: MetricAICoreFreq, Category: CatCompute, Direction: DirLow, SpaceMethod: MethodDirect, TimeMethod: MethodMAD},
-	MetricAICoreUtil:     {Name: MetricAICoreUtil, Category: CatCompute, Direction: DirLow, SpaceMethod: MethodZScore, TimeMethod: MethodMAD},
-	MetricHBMBandwidthUtil:        {Name: MetricHBMBandwidthUtil, Category: CatCompute, Direction: DirLow, SpaceMethod: MethodZScore, TimeMethod: MethodMAD},
-	MetricHBMUtil:         {Name: MetricHBMUtil, Category: CatCompute, Direction: DirLow, SpaceMethod: MethodZScore, TimeMethod: MethodZScore},
-	MetricTXBandwidth:    {Name: MetricTXBandwidth, Category: CatCommunication, Direction: DirLow, SpaceMethod: MethodZScore, TimeMethod: MethodZScore},
+	MetricAICoreUtil:     {Name: MetricAICoreUtil, Category: CatCompute, Direction: DirLow, SpaceMethod: MethodCluster, TimeMethod: MethodMAD},
+	MetricHBMBandwidthUtil:        {Name: MetricHBMBandwidthUtil, Category: CatCompute, Direction: DirLow, SpaceMethod: MethodCluster, TimeMethod: MethodMAD},
+	MetricHBMUtil:         {Name: MetricHBMUtil, Category: CatCompute, Direction: DirLow, SpaceMethod: MethodCluster, TimeMethod: MethodZScore},
+	MetricTXBandwidth:    {Name: MetricTXBandwidth, Category: CatCommunication, Direction: DirLow, SpaceMethod: MethodCluster, TimeMethod: MethodZScore},
 	MetricRXPfcPkt:       {Name: MetricRXPfcPkt, Category: CatCommunication, Direction: DirHigh, SpaceMethod: MethodAbsolute, AbsThreshold: 0, TimeMethod: MethodZScore},
 	MetricRocETxErrPkt:   {Name: MetricRocETxErrPkt, Category: CatCommunication, Direction: DirHigh, SpaceMethod: MethodAbsolute, AbsThreshold: 0, TimeMethod: MethodZScore},
 	MetricRocEOutOfOrder: {Name: MetricRocEOutOfOrder, Category: CatCommunication, Direction: DirHigh, SpaceMethod: MethodAbsolute, AbsThreshold: 0, TimeMethod: MethodZScore},
@@ -334,6 +335,7 @@ type DetectionConfig struct {
 	SpaceMethod     DetectionMethod
 	SpaceZThreshold float64 // default 2.5
 	SpaceIQRMult    float64 // default 1.5
+	SpaceClusterK   float64 // cluster-method significance threshold, default 3.0
 
 	// Time dimension
 	TimeZThreshold float64 // default 2.0
@@ -368,6 +370,7 @@ func DefaultDetectionConfig() DetectionConfig {
 		SpaceMethod:     MethodZScore,
 		SpaceZThreshold: 2.5,
 		SpaceIQRMult:    1.5,
+		SpaceClusterK:   3.0,
 
 		TimeZThreshold: 2.0,
 

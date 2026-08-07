@@ -78,7 +78,7 @@ func runDetection(rawData *TimeSeriesData, source string, cfg DetectionConfig) (
 
 	// 5. Space detection.
 	fmt.Fprintf(os.Stderr, "[SLOWNODE ALGO] Step 5/9: Space (peer) detection...\n")
-	spaceResult := detectSpaceAnomalies(detectionRows, rawData.CardIDs, cfg)
+	spaceResult := detectSpaceAnomalies(detectionRows, baselines, rawData.CardIDs, cfg)
 	spaceDetails := aggregateSpaceScores(spaceResult, rawData.CardIDs, cfg)
 
 	// 6. Time detection.

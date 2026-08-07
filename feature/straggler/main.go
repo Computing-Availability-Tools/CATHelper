@@ -38,6 +38,7 @@ func main() {
 	baselineHours := 360.0
 	detectionHours := 1.0
 	degradation := 0.3
+	spaceClusterK := 0.0 // 0 = use the default SpaceClusterK (3.0)
 
 	for _, arg := range os.Args[1:] {
 		parts := strings.SplitN(arg, "=", 2)
@@ -75,6 +76,12 @@ func main() {
 			if parsed, err := strconv.ParseFloat(val, 64); err == nil && parsed > 0 {
 				detectionHours = parsed
 			}
+		case "--space-cluster-k":
+			if parsed, err := strconv.ParseFloat(val, 64); err == nil && parsed > 0 {
+				spaceClusterK = parsed
+			} else {
+				fmt.Fprintf(os.Stderr, "[SLOWNODE ALGO] WARNING: invalid --space-cluster-k value, using default\n")
+			}
 		}
 	}
 
@@ -93,6 +100,11 @@ func main() {
 		kpiCfg.DetectionHours = detectionHours
 		kpiCfg.SpaceZThreshold = 1 + degradation  // tie to degradation param
 		kpiCfg.TimeZThreshold = 1 + degradation*0.8
+		if spaceClusterK > 0 {
+			// Space cluster significance is an independent knob; only override
+			// the default (3.0) when --space-cluster-k is provided.
+			kpiCfg.SpaceClusterK = spaceClusterK
+		}
 
 		fmt.Fprintf(os.Stderr, "[SLOWNODE ALGO] === KPI Resource Detection ===\n")
 		var kpiResult *resource.DetectionResult
@@ -165,7 +177,7 @@ func main() {
 	// ─────────────────────────────────────────────────────────────────
 	if inputPath == "" {
 		if kpiCSVPath == "" && kpiJSONLDir == "" {
-			fmt.Fprintf(os.Stderr, "Usage: slowNodeDetection path=/your/data/dir [degradation=0.3] [--kpi-csv=/path/to/kpi.csv | --kpi-jsonl-dir=/dir] [--faultsub-url=http://host:9101]\n")
+			fmt.Fprintf(os.Stderr, "Usage: slowNodeDetection path=/your/data/dir [degradation=0.3] [--kpi-csv=/path/to/kpi.csv | --kpi-jsonl-dir=/dir] [--faultsub-url=http://host:9101] [--space-cluster-k=3.0]\n")
 			fmt.Fprintf(os.Stderr, "ERROR: Missing required parameter: path=/your/data/dir (or a KPI input)\n")
 			os.Exit(1)
 		}

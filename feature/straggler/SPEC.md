@@ -34,7 +34,7 @@
 ## CLI
 
 ```
-slowNodeDetection path=/data/dir [degradation=0.3] [--kpi-csv=/path/to/kpi.csv | --kpi-jsonl-dir=/dir] [--faultsub-url=http://host:9101] [--baseline-hours=360] [--detection-hours=1]
+slowNodeDetection path=/data/dir [degradation=0.3] [--kpi-csv=/path/to/kpi.csv | --kpi-jsonl-dir=/dir] [--faultsub-url=http://host:9101] [--baseline-hours=360] [--detection-hours=1] [--space-cluster-k=3.0]
 ```
 
 ### 参数
@@ -48,6 +48,7 @@ slowNodeDetection path=/data/dir [degradation=0.3] [--kpi-csv=/path/to/kpi.csv |
 | `--faultsub-url` | string | 否 | — | FaultSub 回调 URL，KPI 发现异常时回传检测结果 |
 | `--baseline-hours` | float64 | 否 | 360 | 基线窗口（小时） |
 | `--detection-hours` | float64 | 否 | 1 | 检测窗口（小时） |
+| `--space-cluster-k` | float64 | 否 | 3.0 | 空间多数簇显著性阈值 k（独立旋钮，不随 degradation 变化） |
 
 ### 阈值计算
 
@@ -172,15 +173,25 @@ CPU 取桶内最后一个值。
 
 `detectSpaceAnomalies()` 在检测窗口内逐时间点逐指标计算：
 
-**对每个时间点，取所有卡在该指标上的值作为 peer 组**，按 `SpaceMethod` 计算 Z-Score：
+**对每个时间点，取所有卡在该指标上的值作为 peer 组**，按 `SpaceMethod` 判定：
 
-| SpaceMethod | 适用指标 | 公式 | 异常判定 |
+| SpaceMethod | 适用指标 | 机制 | 异常判定 |
 |-------------|---------|------|---------|
-| `zscore` | temp/power/util/hbm_bandwidth_util/hbm_util/tx_bw | `|v_i − peer_mean| / peer_std` | mean Z > 2.5 |
-| `direct` | aicore_freq | 低于所有 peer 最低值 | sentinel 999 |
+| `cluster` | temp/power/util/hbm_bandwidth_util/hbm_util/tx_bw | 递归间隙分裂 → 最大簇均值为基线（多数即正常）→ **逐点**单侧 z | 卡被标记的 **mean_z > k**（k=3）|
+| `direct` | aicore_freq | 低于 peer 时钟上限 `FreqDownclockGap` | sentinel 999 |
 | `absolute` | 4× error counters | > 0 | sentinel 999 |
 
-`aggregateSpaceScores()` 汇总：zscore 方法取检测窗口均值，absolute/direct 方法取异常占比。
+**cluster（多数簇）机制**（逐时间点）：
+1. 递归二分：在最大间隙处切分，两侧都继续，直到子块内无显著间隙（`maxGap ≥ 跨度/2`）——切出完整的簇划分
+2. 基线簇 = 成员最多的簇（"谁多谁有理"）；成员数并列时取方向极值簇（DirHigh→最低簇，DirLow→最高簇）；**基线均值 = 多数簇的均值**
+3. **基线簇成员豁免**（它们是正常参照本身）；对每个**非基线簇成员**单侧判定（只查异常方向）：`z = |该卡值 − 基线均值| / scale[指标]`
+   - `scale[指标]` 从历史基线自我标定：各卡 `1.4826 × baseline.Mad` 的中位数
+   - `z > k`（`SpaceClusterK`，默认 3.0）→ 该卡标记
+4. 记录每卡每时间点的 z（被标记卡的 z，其余 0）
+
+> 逐点判定相对簇均值判定的优势：异常簇内每张卡按自己的偏离幅度单独评分（严重度精确到卡）。基线成员豁免保住"散布舰队不误报"：无主导间隙的舰队是单簇 → 全员在基线内 → 无人被评分，正常散布的边缘卡不会被误标。
+
+`aggregateSpaceScores()` 汇总：cluster 方法对每卡求 `mean_z`（= 占比 × 平均偏离幅度，持续与幅度互补），`mean_z > k` 判空间异常；absolute/direct 方法取异常占比。
 
 #### Step 6: 时间维度检测（Self Comparison）
 
@@ -271,13 +282,13 @@ Time异常    early_degradation  confirmed_anomaly
 
 | 指标名 | 分类 | 异常方向 | SpaceMethod | TimeMethod | 说明 |
 |--------|------|---------|-------------|------------|------|
-| `temp` | 计算 | ↑ 偏高 | zscore | **mad** | NPU 温度 (°C)，对称连续 |
-| `power` | 计算 | ↑ 偏高 | zscore | **mad** | NPU 功耗 (W)，对称连续 |
+| `temp` | 计算 | ↑ 偏高 | cluster | **mad** | NPU 温度 (°C)，对称连续 |
+| `power` | 计算 | ↑ 偏高 | cluster | **mad** | NPU 功耗 (W)，对称连续 |
 | `aicore_freq` | 计算 | ↓ 偏低 | direct | **mad** | AI Core 频率 (MHz)，单点/对称 |
-| `aicore_util` | 计算 | ↓ 偏低 | zscore | **mad** | AI Core 利用率 (%)，双峰（80%+ 工作态） |
-| `hbm_bandwidth_util` | 计算 | ↓ 偏低 | zscore | **mad** | HBM 带宽使用率 (%)，双峰 |
-| `hbm_util` | 计算 | ↓ 偏低 | zscore | zscore | HBM 内存使用率 (%)，仅跟踪不参与规则 |
-| `tx_bandwidth` | 通信 | ↓ 偏低 | zscore | zscore | TX 带宽，近似连续 |
+| `aicore_util` | 计算 | ↓ 偏低 | cluster | **mad** | AI Core 利用率 (%)，双峰（80%+ 工作态） |
+| `hbm_bandwidth_util` | 计算 | ↓ 偏低 | cluster | **mad** | HBM 带宽使用率 (%)，双峰 |
+| `hbm_util` | 计算 | ↓ 偏低 | cluster | zscore | HBM 内存使用率 (%)，仅跟踪不参与规则 |
+| `tx_bandwidth` | 通信 | ↓ 偏低 | cluster | zscore | TX 带宽，近似连续 |
 | `rx_pfc_pkt` | 通信 | ↑ 偏高 | absolute | zscore | PFC 暂停帧（累积计数器） |
 | `roce_tx_err_pkt` | 通信 | ↑ 偏高 | absolute | zscore | RoCE 发送错误包（累积计数器） |
 | `roce_out_of_order` | 通信 | ↑ 偏高 | absolute | zscore | RoCE 乱序包（累积计数器） |
@@ -305,7 +316,8 @@ TrimRatio:            0.25    // 裁剪比例（每端 25%，中间 50%）
 MinSamplesForTrim:    4       // 低于此样本数降级为普通均值
 BaselineHours:        360     // 基线窗口（可通过 CLI 覆盖）
 DetectionHours:       1       // 检测窗口（可通过 CLI 覆盖）
-SpaceZThreshold:      1 + degradation         // 空间 Z 阈值
+SpaceClusterK:        3.0                     // 空间多数簇显著性阈值 k（独立旋钮，--space-cluster-k 覆盖，默认 3.0）
+SpaceZThreshold:      1 + degradation         // 空间 Z 阈值（保留，zscore 备用）
 TimeZThreshold:       1 + degradation × 0.8   // 时间 Z 阈值
 TimeWeight:           0.6     // 融合时间权重 α
 SpaceWeight:          0.4     // 融合空间权重 β
