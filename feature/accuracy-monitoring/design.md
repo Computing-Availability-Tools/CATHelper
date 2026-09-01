@@ -225,6 +225,10 @@ N=4 → 注入 10、每 token 10 项；送检测截前 4 项，返回客户端 1
   原样转发给下游（spec §2.8）。
 - 选中 → 该请求完整走读 body→注入→恢复→检测链路。`monitor_rate=0` 永不注入不检测；
   `1.0` 全检测。
+- **运行时动态更新**：`monitor_rate` 启动期由 env 初始化为 `self._monitor_rate`，
+  运行时可通过 `POST /anomaly/config` 端点动态更新（见 §3.13）。采样判断读
+  `self._monitor_rate`（内存属性），非 `config.monitor_rate`（启动快照）。
+  重启回退 env 初始值。
 
 
 ### 3.6 请求关联标识
@@ -251,6 +255,7 @@ N=4 → 注入 10、每 token 10 项；送检测截前 4 项，返回客户端 1
 - `normal`(0) 只增 requests，不计 detected。
 - Content-Type：`text/plain; version=0.0.4; charset=utf-8`。
 - `model` 标签来自请求体 `model` 字段；缺失用 `"unknown"`。
+  - `vllm_anomaly_monitor_rate`（Gauge）：当前异常监控概率（运行时可更新）。
 
 ### 3.8 配置与路径解析
 
@@ -274,6 +279,8 @@ N=4 → 注入 10、每 token 10 项；送检测截前 4 项，返回客户端 1
 
 检测器配置路径固定为 `configs/detector.yaml`（项目根目录），不可通过 env 覆盖。
 文件不存在 → `resolve_config_path()` raise（启动期硬依赖，见 §3.9）。
+- `VLLM_ANOMALY_CONFIG_PATH`（默认 `/anomaly/config`）：配置端点路径，用于
+  运行时动态更新 `monitor_rate`。
 
 ### 3.9 降级机制
 
@@ -464,12 +471,29 @@ pickle 文件（dict，key=异常编号，value=异常信息）。环境变量 `
 `vllm_anomaly_last_timestamp_seconds{model}` 两个 Gauge，**不改动现有指标/标签**（webui
 collector 只解析已知指标，不受影响）。
 
+### 3.13 动态配置端点
+
+中间件在 `__call__` 内联拦截配置端点（同 metrics 端点模式，无 `app.add_api_route`）。
+路径由 `VLLM_ANOMALY_CONFIG_PATH` 配置（默认 `/anomaly/config`）。
+
+- **GET** `/anomaly/config`：返回当前 `{"monitor_rate": <float>}`。
+- **POST** `/anomaly/config`：接收 `{"monitor_rate": <float>}`，校验 ∈ [0.0, 1.0]，
+  更新 `self._monitor_rate` + `vllm_anomaly_monitor_rate` gauge，返回 `{"monitor_rate": <float>}`。
+  校验失败返回 400 + `{"error": <msg>}`，`_monitor_rate` 不变。
+- 其他 method → 透传。
+- `enabled=False` 时端点仍可达（同 metrics 端点）。
+- 无认证（同 metrics 端点，vLLM API 本身无认证层）。
+- 不持久化：重启回退 env 初始值。
+
 ## 4. 关键组件设计
 
 ### 4.1 AnomalyMiddleware（统一中间件类）
 
 **构造** `__init__(self, app)`：建 `PluginConfig`（`from_env`，env 变量非法 → raise
-终止服务启动）；attach 指标助手；建 `_pending_tasks` set。若 `enabled=True` 则**同步**
+终止服务启动）；attach 指标助手；建 `_pending_tasks` set。
+   `self._monitor_rate = self.config.monitor_rate`（运行时可变属性，初始值来自 env）；
+   `self.metrics.set_monitor_rate(self._monitor_rate)`（gauge 初始化）。
+若 `enabled=True` 则**同步**
 完成以下 eager 初始化步骤（任一步骤失败直接 raise 终止服务启动，见 §3.9）：
 
 1. `resolve_config_path()` → 检查 `configs/detector.yaml` 存在；不存在 raise（提示文件路径）。
@@ -487,8 +511,9 @@ collector 只解析已知指标，不受影响）。
 **`__call__(scope, receive, send)` 分派**：
 1. 非 http scope → 透传 `self.app`。
 2. `GET <metrics_path>` → 内联 `_serve_metrics`。
+2.5. `path == config_path`：GET → `_serve_config`；POST → `_handle_config_update`；其他 → 透传。
 3. 非 POST、非目标路径、或 `enabled=False` → 透传（不读 body）。
-4. 异常监控概率：`will_detect = random.random() < monitor_rate`；未选中 → 纯透传（不读 body、
+4. 异常监控概率：`will_detect = random.random() < _monitor_rate`；未选中 → 纯透传（不读 body、
    不注入、不恢复、不检测，见 §3.5）。
 5. 选中：`_read_all_body(receive)` 聚合 body → `json.loads`；非 dict/非 JSON →
    `_make_replay_receive(receive, raw, request_id)` 原样重放透传。

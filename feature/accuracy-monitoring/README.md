@@ -98,7 +98,26 @@ b) 当开启此功能时，可将异常详细信息保存到本地，便于后�
 | `text` | 推理输出文本 | 
 | `model_name` | 模型名称 |
 
+#### (3) VLLM_ANOMALY_MONITOR_RATE 详细介绍
+VLLM_ANOMALY_MONITOR_RATE 表示请求被异常监控的概率，取值范围在 0.0-1.0。有静态和动态两种配置方式。
 
+a) 静态配置
+
+在拉起服务时配置全局参数
+```
+export VLLM_ANOMALY_MONITOR_RATE=0.3  # 表示每个请求有 30% 的概率会被监控
+vllm serve <model> --middleware anomaly_middleware.AnomalyMiddleware
+```
+
+b) 动态配置
+
+当需要根据当前请求量和精度异常检出数量来动态配置 VLLM_ANOMALY_MONITOR_RATE 时，可以使用下述命令修改当前请求被异常监控的概率。
+```
+curl -X POST http://localhost:${port}/anomaly/config \
+  -H "Content-Type: application/json" \
+  -d '{"monitor_rate": 0.2}'
+```
+静态配置和董涛配置可结合使用。
 
 ## 4 检测算法阈值配置
 

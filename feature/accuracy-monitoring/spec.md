@@ -141,6 +141,8 @@
 - 监控概率 0.0 → 请求直接透传。
 - 监控概率 1.0 → 所有请求都做异常监控。
 - 监控概率 0.3  → 请求有 0.3 的概率会被修改请求内容，注入采集参数。有 0.7 的概率直接透传。
+- 运行时可通过 `POST /anomaly/config` 动态更新监控概率（见 §2.17）。
+  更新即时生效（下一请求即用新值），不持久化（重启回退 env 初始值）。
 
 ### 2.9 请求关联标识
 
@@ -161,6 +163,7 @@
 - `GET /anomaly/metrics` → HTTP 200，`Content-Type: text/plain; version=0.0.4; charset=utf-8`，
   body 为 Prometheus 文本暴露。
 - 下游无 `/anomaly/metrics` 路由 → 中间件上报不会报错，详细情况记录日志。
+- `vllm_anomaly_monitor_rate` Gauge：当前异常监控概率（运行时可更新）。
 
 ### 2.11 环境变量配置
 
@@ -174,6 +177,7 @@
 - 未设 `VLLM_ANOMALY_TOKENIZER_MODEL` → 自动从同进程 `sys.argv` 解析 `vllm serve` 命令行
   （`--tokenizer` → `--model` 位置参数），无需用户额外配置。
 - `VLLM_ANOMALY_DETECTOR_WORKERS` 非正整数 → 服务启动失败并报错。
+- `VLLM_ANOMALY_CONFIG_PATH`（默认 `/anomaly/config`）：动态配置端点路径。
 
 
 ### 2.12 检测器配置路径
@@ -298,6 +302,28 @@ pickle 文件（dict，key=异常编号，value=异常信息）。环境变量 `
 - 保存失败 → log，客户端响应/检测/后续请求不受影响。
 - 现有指标结构、webui 解析不受影响。
 
+### 2.17 动态配置端点
+
+中间件在可配置路径（`VLLM_ANOMALY_CONFIG_PATH`，默认 `/anomaly/config`）内联响应：
+
+- **GET**：返回当前 `{"monitor_rate": <float>}`。
+- **POST** `{"monitor_rate": <float>}`：校验 ∈ [0.0, 1.0]，更新运行时监控概率，
+  返回 `{"monitor_rate": <float>}`。校验失败返回 400 + `{"error": <msg>}`，
+  当前值不变。
+- 其他 method → 透传下游。
+- `enabled=False` 时端点仍可达。
+- 无认证（同 metrics 端点）。
+- 不持久化。
+
+**验收**
+- GET `/anomaly/config` → 200 + `{"monitor_rate": <当前值>}`。
+- POST `{"monitor_rate": 0.3}` → 200 + `{"monitor_rate": 0.3}`，下一请求按 0.3 采样。
+- POST `{"monitor_rate": 1.5}` → 400，当前值不变。
+- POST 非 JSON → 400，当前值不变。
+- `enabled=False` → GET 仍可达。
+- 重启 → 回退 env 初始值。
+- `GET /anomaly/metrics` 含 `vllm_anomaly_monitor_rate` gauge，反映当前值。
+
 ## 3. 输入输出契约
 
 ### 3.1 构造与调用
@@ -333,6 +359,8 @@ pickle 文件（dict，key=异常编号，value=异常信息）。环境变量 `
 ## 4. 行为约束与不变量
 
 1. **透明无条件**： `enabled=True` 和异常监控概率共同作用，决定请求是否注入、响应恢复和检测。
+   `monitor_rate` 为运行时可变（`POST /anomaly/config` 更新 `self._monitor_rate`），
+   其他配置仍为启动期不可变。
 2. **降级即透传**：`enabled=False`（master 开关 off）→ 不读 body、
    不注入、不拦截；指标端点独立可达。启动期检测器不可构造 → 报错终止启动（不进入透传降级）。
 3. **top_logprobs 跨请求恒定**：默认 20，可配 1-20，但运行期不可变。

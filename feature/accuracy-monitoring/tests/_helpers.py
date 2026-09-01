@@ -55,8 +55,15 @@ def build_chat_response(
     model: str,
     entries: List[Dict[str, Any]],
     n: int = 1,
+    reasoning_content: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """构造 chat 非流式响应（n 个 choice，每个相同 entries）。"""
+    """构造 chat 非流式响应（n 个 choice，每个相同 entries）。
+
+    reasoning_content：若提供，加入 message.reasoning_content（thinking model）。
+    """
+    msg: Dict[str, Any] = {"role": "assistant", "content": "x"}
+    if reasoning_content is not None:
+        msg["reasoning_content"] = reasoning_content
     return {
         "id": "chatcmpl-test",
         "object": "chat.completion",
@@ -64,7 +71,7 @@ def build_chat_response(
         "choices": [
             {
                 "index": i,
-                "message": {"role": "assistant", "content": "x"},
+                "message": dict(msg),
                 "logprobs": {"content": [dict(e) for e in entries]},
                 "finish_reason": "stop",
             }

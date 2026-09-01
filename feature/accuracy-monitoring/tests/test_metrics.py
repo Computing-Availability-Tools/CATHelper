@@ -102,3 +102,22 @@ def test_record_detection_does_not_raise_on_bad_input():
     m.record_detection("garbage", "m")  # 非法
     # 不抛异常即通过
     assert b"vllm_anomaly" in m.render_metrics()
+
+
+def test_monitor_rate_gauge_exists():
+    m = Metrics()
+    text = m.render_metrics().decode()
+    assert "vllm_anomaly_monitor_rate" in text
+
+
+def test_set_monitor_rate():
+    m = Metrics()
+    m.set_monitor_rate(0.3)
+    text = m.render_metrics().decode()
+    assert "vllm_anomaly_monitor_rate 0.3" in text
+
+
+def test_set_monitor_rate_default_zero():
+    m = Metrics()
+    text = m.render_metrics().decode()
+    assert "vllm_anomaly_monitor_rate 0.0" in text

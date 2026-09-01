@@ -38,6 +38,7 @@ class AnomalyEvent:
     model: str
     ill_type: str
     choice_index: str
+    source: str = "live"  # "live" | "imported"
 
 
 @dataclass

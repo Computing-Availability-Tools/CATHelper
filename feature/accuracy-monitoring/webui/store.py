@@ -43,6 +43,29 @@ class TrendPoint:
         return out
 
 
+@dataclass
+class TrendEvent:
+    """单个异常事件的趋势记录（阶梯点来源）。
+
+    source="live" 来自轮询增量；source="imported" 来自历史 pickle 导入。
+    """
+
+    ts: float
+    instance: str
+    model: str
+    ill_type: str
+    source: str = "live"
+
+
+@dataclass
+class ImportedSummary:
+    """单实例导入的异常计数快照（用于再次导入时回滚旧值）。"""
+
+    anomalies: int = 0
+    by_type: Dict[str, int] = field(default_factory=lambda: {t: 0 for t in ILL_TYPES})
+    by_model: Dict[str, int] = field(default_factory=dict)
+
+
 class TrendSeries:
     """单实例序列的原始点 + 分钟桶双层结构，按时间淘汰。"""
 
@@ -131,15 +154,11 @@ class Store:
         self.events = RingBuffer(cfg.event_capacity)
         self.alerts = RingBuffer(cfg.alert_capacity)
         self._trends: Dict[str, TrendSeries] = {}  # key=(instance, model)
+        self._trend_events: Deque[TrendEvent] = deque()  # 阶梯趋势事件（按时间裁剪）
+        self._imported: Dict[str, ImportedSummary] = {}  # 导入计数快照（回滚用）
         self._stats: Dict[str, InstanceStats] = {}
         self._next_event_id = 1
         self._next_alert_id = 1
-        # 全局累计聚合（跨实例）
-        self.requests_total = 0
-        self.anomalies_total = 0
-        self.errors_total = 0
-        self.by_type: Dict[str, int] = {t: 0 for t in ILL_TYPES}
-        self.by_model: Dict[str, int] = {}
         self.detection_duration: Optional[Dict[str, float]] = None
 
     # ------------------------------------------------------------------ #
@@ -195,7 +214,7 @@ class Store:
         st = self._stats_for(name)
         st.url = url
 
-    def record_delta(self, instance: str, delta) -> None:
+    def record_delta(self, instance: str, delta, now: Optional[float] = None) -> None:
         """按 DeltaSummary 更新实例统计、事件环形缓冲与全局聚合。"""
         st = self._stats_for(instance)
         st.requests += delta.requests
@@ -206,14 +225,13 @@ class Store:
             st.by_type[e.ill_type] += 1
             st.by_model[e.model] = st.by_model.get(e.model, 0) + 1
             st.last_event = (e.ill_type, e.ts)
+            # 同步追加到阶梯趋势事件（source=live）
+            self._trend_events.append(
+                TrendEvent(ts=e.ts, instance=instance, model=e.model,
+                           ill_type=e.ill_type, source="live")
+            )
+        self._prune_trend_events(now)
 
-        self.requests_total += delta.requests
-        self.errors_total += delta.errors
-        self.anomalies_total += delta.anomalies_total
-        for t, n in delta.by_type.items():
-            self.by_type[t] += n
-        for m, n in delta.by_model.items():
-            self.by_model[m] = self.by_model.get(m, 0) + n
         if delta.duration is not None:
             self.detection_duration = delta.duration
 
@@ -325,29 +343,164 @@ class Store:
         return [self._make_point(ts, v) for ts, v in sorted(agg.items())]
 
     # ------------------------------------------------------------------ #
+    # 阶梯趋势事件（异常事件级，供 /api/trends 阶梯图消费）
+    # ------------------------------------------------------------------ #
+    def _prune_trend_events(self, now: Optional[float] = None) -> None:
+        """按 trend_horizon_seconds 淘汰过旧的阶梯趋势事件。"""
+        now = now if now is not None else NOW()
+        cutoff = now - self.cfg.trend_horizon_seconds
+        while self._trend_events and self._trend_events[0].ts < cutoff:
+            self._trend_events.popleft()
+
+    def append_trend_events(
+        self, events: List["TrendEvent"], now: Optional[float] = None
+    ) -> None:
+        """批量追加阶梯趋势事件（导入用，source 应为 "imported"）。"""
+        for e in events:
+            self._trend_events.append(e)
+        self._prune_trend_events(now)
+
+    def clear_imported_trend_events(self, instance: str) -> int:
+        """删除指定实例的导入趋势事件（覆盖语义）；返回清除条数。"""
+        before = len(self._trend_events)
+        keep = deque(
+            (e for e in self._trend_events
+             if not (e.instance == instance and e.source == "imported")),
+            maxlen=None,
+        )
+        self._trend_events = keep
+        return before - len(self._trend_events)
+
+    def query_trend_events(
+        self,
+        window_seconds: int,
+        instance: Optional[str] = None,
+        now: Optional[float] = None,
+    ) -> List[Dict[str, Any]]:
+        """查询窗口内异常事件，按 ts 升序累计计数，返回阶梯点列表。
+
+        每点含 ts/cumulative/model/ill_type/instance/source。累计从 1 开始（窗口内从 0 增长）。
+        instance=None 表示所有实例（看板）；指定则过滤该实例（详情页）。
+        """
+        now = now if now is not None else NOW()
+        start = now - window_seconds
+        evs = [e for e in self._trend_events if e.ts >= start]
+        if instance is not None:
+            evs = [e for e in evs if e.instance == instance]
+        evs.sort(key=lambda e: e.ts)
+        points: List[Dict[str, Any]] = []
+        cum = 0
+        for e in evs:
+            cum += 1
+            points.append({
+                "ts": e.ts,
+                "cumulative": cum,
+                "model": e.model,
+                "ill_type": e.ill_type,
+                "instance": e.instance,
+                "source": e.source,
+            })
+        return points
+
+    # ------------------------------------------------------------------ #
+    # 历史导入：同步到事件/统计/趋势/全局 KPI（覆盖语义）
+    # ------------------------------------------------------------------ #
+    def apply_import(
+        self,
+        instance: str,
+        anomaly_events: List[AnomalyEvent],
+        trend_events: List["TrendEvent"],
+        now: Optional[float] = None,
+    ) -> int:
+        """将导入的异常事件应用到所有模块（事件列表、实例统计、趋势、全局 KPI）。
+
+        覆盖语义：先回滚该实例上一次导入的计数与事件，再追加新数据。
+        返回被覆盖清除的旧趋势事件条数。
+        """
+        # 1. 回滚上一次导入
+        old = self._imported.get(instance)
+        if old is not None:
+            st = self._stats.get(instance)
+            if st is not None:
+                st.anomalies = max(0, st.anomalies - old.anomalies)
+                for t, n in old.by_type.items():
+                    st.by_type[t] = max(0, st.by_type[t] - n)
+                for m, n in old.by_model.items():
+                    base = st.by_model.get(m, 0)
+                    if base <= n:
+                        st.by_model.pop(m, None)
+                    else:
+                        st.by_model[m] = base - n
+            # 移除旧导入事件
+            self.events.remove_where(
+                lambda e: e.instance == instance
+                and getattr(e, "source", "live") == "imported"
+            )
+
+        # 2. 清旧导入趋势事件
+        cleared = self.clear_imported_trend_events(instance)
+
+        # 3. 追加新事件到环形缓冲
+        for e in anomaly_events:
+            self.events.append(e)
+
+        # 4. 追加新趋势事件
+        self.append_trend_events(trend_events, now=now)
+
+        # 5. 更新实例统计与全局 KPI
+        st = self._stats_for(instance)
+        imp = ImportedSummary()
+        for e in anomaly_events:
+            st.anomalies += 1
+            st.by_type[e.ill_type] += 1
+            st.by_model[e.model] = st.by_model.get(e.model, 0) + 1
+            st.last_event = (e.ill_type, e.ts)
+            imp.anomalies += 1
+            imp.by_type[e.ill_type] += 1
+            imp.by_model[e.model] = imp.by_model.get(e.model, 0) + 1
+
+        self._imported[instance] = imp
+        return cleared
+
+    # ------------------------------------------------------------------ #
     # purge
     # ------------------------------------------------------------------ #
     def purge_instance(self, name: str) -> None:
-        """删除实例 → 清除该实例事件/告警/趋势/统计；不影响其它实例。"""
+        """删除实例 → 清除该实例事件/告警/趋势/统计/导入快照；不影响其它实例。"""
         self.events.remove_where(lambda e: e.instance == name)
         self.alerts.remove_where(lambda a: getattr(a, "instance", None) == name)
         for key in [k for k in self._trends if k[0] == name]:
             del self._trends[key]
+        self._trend_events = deque(
+            (e for e in self._trend_events if e.instance != name)
+        )
+        self._imported.pop(name, None)
         self._stats.pop(name, None)
 
     def summary(self) -> Dict[str, Any]:
-        online = sum(1 for st in self._stats.values() if st.state == "online")
-        offline = sum(1 for st in self._stats.values() if st.state == "offline")
-        paused = sum(1 for st in self._stats.values() if st.state == "paused")
-        rate = self.anomalies_total / self.requests_total if self.requests_total else 0.0
+        stats = list(self._stats.values())
+        requests = sum(st.requests for st in stats)
+        anomalies = sum(st.anomalies for st in stats)
+        errors = sum(st.errors for st in stats)
+        by_type: Dict[str, int] = {t: 0 for t in ILL_TYPES}
+        for st in stats:
+            for t, n in st.by_type.items():
+                by_type[t] += n
+        by_instance: Dict[str, int] = {
+            st.name: st.anomalies for st in stats if st.anomalies > 0
+        }
+        online = sum(1 for st in stats if st.state == "online")
+        offline = sum(1 for st in stats if st.state == "offline")
+        paused = sum(1 for st in stats if st.state == "paused")
+        rate = anomalies / requests if requests else 0.0
         return {
-            "requests": self.requests_total,
-            "anomalies": self.anomalies_total,
+            "requests": requests,
+            "anomalies": anomalies,
             "anomaly_rate": round(rate, 6),
-            "errors": self.errors_total,
-            "by_type": dict(self.by_type),
-            "by_model": dict(self.by_model),
-            "instances": {"total": len(self._stats), "online": online, "offline": offline, "paused": paused},
+            "errors": errors,
+            "by_type": by_type,
+            "by_instance": by_instance,
+            "instances": {"total": len(stats), "online": online, "offline": offline, "paused": paused},
             "detection_duration": self.detection_duration,
             "updated_at": NOW(),
         }

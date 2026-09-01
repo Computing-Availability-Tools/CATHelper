@@ -278,6 +278,61 @@ def extract_completions_response(
     return results
 
 
+def extract_chat_text_tokenids(data: Any) -> List[List[int]]:
+    """chat 非流式：从 choices[].logprobs.content[].token 提取实际生成 token_id 序列。
+
+    每个内容条目的 token 字段格式为 "token_id:NNN"（因注入 return_tokens_as_token_ids=true）。
+    parse_token_id 解析失败返回 -1（保留位置对齐，列表长度 = content[] 长度）。
+    必须在 strip_chat_response 之前调用（strip 会将 token 替换为解码文本）。
+    """
+    results: List[List[int]] = []
+    if not isinstance(data, dict):
+        return results
+    choices = data.get("choices")
+    if not isinstance(choices, list):
+        return results
+    for choice in choices:
+        if not isinstance(choice, dict):
+            continue
+        tokenids: List[int] = []
+        lp = choice.get("logprobs")
+        if isinstance(lp, dict):
+            content = lp.get("content")
+            if isinstance(content, list):
+                for entry in content:
+                    if isinstance(entry, dict):
+                        tokenids.append(parse_token_id(entry.get("token")))
+                    else:
+                        tokenids.append(-1)
+        results.append(tokenids)
+    return results
+
+
+def extract_completions_text_tokenids(data: Any) -> List[List[int]]:
+    """completions 非流式：从 choices[].logprobs.tokens[] 提取实际生成 token_id 序列。
+
+    必须在 strip_completions_response 之前调用。
+    """
+    results: List[List[int]] = []
+    if not isinstance(data, dict):
+        return results
+    choices = data.get("choices")
+    if not isinstance(choices, list):
+        return results
+    for choice in choices:
+        if not isinstance(choice, dict):
+            continue
+        tokenids: List[int] = []
+        lp = choice.get("logprobs")
+        if isinstance(lp, dict):
+            tokens = lp.get("tokens")
+            if isinstance(tokens, list):
+                for t in tokens:
+                    tokenids.append(parse_token_id(t))
+        results.append(tokenids)
+    return results
+
+
 # --------------------------------------------------------------------------- #
 # 恢复（供客户端，按原始参数）
 # --------------------------------------------------------------------------- #
@@ -451,6 +506,8 @@ class SSEStreamProcessor:
         self._comp_acc: Dict[int, Dict[str, List[Any]]] = {}
         # 文本累积（choice_index -> 拼接后的输出文本），用于异常保存
         self._text_acc: Dict[int, str] = {}
+        # 思维链文本累积（choice_index -> 拼接后的思维链文本），仅 chat thinking model
+        self._reasoning_acc: Dict[int, str] = {}
 
     # ---- 转发接口 ---- #
     def feed(self, chunk: bytes) -> bytes:
@@ -542,6 +599,9 @@ class SSEStreamProcessor:
                     c = delta.get("content")
                     if isinstance(c, str):
                         self._text_acc[cidx] = self._text_acc.get(cidx, "") + c
+                    rc = delta.get("reasoning_content")
+                    if isinstance(rc, str):
+                        self._reasoning_acc[cidx] = self._reasoning_acc.get(cidx, "") + rc
             else:
                 c = choice.get("text")
                 if isinstance(c, str):
@@ -601,6 +661,38 @@ class SSEStreamProcessor:
         else:
             keys = sorted(self._comp_acc.keys())
         return [self._text_acc.get(ci) for ci in keys]
+
+    def get_choice_text_tokenids(self) -> List[List[int]]:
+        """返回 per-choice 实际生成 token_id 序列（与 get_detection_data 对齐）。
+
+        chat：从 _chat_acc 累积的 content entries 的 token 字段解析。
+        completions：从 _comp_acc 累积的 tokens[] 解析。
+        """
+        results: List[List[int]] = []
+        if self._is_chat:
+            for ci in sorted(self._chat_acc.keys()):
+                content = self._chat_acc[ci]
+                tokenids: List[int] = []
+                for entry in content:
+                    if isinstance(entry, dict):
+                        tokenids.append(parse_token_id(entry.get("token")))
+                    else:
+                        tokenids.append(-1)
+                results.append(tokenids)
+        else:
+            for ci in sorted(self._comp_acc.keys()):
+                acc = self._comp_acc[ci]
+                tokens = acc.get("tokens", [])
+                results.append([parse_token_id(t) for t in tokens])
+        return results
+
+    def get_choice_reasoning_contents(self) -> List[Optional[str]]:
+        """返回 per-choice 思维链文本（仅 chat；completions 返回 None 列表）。"""
+        if self._is_chat:
+            keys = sorted(self._chat_acc.keys())
+        else:
+            keys = sorted(self._comp_acc.keys())
+        return [self._reasoning_acc.get(ci) for ci in keys]
 
     def get_detection_data(
         self,

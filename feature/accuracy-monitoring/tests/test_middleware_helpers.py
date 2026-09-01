@@ -113,6 +113,8 @@ def _make_mw_with_fake(fake_app, **cfg):
         top_logprobs=cfg.get("top_logprobs", 20),
         monitor_rate=cfg.get("monitor_rate", 1.0),
     )
+    mw._monitor_rate = mw.config.monitor_rate
+    mw.metrics.set_monitor_rate(mw._monitor_rate)
     # _runner/_resolver/_anomaly_store 已为 None（enabled=False 构造）
     return mw
 

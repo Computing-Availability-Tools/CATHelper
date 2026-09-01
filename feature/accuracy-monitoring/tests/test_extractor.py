@@ -12,7 +12,9 @@ from _helpers import (
 from anomaly_middleware.extractor import (
     OriginalParams,
     extract_chat_response,
+    extract_chat_text_tokenids,
     extract_completions_response,
+    extract_completions_text_tokenids,
     inject_params,
     parse_token_id,
     save_original_params,
@@ -416,3 +418,50 @@ def test_extract_completions_none_position_handled():
     assert token_ids[:, 0].tolist() == [10000, 0]
     assert token_ids[1].tolist() == [0, 0, 0, 0]
     assert logprobs[1].tolist() == [-100.0, -100.0, -100.0, -100.0]
+
+
+# --------------------------- extract text tokenids --------------------------- #
+def test_extract_chat_text_tokenids_basic():
+    e1 = chat_top_entry(100, NI, -0.1, n_top=5)
+    e2 = chat_top_entry(200, HAO, -0.2, n_top=5)
+    data = build_chat_response("m", [e1, e2])
+    result = extract_chat_text_tokenids(data)
+    assert result == [[100, 200]]
+
+
+def test_extract_chat_text_tokenids_multi_choice():
+    e = chat_top_entry(100, NI, -0.1, n_top=5)
+    data = build_chat_response("m", [e], n=3)
+    result = extract_chat_text_tokenids(data)
+    assert result == [[100], [100], [100]]
+
+
+def test_extract_chat_text_tokenids_no_logprobs():
+    data = {"choices": [{"message": {"content": "x"}}]}
+    result = extract_chat_text_tokenids(data)
+    assert result == [[]]
+
+
+def test_extract_chat_text_tokenids_parse_failure():
+    e = {"token": "bad", "logprob": -0.1, "bytes": None, "top_logprobs": []}
+    data = build_chat_response("m", [e])
+    result = extract_chat_text_tokenids(data)
+    assert result == [[-1]]
+
+
+def test_extract_completions_text_tokenids_basic():
+    data = build_completions_response("m", [100, 200], [-0.1, -0.2], n_top=5)
+    result = extract_completions_text_tokenids(data)
+    assert result == [[100, 200]]
+
+
+def test_extract_completions_text_tokenids_multi_choice():
+    data = build_completions_response("m", [100], [-0.1], n_top=5, n=2)
+    result = extract_completions_text_tokenids(data)
+    assert result == [[100], [100]]
+
+
+def test_extract_completions_text_tokenids_no_logprobs():
+    data = {"choices": [{"text": "x"}]}
+    result = extract_completions_text_tokenids(data)
+    assert result == [[]]

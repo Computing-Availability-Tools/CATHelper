@@ -100,6 +100,11 @@ class Metrics:
             ILL_REPETITION: self.last_repetition,
             ILL_NAN: self.last_nan_value,
         }
+        self.monitor_rate_gauge = Gauge(
+            "vllm_anomaly_monitor_rate",
+            "当前异常监控概率（运行时可通过 POST /anomaly/config 更新）",
+            registry=self.registry,
+        )
 
     def record_detection(
         self,
@@ -153,6 +158,12 @@ class Metrics:
         try:
             self.last_anomaly_id.labels(model=model).set(int(anomaly_id))
             self.last_anomaly_timestamp.labels(model=model).set(str(timestamp*1000).split('.')[0]) # float(timestamp)
+        except Exception:
+            pass
+
+    def set_monitor_rate(self, rate: float) -> None:
+        try:
+            self.monitor_rate_gauge.set(rate)
         except Exception:
             pass
 

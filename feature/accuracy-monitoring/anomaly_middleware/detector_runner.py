@@ -201,6 +201,8 @@ def schedule_detection(
     anomaly_store: Any = None,
     prompt: Any = None,
     texts: Optional[Sequence] = None,
+    text_tokenids: Optional[Sequence[Sequence[int]]] = None,
+    reasoning_contents: Optional[Sequence[Optional[str]]] = None,
 ) -> asyncio.Task:
     """fire-and-forget 检测任务。异常全捕获计 error，不影响客户端。
 
@@ -247,6 +249,8 @@ def schedule_detection(
                         "topk_logprobs": lp.tolist() if lp is not None else [],
                         "tokens_ids": tid.tolist() if tid is not None else [],
                         "text": texts[idx] if texts and idx < len(texts) else None,
+                        "text_tokenid": text_tokenids[idx] if text_tokenids and idx < len(text_tokenids) else [],
+                        "reasoning_content": reasoning_contents[idx] if reasoning_contents and idx < len(reasoning_contents) else None,
                         "model_name": model,
                     }
                     aid = await anomaly_store.save(record)

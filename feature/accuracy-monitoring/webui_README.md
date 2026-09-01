@@ -45,11 +45,11 @@ instances:
     paused: false            # 可选，默认 false
 
 store:
-  event_capacity: 10000      # 异常事件环形缓冲容量
-  alert_capacity: 500        # 告警环形缓冲容量
-  raw_trend_window_seconds: 3600   # 趋势原始点保留时长（轮询粒度 ≈1h）
-  trend_bucket_seconds: 60         # 分钟聚合桶粒度
-  trend_horizon_seconds: 86400     # 趋势总保留时长（24h）
+  event_capacity: 1000
+  alert_capacity: 200
+  raw_trend_window_seconds: 3600
+  trend_bucket_seconds: 60
+  trend_horizon_seconds: 2592000
 
 webhooks:
   # 全局默认 Webhook URL（可空）。自动识别渠道并转换消息格式：

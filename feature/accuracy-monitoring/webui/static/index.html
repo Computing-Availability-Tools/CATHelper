@@ -71,12 +71,18 @@
         <div class="card-header">
           <h2>异常检出趋势</h2>
           <div class="seg" id="window-seg">
-            <button data-window="1h" class="seg-btn active">1h</button>
-            <button data-window="4h" class="seg-btn">4h</button>
-            <button data-window="8h" class="seg-btn">8h</button>
-            <button data-window="16h" class="seg-btn">16h</button>
-            <button data-window="24h" class="seg-btn">24h</button>
+            <button data-window="1day" class="seg-btn active">1天</button>
+            <button data-window="7day" class="seg-btn">7天</button>
+            <button data-window="30day" class="seg-btn">30天</button>
           </div>
+          <button id="import-btn" class="btn btn-xs btn-ghost">导入历史</button>
+        </div>
+        <div id="import-form" class="import-form hidden">
+          <input id="import-file" type="file" accept=".pkl">
+          <select id="import-instance" class="input"></select>
+          <button id="import-confirm" class="btn btn-xs btn-primary">确认导入</button>
+          <button id="import-cancel" class="btn btn-xs btn-ghost">取消</button>
+          <span class="import-hint">导入将覆盖该实例已有历史导入数据</span>
         </div>
         <div id="trend-chart" class="chart chart-lg"></div>
         <div id="trend-empty" class="chart-placeholder hidden">暂无趋势数据</div>
@@ -90,7 +96,7 @@
           <div id="type-empty" class="chart-placeholder hidden">无异常数据</div>
         </div>
         <div class="card">
-          <div class="card-header"><h2>按模型累计异常</h2></div>
+          <div class="card-header"><h2>按实例累计异常</h2></div>
           <div id="model-chart" class="chart chart-sm"></div>
           <div id="model-empty" class="chart-placeholder hidden">无异常数据</div>
         </div>
@@ -161,12 +167,17 @@
         <div class="card-header">
           <h2>异常检出趋势</h2>
           <div class="seg" id="detail-window-seg">
-            <button data-window="1h" class="seg-btn active">1h</button>
-            <button data-window="4h" class="seg-btn">4h</button>
-            <button data-window="8h" class="seg-btn">8h</button>
-            <button data-window="16h" class="seg-btn">16h</button>
-            <button data-window="24h" class="seg-btn">24h</button>
+            <button data-window="1day" class="seg-btn active">1天</button>
+            <button data-window="7day" class="seg-btn">7天</button>
+            <button data-window="30day" class="seg-btn">30天</button>
           </div>
+          <button id="detail-import-btn" class="btn btn-xs btn-ghost">导入历史</button>
+        </div>
+        <div id="detail-import-form" class="import-form hidden">
+          <input id="detail-import-file" type="file" accept=".pkl">
+          <span class="import-hint">实例：<span id="detail-import-instance-name"></span> · 导入将覆盖该实例已有历史导入数据</span>
+          <button id="detail-import-confirm" class="btn btn-xs btn-primary">确认导入</button>
+          <button id="detail-import-cancel" class="btn btn-xs btn-ghost">取消</button>
         </div>
         <div id="detail-trend-chart" class="chart chart-lg"></div>
         <div id="detail-trend-empty" class="chart-placeholder hidden">暂无趋势数据</div>

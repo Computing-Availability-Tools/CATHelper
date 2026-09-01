@@ -82,8 +82,49 @@ def test_global_aggregation():
     assert s["anomalies"] == 3
     assert s["by_type"]["garbled"] == 2
     assert s["by_type"]["nan_value"] == 1
-    assert s["by_model"]["m1"] == 2
+    assert s["by_instance"] == {"a": 2, "b": 1}
     assert s["anomaly_rate"] == round(3 / 8, 6)
+
+
+def test_purge_updates_global_aggregates():
+    st = _store()
+    st.record_delta("a", _delta(1, [("garbled", "a", "m", "0")]))
+    st.record_delta("b", _delta(1, [("rare_character", "b", "m", "1")]))
+
+    st.purge_instance("a")
+    s = st.summary()
+    assert s["requests"] == 1
+    assert s["anomalies"] == 1
+    assert s["by_type"]["garbled"] == 0
+    assert s["by_type"]["rare_character"] == 1
+    assert s["by_instance"] == {"b": 1}
+    assert "a" not in s["by_instance"]
+
+
+def test_summary_by_instance_filters_zero():
+    st = _store()
+    st.set_state("a", "online")
+    st.set_state("b", "online")
+    st.record_delta("b", _delta(1, [("garbled", "b", "m", "0")]))
+    s = st.summary()
+    assert s["by_instance"] == {"b": 1}
+
+
+def test_import_then_purge_summary():
+    st = _store()
+    from webui.events import AnomalyEvent
+    from webui.store import TrendEvent
+
+    events = [AnomalyEvent(id=1, ts=1.0, instance="a", model="m",
+                           ill_type="garbled", choice_index="0", source="imported")]
+    trend_events = [TrendEvent(ts=1.0, instance="a", model="m",
+                               ill_type="garbled", source="imported")]
+    st.apply_import("a", events, trend_events)
+    assert st.summary()["anomalies"] == 1
+
+    st.purge_instance("a")
+    assert st.summary()["anomalies"] == 0
+    assert st.summary()["by_instance"] == {}
 
 
 def test_trend_raw_pruning_by_time():
