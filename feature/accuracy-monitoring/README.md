@@ -117,7 +117,6 @@ curl -X POST http://localhost:${port}/anomaly/config \
   -H "Content-Type: application/json" \
   -d '{"monitor_rate": 0.2}'
 ```
-静态配置和董涛配置可结合使用。
 
 ## 4 检测算法阈值配置
 
