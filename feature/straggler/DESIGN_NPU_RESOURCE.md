@@ -388,7 +388,7 @@ func main() {
 
     // ── 合并输出 ──
     if kpiResult != nil || profilerOut != nil {
-        daemon.WriteCombinedJSON(kpiResult, profilerOut, "straggler_output.json") // 运行目录
+        writeCombinedJSON(kpiResult, profilerOut, "straggler_output.json") // 运行目录
     }
 }
 ```
@@ -551,7 +551,6 @@ func AggregateByMinute(rawRows []CSVRow, cardIDs []int, cfg DetectionConfig) ([]
 // detectSpaceAnomalies 对最后一个聚合点执行空间 peer 对比（节点内互比，
 // 双方向 kmeans 比例 / 绝对阈值）。
 func detectSpaceAnomalies(detectionRows []CSVRow, cardIDs []int, cfg DetectionConfig, nodeOf ...map[int]string) *SpaceDetectionResult
-<<<<<<< HEAD
 
 // ==================== report.go ====================
 // RunDetectionFromDir / RunDetectionFromData / RunDetection 是 KPI 检测入口
@@ -562,14 +561,6 @@ func RunDetectionFromData(ts *TimeSeriesData, source string, cfg DetectionConfig
 // buildAnomalyMetrics 以纯空间结果按指标分组异常卡（指标优先输出）。
 func buildAnomalyMetrics(spaceDetails map[int]map[MetricName]*MetricAnomalyDetail, cardIDs []int, nodeOf map[int]string, localID map[int]int, cfg DetectionConfig) ([]MetricAnomaly, int)
 
-=======
-
-
-// ==================== report.go ====================
-// buildAnomalyMetrics 以纯空间结果按指标分组异常卡（指标优先输出）。
-func buildAnomalyMetrics(spaceDetails map[int]map[MetricName]*MetricAnomalyDetail, cardIDs []int, nodeOf map[int]string, localID map[int]int, cfg DetectionConfig) ([]MetricAnomaly, int)
-
->>>>>>> 6d99aabd9a7b1158e71c378ac645cf1c7d188533
 // HasAnomaly 结果中是否有异常卡。
 func HasAnomaly(result *DetectionResult) bool
 

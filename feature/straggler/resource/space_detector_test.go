@@ -23,18 +23,17 @@ func freqCardIDs(n int) []int {
 	return ids
 }
 
-// Severe single downclock must be flagged: 800MHz vs 1800MHz peers → the
-// unified cluster/baseline ratio 800/1800 ≈ 0.444 < 1/SpaceRatioThreshold
-// (0.5). aicore_freq uses the same kmeans ratio detection as the other
-// cluster metrics; the score is the raw ratio (min side flags below 1/threshold).
+// Severe single downclock must be flagged: 800MHz vs 1800MHz peers → ratio
+// 1800/800 = 2.25 > SpaceRatioThreshold (2.0). aicore_freq now uses the same
+// kmeans ratio detection as the other cluster metrics.
 func TestSpaceFreqSingleDownclock(t *testing.T) {
 	cfg := DefaultDetectionConfig()
 	cardIDs := freqCardIDs(8)
 	freqs := map[int]float64{0: 1800, 1: 1800, 2: 1800, 3: 1800, 4: 1800, 5: 1800, 6: 1800, 7: 800}
 
 	res := detectSpaceAnomalies(freqRows(freqs), cardIDs, cfg)
-	if got := res.Scores[7][MetricAICoreFreq][0]; got < 0.443 || got > 0.446 {
-		t.Fatalf("downclocked card 7 → space score = %v, want ≈0.444 (800/1800)", got)
+	if got := res.Scores[7][MetricAICoreFreq][0]; got < 2.24 || got > 2.26 {
+		t.Fatalf("downclocked card 7 → space score = %v, want ≈2.25", got)
 	}
 	for cid := 0; cid < 7; cid++ {
 		if z := res.Scores[cid][MetricAICoreFreq][0]; z != 1.0 {

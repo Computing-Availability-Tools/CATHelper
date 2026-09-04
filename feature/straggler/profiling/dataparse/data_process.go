@@ -26,6 +26,21 @@ var (
 	fileWriteOnceMu sync.Mutex
 )
 
+// ResetFileWriteOnce clears the dedup table that guards group_info_/host_info_
+// JSON writes. The table is a package-level global keyed by absolute file path,
+// so a long-lived daemon that deletes and re-creates --profiler-dir each cycle
+// would otherwise keep stale *sync.Once objects for the same paths: the second
+// and later cycles' once.Do become no-ops, the JSON files stop being written,
+// GetCurDetectionInfo falls back to CSV-only rank collection (no parallel
+// topology), and slow-communication/CPU/bubble detection silently lose input.
+// One-shot mode is unaffected (single pass, first Do always fires).
+// Call this at the start of every daemon cycle, before StartProcess.
+func ResetFileWriteOnce() {
+	fileWriteOnceMu.Lock()
+	fileWriteOnce = make(map[string]*sync.Once)
+	fileWriteOnceMu.Unlock()
+}
+
 // ---------------------------------------------------------------------------
 // ProcessDatabase — per-file pipeline
 // ---------------------------------------------------------------------------

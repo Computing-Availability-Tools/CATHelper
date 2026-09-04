@@ -216,6 +216,7 @@ timestamp,NPU_CARD_TEMP,NPU_CARD_POWER,NPU_CARD_AICORE_FREQ,NPU_CARD_AICORE_UTIL
 | `--daemon-port` | int | 否 | 8080 | HTTP 端口 |
 | `--interval` | int | 否 | 600 | 检测周期（秒，≥60，非法回退默认） |
 | `--collect-wait` | int | 否 | 60 | dyno 触发成功后的等待秒数 |
+| `--profiler-iterations` | int | 否 | 5 | dyno nputrace 采集迭代数（传给 dyno 的 `--iterations`） |
 
 `--daemon` 模式用法与 HTTP 接口详见[五、守护进程模式](#五守护进程模式常驻检测)。`degradation`、`--debug-output` 在该模式下语义不变（作用于每轮检测）。
 
@@ -271,13 +272,28 @@ cd feature/straggler
 bash build.sh          # 首次构建（见九、构建与部署）
 
 ./slowNodeDetection --daemon \
-    --profiler-dir=/data/profiler \   # 必填：采集落盘根目录（传给 dyno 的 --log-file）
-    --kpi-dir=/data/kpi \             # 可选：KPI 数据目录（CATMonitor JSONL；缺省则只跑 Profiler）
-    --interval=600 \                  # 可选：检测周期（秒，≥60）
-    --collect-wait=60 \               # 可选：触发成功后等待采集完成的秒数
-    --daemon-port=8080 \              # 可选：HTTP 端口
-    --degradation=0.3                 # 可选：灵敏度（与一次性模式同义）
+    --profiler-dir=/data/profiler \
+    --kpi-dir=/data/kpi \
+    --interval=600 \
+    --collect-wait=60 \
+    --profiler-iterations=5 \
+    --daemon-port=8080 \
+    --degradation=0.3
 ```
+
+参数说明：
+
+| 参数 | 必需 | 默认 | 说明 |
+|------|------|------|------|
+| `--profiler-dir` | 是 | — | 采集落盘根目录（传给 dyno 的 `--log-file`） |
+| `--kpi-dir` | 否 | — | KPI 数据目录（CATMonitor JSONL；缺省则每轮只跑 Profiler） |
+| `--interval` | 否 | 600 | 检测周期（秒，≥60） |
+| `--collect-wait` | 否 | 60 | 触发成功后等待采集完成的秒数 |
+| `--profiler-iterations` | 否 | 5 | dyno 采集迭代数（默认 5） |
+| `--daemon-port` | 否 | 8080 | HTTP 端口 |
+| `--degradation` | 否 | 0.3 | 灵敏度（与一次性模式同义） |
+
+> 注意：上方命令是**可直接复制执行**的写法（续行 `\` 后不留注释/空格）。若需给参数加注释，请写到注释区或参数表里，不要插在命令续行内——`\` 后跟注释会让续行失效，参数会被 shell 拆分。
 
 `--profiler-dir` 必填；`--kpi-dir` 可选（缺省时每轮只跑 Profiler 检测，合并 JSON 不含 `kpi` 键）。日志打到 stderr。
 
@@ -285,7 +301,7 @@ bash build.sh          # 首次构建（见九、构建与部署）
 > 1. **平铺**：目录下直接放 `straggler_kpi_{date}.jsonl`（无 `node_config.json`）；
 > 2. **多节点**：目录下有 `node_config.json`（`{"<folder>": {"node": "节点名", "cards": [...]}}`），jsonl 放在各 `<folder>/` 子目录内，按 per-node 卡号过滤。
 >
-> 注意：目录里**一旦存在 `node_config.json`，就按多节点布局读，顶层散放的 jsonl 会被忽略**。daemon 的 `--kpi-dir` 应指向 CATMonitor 的 `straggler_output.data_dir`（默认 `/var/lib/catmonitor/straggler`）且 CATMonitor 侧启用 `straggler_output` 插件。守护进程启动时会打印该目录可读取的 jsonl 文件数（两种布局都统计）；若为 0 会输出明确 WARNING。每轮周期的 KPI 执行结果（`ok` = 已执行；`disabled` / `skipped: ...` / `failed: ...` = 未产出结果及原因）记录在 history 与 `/status` 的 `last_cycle.kpi_status` 中。
+> 注意：目录里**一旦存在 `node_config.json`，就按多节点布局读，顶层散放的 jsonl 会被忽略**。daemon 的 `--kpi-dir` 应指向 CATMonitor 的 `straggler_output.data_dir`（默认 `/var/lib/catmonitor/straggler`）且 CATMonitor 侧启用 `straggler_output` 插件。守护进程启动时会打印该目录可读取的 jsonl 文件数（两种布局都统计）；若为 0 会输出明确 WARNING。每轮周期的 KPI 执行结果（`ok` / `skipped: ...` / `failed: ...`）记录在 history 与 `/status` 的 `last_cycle.kpi_status` 中，KPI 未生效时原因一目了然。
 
 ### 5.3 HTTP 接口
 
@@ -299,9 +315,9 @@ bash build.sh          # 首次构建（见九、构建与部署）
 | `GET /straggler/results/history?limit=N` | 本次会话全部周期摘要（含失败的 error），按时间倒序；`?limit=N` 可选，限制返回条数 | — |
 | `GET /straggler/results/{id}` | 指定周期 id 的合并结果 JSON | — |
 | `GET /straggler/report/latest` | 最近一轮 Profiler 文本报告（text/plain） | — |
-| `GET /straggler/report/{id}` | 指定周期 id 的 Profiler 文本报告（text/plain） | — |
 | `POST /daemon/start` | 恢复运行（paused → running） | — |
 | `POST /daemon/pause` | 暂停（在跑的周期跑完，不再排新的） | — |
+| `POST /daemon/stop` | 优雅关闭守护进程（停 HTTP、等周期结束、杀 dynolog、删除全部落盘结果） | — |
 | `POST /daemon/interval` | 修改检测周期 | `{"interval_sec": 300}`（60–86400） |
 | `POST /daemon/trigger` | 立即补跑一轮（已有周期在跑 → 409） | — |
 
@@ -314,13 +330,13 @@ curl -s localhost:8080/straggler/results/latest | jq
 curl -s localhost:8080/straggler/results/history | jq        # 全部历史；可用 ?limit=N 截断
 curl -s localhost:8080/straggler/results/2 | jq
 curl -s localhost:8080/straggler/report/latest
-curl -s localhost:8080/straggler/report/1
 
 # 控制
 curl -s -X POST localhost:8080/daemon/pause
 curl -s -X POST localhost:8080/daemon/trigger
 curl -s -X POST localhost:8080/daemon/interval -d '{"interval_sec": 300}'
 curl -s -X POST localhost:8080/daemon/start
+curl -s -X POST localhost:8080/daemon/stop
 ```
 
 **`GET /status` 响应示例**：
@@ -340,7 +356,7 @@ curl -s -X POST localhost:8080/daemon/start
     "duration_ms": 120000,
     "dbs": 8,
     "dump_dir": "daemon_results/20260820-100000",
-    "summary": { "profiler": { "cal": 1, "comm": 0, "cpu": 0, "npu_bubble": 0 }, "kpi": { "temp": 1 } }
+    "summary": { "cal": 1, "comm": 0, "cpu": 0, "npu_bubble": 0 }
   },
   "next_run_at": "2026-08-20T10:10:00+08:00"
 }

@@ -34,6 +34,9 @@ type Daemon struct {
 	cycleInFlight bool
 	timer         *time.Timer   // cycle timer; stopped while paused, re-armed by Start/Trigger
 	dynolog       *exec.Cmd     // dynolog child to kill on shutdown (nil = reusing existing)
+	stopOnce      sync.Once     // guards stopCh so POST /daemon/stop closes it exactly once
+	stopCh        chan struct{} // closed by POST /daemon/stop to request graceful shutdown
+	removeResults bool          // set by Stop(): delete all daemon_results/ on shutdown
 }
 
 // New creates a Daemon. detect is the shared profiler pipeline
@@ -55,6 +58,7 @@ func New(cfg Config, detect DetectFunc) *Daemon {
 		logf:     func(format string, args ...any) { fmt.Fprintf(os.Stderr, "[DAEMON] "+format+"\n", args...) },
 		state:    "running",
 		interval: cfg.Interval,
+		stopCh:   make(chan struct{}),
 	}
 }
 
@@ -110,6 +114,8 @@ func (d *Daemon) Run(ctx context.Context) error {
 	for {
 		select {
 		case <-ctx.Done():
+			return d.shutdown(srv)
+		case <-d.stopCh:
 			return d.shutdown(srv)
 		case err := <-srvErr:
 			return err
@@ -197,6 +203,12 @@ func (d *Daemon) runCycle(id int) {
 	cr.DBs = len(dbFiles)
 
 	// 4. Parse (StartProcess — not DataParsing, which os.Exit's on zero files).
+	// Reset the per-path sync.Once dedup table: it is a package-level global
+	// keyed by absolute path, and cleanupDump removed --profiler-dir last
+	// cycle, so without a reset the stale Once objects make this cycle's
+	// group_info_/host_info_ JSON writes no-ops → topology lost → slow
+	// comm/CPU/bubble detection silently drops. One-shot mode is unaffected.
+	dataparse.ResetFileWriteOnce()
 	if err := dataparse.StartProcess(dbFiles, root); err != nil {
 		cr.Error = fmt.Sprintf("StartProcess: %v", err)
 		return
@@ -254,6 +266,18 @@ func (d *Daemon) runCycle(id int) {
 			d.logf("cycle %d copy report: %v", cr.ID, err)
 		} else if err := copyFile(src, filepath.Join(archive, "analysis_result", "detection_report.log")); err != nil {
 			d.logf("cycle %d copy report: %v", cr.ID, err)
+		}
+	}
+
+	// 9. Copy op_metric/ into the archive dir as the durable detector-input
+	//    snapshot (group_info_*.json, host_info_*.json, global_rank_*.csv).
+	//    cleanupDump (deferred below) removes the whole --profiler-dir, so
+	//    without this copy the per-rank topology + metric CSVs are gone every
+	//    cycle. Best effort — detection already produced cr.Report/Result.
+	srcOpMetric := filepath.Join(root, "op_metric")
+	if fileExistsDir(srcOpMetric) {
+		if err := copyDir(srcOpMetric, archive); err != nil {
+			d.logf("cycle %d copy op_metric: %v", cr.ID, err)
 		}
 	}
 }
@@ -376,6 +400,13 @@ func (d *Daemon) shutdown(srv *http.Server) error {
 		_ = d.dynolog.Process.Kill()
 		_, _ = d.dynolog.Process.Wait()
 	}
+	if d.removeResults {
+		if err := os.RemoveAll("daemon_results"); err != nil {
+			d.logf("remove daemon_results: %v", err)
+		} else {
+			d.logf("removed all daemon_results (dump_dir) files")
+		}
+	}
 	d.logf("daemon stopped")
 	return nil
 }
@@ -442,6 +473,20 @@ func (d *Daemon) Trigger() error {
 	return nil
 }
 
+// Stop requests a graceful shutdown of the daemon: Run's select observes the
+// closed stopCh and runs shutdown (HTTP server close, in-flight cycle wait,
+// dynolog child kill). Idempotent — repeated calls are no-ops. All archived
+// result files under daemon_results/ (each cycle's dump_dir) are removed as
+// part of the shutdown.
+func (d *Daemon) Stop() {
+	d.stopOnce.Do(func() {
+		d.mu.Lock()
+		d.removeResults = true
+		d.mu.Unlock()
+		close(d.stopCh)
+	})
+}
+
 // stopTimer stops the cycle timer, draining any stale fire so a later Reset
 // takes effect cleanly (Stop returning false means a value may be pending in
 // C). Caller holds d.mu.
@@ -499,6 +544,35 @@ func copyFile(src, dst string) error {
 		return err
 	}
 	return os.WriteFile(dst, data, 0644)
+}
+
+// copyDir recursively copies src into dst (dst/src's basename is created).
+// Errors are collected per-file; a non-nil error is returned only when the
+// top-level src cannot be walked — individual file failures do not abort the
+// copy so a partial op_metric still survives.
+func copyDir(src, dst string) error {
+	info, err := os.Stat(src)
+	if err != nil {
+		return err
+	}
+	target := filepath.Join(dst, info.Name())
+	if err := os.MkdirAll(target, 0o755); err != nil {
+		return err
+	}
+	return filepath.Walk(src, func(path string, fi os.FileInfo, werr error) error {
+		if werr != nil {
+			return werr
+		}
+		rel, rerr := filepath.Rel(src, path)
+		if rerr != nil {
+			return rerr
+		}
+		out := filepath.Join(target, rel)
+		if fi.IsDir() {
+			return os.MkdirAll(out, fi.Mode())
+		}
+		return copyFile(path, out)
+	})
 }
 
 // cleanupDump removes the entire --profiler-dir at the end of every cycle,
