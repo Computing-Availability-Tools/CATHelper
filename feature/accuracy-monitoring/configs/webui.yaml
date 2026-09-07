@@ -1,55 +1,22 @@
-# 推理精度异常监控 Web 界面配置文件
-
 auth:
   username: admin
-  # 二选一：明文 password 或 SHA-256 hex 的 password_hash（推荐，避免明文落盘）
-  password: admin@123 # 默认
-  token_ttl_hours: 24 # 网页用户登录有效时间，可选时间 0-24 小时，数值取正整数
+  password: admin@123
+  token_ttl_hours: 24
 
 poll:
-  interval_seconds: 3        # 2-5s
-  http_timeout_seconds: 2
+  interval_seconds: 3
+  http_timeout_seconds: 1
 
-# 监控的推理服务，可配置多个，支持在本文件和 Web 界面两种配置方式
-instances:
-  # - name: vllm-prod-1
-  #   url: http://10.0.0.1:8000
-  # - name: vllm-prod-2
-  #   url: http://10.0.0.2:8000
-  #   paused: false            # 可选，默认 false
+instances: []
 
 store:
-  event_capacity: 10000      # 异常事件环形缓冲容量
-  alert_capacity: 500        # 告警环形缓冲容量
-  raw_trend_window_seconds: 3600   # 趋势原始点保留时长（轮询粒度 ≈1h）
-  trend_bucket_seconds: 60         # 分钟聚合桶粒度
-  trend_horizon_seconds: 86400     # 趋势总保留时长（24h）
+  event_capacity: 1000
+  alert_capacity: 200
+  raw_trend_window_seconds: 3600
+  trend_bucket_seconds: 60
+  trend_horizon_seconds: 2592000
 
 webhooks:
-  # 全局默认 Webhook URL（可空）。自动识别渠道并转换消息格式：
-  #   - 飞书（Lark）机器人:   https://open.feishu.cn/open-apis/bot/v2/hook/<token>
-  #   - 钉钉自定义机器人:     https://oapi.dingtalk.com/robot/send?access_token=<token>
-  #   - 企业微信群机器人:     https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=<key>
-  #   - 其它地址: 发送通用 JSON（rule_name/instance/model/ill_type/count/ts）
   default: ""
 
-email:
-  enabled: false             # 邮件告警（可选）
-  smtp_host: "smtp.example.com"
-  smtp_port: 465             # 465=SSL；587 请设 use_ssl: false
-  smtp_user: "alert@example.com"
-  smtp_password: "xxx"
-  use_ssl: true
-  from_addr: "alert@example.com"
-  to_addrs:
-    - "ops@example.com"
-
-alerts:
-  - name: garbled_frequent
-    instance: "*"            # * = 全部
-    model: "*"
-    ill_type: garbled        # rare_character | garbled | repetition | nan_value；缺省 = 任一异常
-    window_seconds: 300      # 滑动窗口时长(单位：秒)，以当前异常事件事件为准，往前数window_seconds内，同一个（实例、模型、异常类型）检出累计达到 threshold ，则触发告警
-    threshold: 3             # 窗口内事件数阈值，超过阈值则告警
-    webhook_url: ""          # 可选，覆盖全局 webhook
-    enabled: true
+alerts: []

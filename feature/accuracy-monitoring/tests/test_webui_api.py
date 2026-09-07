@@ -71,7 +71,7 @@ async def test_summary_structure(app_client):
     assert r.status_code == 200
     data = r.json()
     for k in ("requests", "anomalies", "anomaly_rate", "errors",
-              "by_type", "by_model", "instances", "updated_at"):
+              "by_type", "by_instance", "instances", "updated_at"):
         assert k in data
     assert set(data["by_type"].keys()) == {"rare_character", "garbled", "repetition", "nan_value"}
 
@@ -94,6 +94,7 @@ async def test_summary_reflects_store(app_client):
     assert data["requests"] == 5
     assert data["anomalies"] == 2
     assert data["by_type"]["garbled"] == 2
+    assert data["by_instance"] == {"a": 2}
 
 
 async def test_events_and_alerts_require_auth_then_return_lists(app_client):
@@ -309,14 +310,22 @@ async def test_delete_purges_instance_data(app_client):
     client, ctx, _ = app_client
     h = await _login(client)
     await client.post("/api/instances", json={"name": "p", "url": "http://x:1"}, headers=h)
-    from webui.events import AnomalyEvent
+    from webui.events import AnomalyEvent, DeltaSummary
 
-    ctx.store.add_event(AnomalyEvent(id=1, ts=1.0, instance="p", model="m",
-                                     ill_type="garbled", choice_index="0"))
-    ctx.store.set_state("p", "online")
+    d = DeltaSummary(requests=1)
+    d.events.append(AnomalyEvent(id=1, ts=1.0, instance="p", model="m",
+                                 ill_type="garbled", choice_index="0"))
+    d.anomalies_total = 1
+    d.by_type["garbled"] = 1
+    d.by_model["m"] = 1
+    ctx.store.record_delta("p", d)
+    assert ctx.store.summary()["anomalies"] == 1
+
     await client.delete("/api/instances/p", headers=h)
     assert ctx.store.instance_stats("p") is None
     assert all(e.instance != "p" for e in ctx.store.recent_events(10))
+    assert ctx.store.summary()["anomalies"] == 0
+    assert ctx.store.summary()["by_instance"] == {}
 
 
 async def test_add_then_instance_visible_in_list(app_client):

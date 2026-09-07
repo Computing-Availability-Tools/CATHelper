@@ -165,3 +165,92 @@ async def test_non_json_body_passthrough(client_factory):
     assert resp.status_code == 200
     # 下游收到原始 body
     assert fake.received[0][1] == b"not json"
+
+
+async def test_monitor_rate_uses_runtime_attribute(client_factory, monkeypatch):
+    """_monitor_rate 独立于 config.monitor_rate——运行时属性驱动采样。"""
+    import anomaly_middleware.middleware as mwmod
+
+    seq = iter([0.5])  # 0.5
+    monkeypatch.setattr(mwmod.random, "random", lambda: next(seq))
+    # config.monitor_rate=0.3, 但 _monitor_rate=1.0
+    client, fake, mw = client_factory(_chat_fn(), monitor_rate=0.3, real_runner=True)
+    mw._monitor_rate = 1.0  # 覆盖为 1.0
+    resp = await client.post(
+        "/v1/chat/completions", json={"model": "m", "messages": []}
+    )
+    assert resp.status_code == 200
+    # 0.5 < 1.0 (_monitor_rate) → 选中注入（若读 config.monitor_rate=0.3 则 0.5>=0.3 透传）
+    body = json.loads(fake.received[0][1])
+    assert body.get("return_tokens_as_token_ids") is True
+
+
+# --------------------------- 动态更新 E2E --------------------------- #
+async def test_dynamic_update_to_zero_then_one(client_factory):
+    """运行时 POST rate=0.0 → 后续请求全透传；POST rate=1.0 → 全监控。"""
+    client, fake, mw = client_factory(_chat_fn(), monitor_rate=1.0, real_runner=True)
+
+    # 更新为 0.0
+    resp = await client.post("/anomaly/config", json={"monitor_rate": 0.0})
+    assert resp.status_code == 200
+    assert resp.json()["monitor_rate"] == 0.0
+
+    # 发请求 → 透传（不注入）
+    resp = await client.post(
+        "/v1/chat/completions", json={"model": "m", "messages": []}
+    )
+    assert resp.status_code == 200
+    body = json.loads(fake.received[0][1])
+    assert "return_tokens_as_token_ids" not in body
+
+    # 更新为 1.0
+    resp = await client.post("/anomaly/config", json={"monitor_rate": 1.0})
+    assert resp.json()["monitor_rate"] == 1.0
+
+    # 发请求 → 注入检测
+    resp = await client.post(
+        "/v1/chat/completions", json={"model": "m", "messages": []}
+    )
+    assert resp.status_code == 200
+    body = json.loads(fake.received[1][1])
+    assert body.get("return_tokens_as_token_ids") is True
+
+    await drain(mw)
+    text = mw.metrics.render_metrics().decode()
+    assert "vllm_anomaly_requests_total 1" in text  # 仅 rate=1.0 后的 1 次检测
+
+
+async def test_metrics_contains_monitor_rate(client_factory):
+    """GET /anomaly/metrics 包含 vllm_anomaly_monitor_rate gauge。"""
+    client, fake, mw = client_factory(_chat_fn(), monitor_rate=0.3)
+    resp = await client.get("/anomaly/metrics")
+    assert resp.status_code == 200
+    text = resp.text
+    assert "vllm_anomaly_monitor_rate" in text
+    assert "vllm_anomaly_monitor_rate 0.3" in text
+
+
+async def test_metrics_reflects_updated_rate(client_factory):
+    """POST 更新后 metrics gauge 反映新值。"""
+    client, fake, mw = client_factory(_chat_fn(), monitor_rate=1.0)
+    await client.post("/anomaly/config", json={"monitor_rate": 0.5})
+    resp = await client.get("/anomaly/metrics")
+    text = resp.text
+    assert "vllm_anomaly_monitor_rate 0.5" in text
+
+
+async def test_get_config_returns_initial_rate(client_factory):
+    """启动后 GET /anomaly/config 返回 env 初始值。"""
+    client, fake, mw = client_factory(_chat_fn(), monitor_rate=0.7)
+    resp = await client.get("/anomaly/config")
+    assert resp.status_code == 200
+    assert resp.json()["monitor_rate"] == 0.7
+
+
+async def test_invalid_update_does_not_change_metrics(client_factory):
+    """POST 无效值 → metrics gauge 不变。"""
+    client, fake, mw = client_factory(_chat_fn(), monitor_rate=0.3)
+    resp = await client.post("/anomaly/config", json={"monitor_rate": 1.5})
+    assert resp.status_code == 400
+    mresp = await client.get("/anomaly/metrics")
+    assert "vllm_anomaly_monitor_rate 0.3" in mresp.text

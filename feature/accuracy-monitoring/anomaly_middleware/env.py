@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 METRICS_PATH_DEFAULT = "/anomaly/metrics"
+CONFIG_PATH_DEFAULT = "/anomaly/config"
 TOP_LOGPROBS_DEFAULT = 20
 MONITOR_RATE_DEFAULT = 1.0
 DETECTOR_WORKERS_DEFAULT = 4
@@ -62,6 +63,7 @@ class PluginConfig:
     detector_workers: int = DETECTOR_WORKERS_DEFAULT
     tokenizer_model: Optional[str] = None
     save_path: Optional[str] = None
+    config_path: str = CONFIG_PATH_DEFAULT
 
     @classmethod
     def from_env(cls) -> "PluginConfig":
@@ -93,6 +95,7 @@ class PluginConfig:
             detector_workers=workers,
             tokenizer_model=_env_str("VLLM_ANOMALY_TOKENIZER_MODEL"),
             save_path=save_path,
+            config_path=_env_str("VLLM_ANOMALY_CONFIG_PATH") or CONFIG_PATH_DEFAULT,
         )
 
 

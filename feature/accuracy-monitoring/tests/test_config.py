@@ -105,3 +105,24 @@ def test_config_metrics_path_empty_uses_default(monkeypatch):
     monkeypatch.setenv("VLLM_ANOMALY_METRICS_PATH", "   ")
     c = PluginConfig.from_env()
     assert c.metrics_path == "/anomaly/metrics"
+
+
+# --------------------------- config_path --------------------------- #
+def test_config_path_default(monkeypatch):
+    for k in list(os.environ):
+        if k.startswith("VLLM_ANOMALY"):
+            monkeypatch.delenv(k, raising=False)
+    c = PluginConfig.from_env()
+    assert c.config_path == "/anomaly/config"
+
+
+def test_config_path_env_override(monkeypatch):
+    monkeypatch.setenv("VLLM_ANOMALY_CONFIG_PATH", "/custom/cfg")
+    c = PluginConfig.from_env()
+    assert c.config_path == "/custom/cfg"
+
+
+def test_config_path_empty_uses_default(monkeypatch):
+    monkeypatch.setenv("VLLM_ANOMALY_CONFIG_PATH", "   ")
+    c = PluginConfig.from_env()
+    assert c.config_path == "/anomaly/config"

@@ -188,6 +188,18 @@ tbody tr:hover { background: #f8fafc; }
 .tag-repetition { background: #fac858; color: #7a5d00; }
 .tag-nan_value { background: #ee6666; }
 .tag-unknown { background: var(--gray); }
+.tag-imported { background: var(--amber); color: #fff; }
+
+.import-form {
+  display: flex; gap: 10px; align-items: center; flex-wrap: wrap;
+  border-top: 1px solid var(--border); padding-top: 12px; margin-bottom: 12px;
+}
+.import-form input[type="file"] {
+  font-size: 13px; color: var(--text-secondary);
+  border: 1px solid var(--border); border-radius: 8px; padding: 6px 10px; background: #fff;
+}
+.import-form .input { min-width: 140px; max-width: 220px; }
+.import-hint { font-size: 12px; color: var(--text-secondary); }
 
 .add-instance { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; border-top: 1px solid var(--border); padding-top: 14px; }
 .add-instance .input { flex: 1; min-width: 160px; }

@@ -21,7 +21,9 @@ from .extractor import (
     OriginalParams,
     SSEStreamProcessor,
     extract_chat_response,
+    extract_chat_text_tokenids,
     extract_completions_response,
+    extract_completions_text_tokenids,
     inject_params,
     save_original_params,
     strip_chat_response,
@@ -137,6 +139,8 @@ class ResponseInterceptor:
         self._detection_scheduled = False
         self._detection_results: List[Tuple[np.ndarray, np.ndarray]] = []
         self._choice_texts: List[Any] = []
+        self._choice_text_tokenids: List[List[int]] = []
+        self._choice_reasoning_contents: List[Any] = []
 
     async def __call__(self, message: dict) -> None:
         t = message.get("type")
@@ -229,10 +233,17 @@ class ResponseInterceptor:
                     )
                 else:
                     self._choice_texts.append(c.get("text"))
+        ch = choices if isinstance(choices, list) else []
         if self._ctx.is_chat:
             self._detection_results = extract_chat_response(
                 data, self._ctx.top_logprobs
             )
+            self._choice_text_tokenids = extract_chat_text_tokenids(data)
+            self._choice_reasoning_contents = [
+                (c.get("message") or {}).get("reasoning_content")
+                if isinstance(c, dict) else None
+                for c in ch
+            ]
             strip_chat_response(
                 data, self._ctx.orig, self._resolver,
             )
@@ -240,6 +251,8 @@ class ResponseInterceptor:
             self._detection_results = extract_completions_response(
                 data, self._ctx.top_logprobs
             )
+            self._choice_text_tokenids = extract_completions_text_tokenids(data)
+            self._choice_reasoning_contents = [None] * len(ch)
             strip_completions_response(
                 data, self._ctx.orig, self._resolver,
                 recompute_text_offset=True,
@@ -251,6 +264,18 @@ class ResponseInterceptor:
         if self._is_streaming:
             return self._sse.get_choice_texts() if self._sse is not None else []
         return list(self._choice_texts)
+
+    def get_choice_text_tokenids(self) -> List[List[int]]:
+        """per-choice 实际生成 token_id 序列（非流式取 _choice_text_tokenids；流式取 SSE 累积）。"""
+        if self._is_streaming:
+            return self._sse.get_choice_text_tokenids() if self._sse is not None else []
+        return list(self._choice_text_tokenids)
+
+    def get_choice_reasoning_contents(self) -> List[Any]:
+        """per-choice 思维链文本（非流式取 _choice_reasoning_contents；流式取 SSE 累积）。"""
+        if self._is_streaming:
+            return self._sse.get_choice_reasoning_contents() if self._sse is not None else []
+        return list(self._choice_reasoning_contents)
 
     async def _send_start(self, final: bytes) -> None:
         msg = self._start_msg
@@ -297,6 +322,8 @@ class ResponseInterceptor:
                 anomaly_store=self._anomaly_store,
                 prompt=self._ctx.prompt,
                 texts=self.get_choice_texts(),
+                text_tokenids=self.get_choice_text_tokenids(),
+                reasoning_contents=self.get_choice_reasoning_contents(),
             )
         except RuntimeError as exc:
             # 无运行事件循环等：记录后跳过（不影响客户端）
@@ -327,6 +354,8 @@ class AnomalyMiddleware:
         self._vocab_size: Optional[int] = None
         self._runner: Optional[DetectorRunner] = None
         self._anomaly_store: Any = None
+        self._monitor_rate = self.config.monitor_rate
+        self.metrics.set_monitor_rate(self._monitor_rate)
 
         if not self.config.enabled:
             # ② enabled=False → skip all checks, pure passthrough
@@ -390,6 +419,17 @@ class AnomalyMiddleware:
         if method == "GET" and path == self.config.metrics_path:
             await self._serve_metrics(send)
             return
+        # 配置端点（内联，GET 查询 / POST 更新）
+        if path == self.config.config_path:
+            if method == "POST":
+                await self._handle_config_update(scope, receive, send)
+                return
+            elif method == "GET":
+                await self._serve_config(send)
+                return
+            else:
+                await self.app(scope, receive, send)
+                return
         # 降级或非目标 → 透传（不读 body）
         if not self.config.enabled:
             await self.app(scope, receive, send)
@@ -398,7 +438,7 @@ class AnomalyMiddleware:
             await self.app(scope, receive, send)
             return
         # 采样：未中 → 纯透传（不读 body、不注入、不恢复、不检测）
-        if random.random() >= self.config.monitor_rate:
+        if random.random() >= self._monitor_rate:
             await self.app(scope, receive, send)
             return
         # 选中：读 body
@@ -454,6 +494,51 @@ class AnomalyMiddleware:
         await send(
             {"type": "http.response.body", "body": body, "more_body": False}
         )
+
+    async def _send_json(self, send, status: int, obj: dict) -> None:
+        body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+        headers = [
+            [b"content-type", b"application/json; charset=utf-8"],
+            [b"content-length", str(len(body)).encode("latin-1")],
+        ]
+        await send(
+            {"type": "http.response.start", "status": status, "headers": headers}
+        )
+        await send(
+            {"type": "http.response.body", "body": body, "more_body": False}
+        )
+
+    async def _serve_config(self, send) -> None:
+        await self._send_json(send, 200, {"monitor_rate": self._monitor_rate})
+
+    async def _handle_config_update(self, scope, receive, send) -> None:
+        raw = await _read_all_body(receive)
+        try:
+            data = json.loads(raw)
+        except Exception:
+            await self._send_json(send, 400, {"error": "invalid JSON body"})
+            return
+        if not isinstance(data, dict):
+            await self._send_json(send, 400, {"error": "body must be a JSON object"})
+            return
+        if "monitor_rate" not in data:
+            await self._send_json(send, 400, {"error": "missing 'monitor_rate' field"})
+            return
+        value = data["monitor_rate"]
+        try:
+            rate = float(value)
+        except (TypeError, ValueError):
+            await self._send_json(send, 400, {"error": "monitor_rate must be a number"})
+            return
+        if not (0.0 <= rate <= 1.0):
+            await self._send_json(send, 400, {
+                "error": f"monitor_rate must be 0.0-1.0, got: {rate}"
+            })
+            return
+        self._monitor_rate = rate
+        self.metrics.set_monitor_rate(rate)
+        logger.info("monitor_rate 已更新: %s", rate)
+        await self._send_json(send, 200, {"monitor_rate": rate})
 
     def shutdown(self) -> None:
         for t in list(self._pending_tasks):

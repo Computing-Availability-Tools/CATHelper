@@ -150,7 +150,7 @@ class StoreConfig:
     alert_capacity: int = 500
     raw_trend_window_seconds: int = 3600
     trend_bucket_seconds: int = 60
-    trend_horizon_seconds: int = 86400
+    trend_horizon_seconds: int = 2592000  # 30 天（阶梯趋势事件保留上限）
 
     @classmethod
     def from_dict(cls, d: Mapping[str, Any]) -> "StoreConfig":
@@ -158,7 +158,7 @@ class StoreConfig:
         alert = _positive_number(d, "alert_capacity", "store") if "alert_capacity" in d else 500
         raw = _positive_number(d, "raw_trend_window_seconds", "store") if "raw_trend_window_seconds" in d else 3600
         bucket = _positive_number(d, "trend_bucket_seconds", "store") if "trend_bucket_seconds" in d else 60
-        horizon = _positive_number(d, "trend_horizon_seconds", "store") if "trend_horizon_seconds" in d else 86400
+        horizon = _positive_number(d, "trend_horizon_seconds", "store") if "trend_horizon_seconds" in d else 2592000
         if raw >= horizon:
             raise ConfigError(
                 f"store: raw_trend_window_seconds({raw}) 必须小于 trend_horizon_seconds({horizon})"

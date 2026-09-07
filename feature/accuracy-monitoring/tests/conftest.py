@@ -36,6 +36,7 @@ async def client_factory():
         enabled: bool = True,
         workers: int = 1,
         metrics_path: str = "/anomaly/metrics",
+        config_path: str = "/anomaly/config",
         real_runner: bool = False,
     ):
         fake = FakeVLLM(response_fn)
@@ -57,7 +58,10 @@ async def client_factory():
             metrics_path=metrics_path,
             monitor_rate=monitor_rate,
             detector_workers=workers,
+            config_path=config_path,
         )
+        mw._monitor_rate = mw.config.monitor_rate
+        mw.metrics.set_monitor_rate(mw._monitor_rate)
         mw._resolver = None
         mw._anomaly_store = None
         if real_runner:

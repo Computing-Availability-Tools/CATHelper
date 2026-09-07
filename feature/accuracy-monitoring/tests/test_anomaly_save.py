@@ -257,6 +257,48 @@ async def test_schedule_detection_normal_result_not_saved(tmp_path):
     assert store.counter == 0
 
 
+async def test_schedule_detection_saves_text_tokenid(tmp_path):
+    fp = tmp_path / "anom.pkl"
+    store = AnomalyStore(save_path=str(fp))
+    metrics = Metrics()
+    runner = _FakeRunner([[True, 1]])
+    lp = [np.array([[0.1, 0.2]], dtype=np.float32)]
+    tid = [np.array([[10, 20]], dtype=np.int32)]
+    task = schedule_detection(
+        runner, lp, tid,
+        request_id="req-1", model="m", metrics=metrics,
+        pending_tasks=set(),
+        anomaly_store=store, prompt="msg", texts=["hello"],
+        text_tokenids=[[100, 200]],
+        reasoning_contents=["thinking..."],
+    )
+    await task
+    with open(fp, "rb") as f:
+        data = pickle.load(f)
+    assert data[1]["text_tokenid"] == [100, 200]
+    assert data[1]["reasoning_content"] == "thinking..."
+
+
+async def test_schedule_detection_text_tokenid_defaults_empty(tmp_path):
+    fp = tmp_path / "anom.pkl"
+    store = AnomalyStore(save_path=str(fp))
+    metrics = Metrics()
+    runner = _FakeRunner([[True, 1]])
+    lp = [np.array([[0.1]], dtype=np.float32)]
+    tid = [np.array([[1]], dtype=np.int32)]
+    task = schedule_detection(
+        runner, lp, tid,
+        request_id="req-2", model="m", metrics=metrics,
+        pending_tasks=set(),
+        anomaly_store=store, prompt="p", texts=["t"],
+    )
+    await task
+    with open(fp, "rb") as f:
+        data = pickle.load(f)
+    assert data[1]["text_tokenid"] == []
+    assert data[1]["reasoning_content"] is None
+
+
 # --------------------------- SSE 文本累积（供异常保存）--------------------------- #
 def _entry(token_id, logprob=-0.1, n=3):
     tps = [
@@ -363,3 +405,161 @@ def test_sse_text_captured_across_logprobs_gap():
     assert sse.get_choice_texts() == ["ab"]
     lp, tid = sse.get_detection_data()
     assert len(lp) == 1 and len(tid) == 1
+
+
+# --------------------------- SSE text_tokenids + reasoning --------------------------- #
+def test_sse_chat_text_tokenids_aligned():
+    sse = SSEStreamProcessor(True, _orig(True), 3, resolver=None)
+    e = _entry(100)
+    sse.feed(_sse_bytes(_chat_chunk("a", e)))
+    sse.feed(_sse_bytes(_chat_chunk("b", e)))
+    sse.feed(b"data: [DONE]\n\n")
+    sse.flush()
+    tokenids = sse.get_choice_text_tokenids()
+    assert tokenids == [[100, 100]]
+    lp, tid = sse.get_detection_data()
+    assert len(tid[0]) == 2  # aligned
+
+
+def test_sse_chat_reasoning_content_accumulation():
+    sse = SSEStreamProcessor(True, _orig(True), 3, resolver=None)
+    e = _entry(100)
+    # thinking chunk: delta.reasoning_content, no delta.content
+    sse.feed(_sse_bytes({
+        "id": "x", "model": "m",
+        "choices": [{
+            "index": 0,
+            "delta": {"reasoning_content": "think"},
+            "logprobs": {"content": [dict(e)]},
+            "finish_reason": None,
+        }],
+    }))
+    # output chunk: delta.content
+    sse.feed(_sse_bytes(_chat_chunk("answer", e)))
+    sse.feed(b"data: [DONE]\n\n")
+    sse.flush()
+    assert sse.get_choice_texts() == ["answer"]
+    assert sse.get_choice_reasoning_contents() == ["think"]
+    tokenids = sse.get_choice_text_tokenids()
+    assert len(tokenids[0]) == 2  # thinking + output = 2 tokens
+
+
+def test_sse_completions_text_tokenids():
+    sse = SSEStreamProcessor(False, _orig(False), 3, resolver=None)
+    sse.feed(_sse_bytes(_comp_chunk("foo", 100)))
+    sse.feed(_sse_bytes(_comp_chunk("bar", 101)))
+    sse.feed(b"data: [DONE]\n\n")
+    sse.flush()
+    assert sse.get_choice_text_tokenids() == [[100, 101]]
+    assert sse.get_choice_reasoning_contents() == [None]
+
+
+def test_sse_multi_choice_text_tokenids():
+    sse = SSEStreamProcessor(True, _orig(True), 3, resolver=None)
+    e = _entry(100)
+    sse.feed(_sse_bytes(_chat_chunk("a", e, index=0)))
+    sse.feed(_sse_bytes(_chat_chunk("x", e, index=1)))
+    sse.feed(_sse_bytes(_chat_chunk("b", e, index=0)))
+    sse.flush()
+    tokenids = sse.get_choice_text_tokenids()
+    assert tokenids == [[100, 100], [100]]
+
+
+# --------------------------- ResponseInterceptor text_tokenid --------------------------- #
+async def test_interceptor_nonstream_chat_text_tokenids():
+    from anomaly_middleware.middleware import ResponseInterceptor, RequestContext
+
+    sent = []
+    async def send(msg):
+        sent.append(msg)
+
+    ctx = RequestContext(
+        orig=OriginalParams(is_chat=True, logprobs=True, top_logprobs=3,
+                           return_tokens_as_token_ids=False, n=1, stream=False),
+        is_chat=True, model="m", request_id="r", will_detect=True, top_logprobs=3,
+    )
+    interceptor = ResponseInterceptor(
+        send, ctx=ctx, runner=None, metrics=Metrics(),
+        pending_tasks=set(), resolver=None, anomaly_store=None,
+    )
+    from _helpers import chat_top_entry, build_chat_response
+    NI = "你"
+    e1 = chat_top_entry(100, NI, -0.1, n_top=5)
+    e2 = chat_top_entry(200, "好", -0.2, n_top=5)
+    data = build_chat_response("m", [e1, e2], reasoning_content="thinking...")
+    body = json.dumps(data, ensure_ascii=False).encode("utf-8")
+
+    await interceptor({"type": "http.response.start", "status": 200, "headers": []})
+    await interceptor({"type": "http.response.body", "body": body, "more_body": False})
+
+    assert interceptor.get_choice_text_tokenids() == [[100, 200]]
+    assert interceptor.get_choice_reasoning_contents() == ["thinking..."]
+
+
+async def test_interceptor_nonstream_completions_text_tokenids():
+    from anomaly_middleware.middleware import ResponseInterceptor, RequestContext
+    from _helpers import build_completions_response
+
+    sent = []
+    async def send(msg):
+        sent.append(msg)
+
+    ctx = RequestContext(
+        orig=OriginalParams(is_chat=False, logprobs=3, top_logprobs=None,
+                           return_tokens_as_token_ids=False, n=1, stream=False),
+        is_chat=False, model="m", request_id="r", will_detect=True, top_logprobs=3,
+    )
+    interceptor = ResponseInterceptor(
+        send, ctx=ctx, runner=None, metrics=Metrics(),
+        pending_tasks=set(), resolver=None, anomaly_store=None,
+    )
+    data = build_completions_response("m", [100, 200], [-0.1, -0.2], n_top=5)
+    body = json.dumps(data, ensure_ascii=False).encode("utf-8")
+
+    await interceptor({"type": "http.response.start", "status": 200, "headers": []})
+    await interceptor({"type": "http.response.body", "body": body, "more_body": False})
+
+    assert interceptor.get_choice_text_tokenids() == [[100, 200]]
+    assert interceptor.get_choice_reasoning_contents() == [None]
+
+
+async def test_interceptor_streaming_chat_text_tokenids_and_reasoning():
+    from anomaly_middleware.middleware import ResponseInterceptor, RequestContext
+
+    sent = []
+    async def send(msg):
+        sent.append(msg)
+
+    ctx = RequestContext(
+        orig=OriginalParams(is_chat=True, logprobs=None, top_logprobs=None,
+                           return_tokens_as_token_ids=False, n=1, stream=True),
+        is_chat=True, model="m", request_id="r", will_detect=True, top_logprobs=3,
+    )
+    interceptor = ResponseInterceptor(
+        send, ctx=ctx, runner=None, metrics=Metrics(),
+        pending_tasks=set(), resolver=None, anomaly_store=None,
+    )
+    e = _entry(100)
+    # thinking chunk
+    chunk1 = {
+        "id": "x", "model": "m",
+        "choices": [{
+            "index": 0,
+            "delta": {"reasoning_content": "think"},
+            "logprobs": {"content": [dict(e)]},
+            "finish_reason": None,
+        }],
+    }
+    # output chunk
+    chunk2 = _chat_chunk("answer", e)
+    sse_data = b"data: " + json.dumps(chunk1).encode() + b"\n\n"
+    sse_data += b"data: " + json.dumps(chunk2).encode() + b"\n\n"
+    sse_data += b"data: [DONE]\n\n"
+
+    await interceptor({"type": "http.response.start", "status": 200,
+                       "headers": [[b"content-type", b"text/event-stream"]]})
+    await interceptor({"type": "http.response.body", "body": sse_data, "more_body": False})
+
+    assert interceptor.get_choice_text_tokenids() == [[100, 100]]
+    assert interceptor.get_choice_reasoning_contents() == ["think"]
+    assert interceptor.get_choice_texts() == ["answer"]

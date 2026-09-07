@@ -223,13 +223,27 @@
     });
   }
 
-  function trendOption(legendData) {
+  function trendOption() {
     return {
       backgroundColor: 'transparent',
       animation: false,
-      tooltip: { trigger: 'axis' },
-      legend: { data: legendData, top: 0, left: 'center' },
-      grid: { left: 56, right: 24, top: 40, bottom: 32 },
+      tooltip: {
+        trigger: 'axis',
+        formatter: function (params) {
+          var p = params[0];
+          if (!p || !p.data) return '';
+          var d = p.data;
+          var time = fmtTime(d.value[0] / 1000);
+          var tag = d.source === 'imported' ? ' <span class="tag tag-imported">导入</span>' : '';
+          return (
+            '累计：' + d.value[1] + '<br>' +
+            '模型：' + (d.model || '-') + '<br>' +
+            '检出类别：' + illLabel(d.ill_type) + tag + '<br>' +
+            '检出时间：' + time
+          );
+        },
+      },
+      grid: { left: 56, right: 24, top: 24, bottom: 32 },
       xAxis: {
         type: 'time',
         axisLabel: { hideOverlap: true },
@@ -240,24 +254,22 @@
       yAxis: {
         type: 'value',
         minInterval: 1,
-        name: '事件数',
+        name: '累计异常数',
         nameLocation: 'middle',
         nameGap: 34,
         splitLine: { lineStyle: { color: '#eef1f6' } },
       },
       dataZoom: [{ type: 'inside' }],
-      series: legendData.map(function (label) {
-        var t = ILL_TYPES[legendData.indexOf(label)] || 'unknown';
-        return {
-          name: label,
+      series: [
+        {
           type: 'line',
+          step: 'end',
           showSymbol: false,
-          smooth: true,
-          lineStyle: { width: 2, color: ILL_COLORS[t] },
-          itemStyle: { color: ILL_COLORS[t] },
+          lineStyle: { width: 2, color: '#2563eb' },
+          itemStyle: { color: '#2563eb' },
           data: [],
-        };
-      }),
+        },
+      ],
     };
   }
 
@@ -354,29 +366,29 @@
       );
     }
 
-    // 按模型累计异常柱状图（固定柱宽 + 等间距自适应）
-    var modelEntries = Object.entries(s.by_model || {}).sort(function (a, b) {
+    // 按实例累计异常柱状图（固定柱宽 + 等间距自适应）
+    var instanceEntries = Object.entries(s.by_instance || {}).sort(function (a, b) {
       return b[1] - a[1];
     });
-    if (modelEntries.length === 0 || !modelChart) {
+    if (instanceEntries.length === 0 || !modelChart) {
       $('model-chart').classList.add('hidden');
       $('model-empty').classList.remove('hidden');
     } else {
       $('model-chart').classList.remove('hidden');
       $('model-empty').classList.add('hidden');
-      var layout = modelBarLayout(modelChart, modelEntries.length);
+      var layout = modelBarLayout(modelChart, instanceEntries.length);
       modelChart.setOption(
         {
           tooltip: { trigger: 'axis' },
           grid: { left: 40, right: 16, top: 24, bottom: 40 },
           xAxis: {
             type: 'category',
-            data: modelEntries.map(function (m) {
+            data: instanceEntries.map(function (m) {
               return m[0];
             }),
             axisLabel: {
               interval: 0,
-              rotate: modelEntries.length > 8 ? 40 : modelEntries.length > 4 ? 30 : 0,
+              rotate: instanceEntries.length > 8 ? 40 : instanceEntries.length > 4 ? 30 : 0,
             },
           },
           yAxis: { type: 'value', minInterval: 1 },
@@ -386,7 +398,7 @@
               barWidth: layout.barWidth,
               barCategoryGap: layout.barCategoryGap,
               itemStyle: { color: '#2563eb', borderRadius: [3, 3, 0, 0] },
-              data: modelEntries.map(function (m) {
+              data: instanceEntries.map(function (m) {
                 return m[1];
               }),
             },
@@ -397,12 +409,7 @@
   }
 
   function isEmptyTrend(points) {
-    if (!points || points.length === 0) return true;
-    return points.every(function (p) {
-      return ILL_TYPES.every(function (t) {
-        return !(p[t] > 0);
-      });
-    });
+    return !points || points.length === 0;
   }
 
   function renderTrend(chart, chartEl, emptyEl, points) {
@@ -415,21 +422,18 @@
     chartEl.classList.remove('hidden');
     emptyEl.classList.add('hidden');
 
-    var legendData = ILL_TYPES.map(illLabel);
-    var series = {};
-    ILL_TYPES.forEach(function (t) {
-      series[t] = [];
+    var data = (points || []).map(function (p) {
+      return {
+        value: [p.ts * 1000, p.cumulative],
+        model: p.model,
+        ill_type: p.ill_type,
+        instance: p.instance,
+        source: p.source,
+      };
     });
-    (points || []).forEach(function (p) {
-      ILL_TYPES.forEach(function (t) {
-        series[t].push([p.ts * 1000, p[t] || 0]);
-      });
-    });
-    var opt = trendOption(legendData);
-    ILL_TYPES.forEach(function (t) {
-      opt.series[ILL_TYPES.indexOf(t)].data = series[t];
-    });
-    // 合并模式更新：避免 notMerge 每次重建图表触发 enter 动画闪烁，并保留 dataZoom 缩放状态
+    var opt = trendOption();
+    opt.series[0].data = data;
+    // 合并模式更新：animation:false 无闪烁，保留 dataZoom 缩放状态
     chart.setOption(opt);
   }
 
@@ -523,7 +527,7 @@
   // 详情页：KPI + 趋势 + 类型分布
   // ------------------------------------------------------------------ //
   var currentInstance = null;
-  var detailWindow = '1h';
+  var detailWindow = '1day';
 
   function buildDetailKpis() {
     var wrap = $('detail-kpis');
@@ -543,12 +547,13 @@
     $('detail-instance-name').textContent = name;
     $('detail-instance-state').textContent = '';
     $('detail-current-user').textContent = $('current-user').textContent || '';
-    detailWindow = '1h';
+    detailWindow = '1day';
     var seg = $('detail-window-seg');
     seg.querySelectorAll('.seg-btn').forEach(function (b) {
-      b.classList.toggle('active', b.getAttribute('data-window') === '1h');
+      b.classList.toggle('active', b.getAttribute('data-window') === '1day');
     });
     setView('detail');
+    $('detail-import-instance-name').textContent = name;
     setTimeout(function () {
       detailTrendChart.resize();
       detailTypeChart.resize();
@@ -774,7 +779,7 @@
     var ok = window.confirm(
       '确认删除实例 ' +
         inst.name +
-        '？\n删除将清除该实例的事件 / 告警 / 趋势数据（不可恢复）。'
+        '？\n删除将清除该实例的事件 / 告警 / 趋势 / 全局累计统计数据（不可恢复）。'
     );
     if (!ok) return;
     var r = await api('/api/instances/' + encodeURIComponent(inst.name), { method: 'DELETE' });
@@ -784,7 +789,7 @@
         closeDetail();
         return;
       }
-      refreshInstances();
+      refreshNow();
     } else {
       var msg = r.data && r.data.detail ? r.data.detail : '删除失败';
       showToast(msg, true);
@@ -792,11 +797,112 @@
   }
 
   // ------------------------------------------------------------------ //
+  // 历史数据导入（异常 pickle → 阶梯趋势）
+  // ------------------------------------------------------------------ //
+  async function populateImportInstances() {
+    var sel = $('import-instance');
+    sel.innerHTML = '';
+    var r = await api('/api/instances');
+    if (r.ok && r.data) {
+      r.data.forEach(function (inst) {
+        var opt = el('option', '', inst.name);
+        opt.value = inst.name;
+        sel.appendChild(opt);
+      });
+    }
+    if (!sel.options.length) {
+      var opt = el('option', '', '（暂无实例，可手输）');
+      opt.value = '';
+      sel.appendChild(opt);
+    }
+  }
+
+  function toggleImportForm(show) {
+    var form = $('import-form');
+    if (show) {
+      populateImportInstances();
+      form.classList.remove('hidden');
+    } else {
+      form.classList.add('hidden');
+      $('import-file').value = '';
+    }
+  }
+
+  function toggleDetailImportForm(show) {
+    var form = $('detail-import-form');
+    if (show) {
+      $('detail-import-instance-name').textContent = currentInstance || '-';
+      form.classList.remove('hidden');
+    } else {
+      form.classList.add('hidden');
+      $('detail-import-file').value = '';
+    }
+  }
+
+  async function uploadImport(file, instance) {
+    if (!file) {
+      showToast('请选择文件', true);
+      return;
+    }
+    if (!instance) {
+      showToast('请指定实例名', true);
+      return;
+    }
+    var headers = authHeaders({});
+    delete headers['Content-Type'];
+    var resp;
+    try {
+      resp = await fetch(
+        '/api/import?instance=' + encodeURIComponent(instance),
+        { method: 'POST', headers: headers, body: file }
+      );
+    } catch (e) {
+      showToast('导入失败：网络错误', true);
+      return;
+    }
+    if (resp.status === 401) {
+      showLogin();
+      return;
+    }
+    var data = null;
+    try {
+      data = await resp.json();
+    } catch (e) {
+      data = null;
+    }
+    if (resp.ok && data) {
+      showToast(
+        '导入成功：' + data.imported + ' 条' +
+        (data.skipped ? '（跳过 ' + data.skipped + '）' : '') +
+        (data.cleared ? '，覆盖旧 ' + data.cleared + ' 条' : '')
+      );
+      refreshNow();
+    } else {
+      var msg = (data && data.detail) || '导入失败';
+      showToast(msg, true);
+    }
+  }
+
+  async function confirmImport() {
+    var file = $('import-file').files[0];
+    var instance = $('import-instance').value;
+    await uploadImport(file, instance);
+    if (file && instance) toggleImportForm(false);
+  }
+
+  async function confirmDetailImport() {
+    var file = $('detail-import-file').files[0];
+    var instance = currentInstance;
+    await uploadImport(file, instance);
+    if (file && instance) toggleDetailImportForm(false);
+  }
+
+  // ------------------------------------------------------------------ //
   // 轮询
   // ------------------------------------------------------------------ //
   var polling = false;
   var pollTimer = null;
-  var currentWindow = '1h';
+  var currentWindow = '1day';
   var inFlight = false;
 
   function startPolling() {
@@ -931,6 +1037,22 @@
     bindSeg('detail-window-seg', function (w) {
       detailWindow = w;
     });
+
+    // 历史导入
+    $('import-btn').addEventListener('click', function () {
+      toggleImportForm($('import-form').classList.contains('hidden'));
+    });
+    $('import-cancel').addEventListener('click', function () {
+      toggleImportForm(false);
+    });
+    $('import-confirm').addEventListener('click', confirmImport);
+    $('detail-import-btn').addEventListener('click', function () {
+      toggleDetailImportForm($('detail-import-form').classList.contains('hidden'));
+    });
+    $('detail-import-cancel').addEventListener('click', function () {
+      toggleDetailImportForm(false);
+    });
+    $('detail-import-confirm').addEventListener('click', confirmDetailImport);
 
     // 点击横幅 → 展开告警面板
     $('alert-banner').addEventListener('click', openAlertPanel);

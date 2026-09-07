@@ -8,8 +8,10 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import logging
 import os
+import pickle
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -29,21 +31,72 @@ from .config import (
     InstanceConfig,
     WebUIConfig,
 )
-from .events import EventSynthesizer
-from .store import Store
+from .events import AnomalyEvent, EventSynthesizer, ill_type_name
+from .store import Store, TrendEvent
 
 logger = logging.getLogger("webui.main")
 
-# 趋势时间窗白名单（§8）：1h / 4h / 8h / 16h / 24h
+# 趋势时间窗白名单：1day / 7day / 30day（天计数，最多近一个月）
 TREND_WINDOWS: Dict[str, int] = {
-    "1h": 3600,
-    "4h": 14400,
-    "8h": 28800,
-    "16h": 57600,
-    "24h": 86400,
+    "1day": 86400,
+    "7day": 604800,
+    "30day": 2592000,
 }
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
+
+
+class _SafeUnpickler(pickle.Unpickler):
+    """受限反序列化：拒绝任何全局对象（防 pickle 代码执行）。
+
+    中间件落盘的异常数据为纯 dict/int/str/list/float，不触发 find_class；
+    文件被篡改注入 GLOBAL/INST 操作码时直接拒绝。
+    """
+
+    def find_class(self, module, name):
+        raise pickle.UnpicklingError(f"不允许的全局对象: {module}.{name}")
+
+
+def parse_anomaly_pickle(data: bytes) -> "tuple[List[Dict[str, Any]], int]":
+    """解析异常 pickle 字节为记录列表 + 跳过条数。
+
+    每条记录取 time/ill_type/model_name 三字段；缺字段或转换失败跳过。
+    ill_type=0(normal) 与越界值跳过（非异常，不入趋势）。
+    返回的记录为 dict: {ts, ill_type(字符串名), model}。
+    """
+    try:
+        raw = _SafeUnpickler(io.BytesIO(data))
+        d = raw.load()
+    except pickle.UnpicklingError:
+        raise
+    except Exception as exc:
+        raise ValueError(f"pickle 解析失败: {exc}") from exc
+    if not isinstance(d, dict):
+        raise ValueError("文件内容不是异常数据字典")
+
+    records: List[Dict[str, Any]] = []
+    skipped = 0
+    for _key, rec in d.items():
+        if not isinstance(rec, dict):
+            skipped += 1
+            continue
+        try:
+            ts = float(rec.get("time"))
+            ill = int(rec.get("ill_type"))
+            model = str(rec.get("model_name") or "unknown")
+        except (TypeError, ValueError):
+            skipped += 1
+            continue
+        if ill < 1 or ill > 4:
+            skipped += 1
+            continue
+        name = ill_type_name(ill)
+        if name == "unknown":
+            skipped += 1
+            continue
+        records.append({"ts": ts, "ill_type": name, "model": model})
+    records.sort(key=lambda r: r["ts"])
+    return records, skipped
 
 
 class LoginRequest(BaseModel):
@@ -261,6 +314,7 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
                 "model": e.model,
                 "ill_type": e.ill_type,
                 "choice_index": e.choice_index,
+                "source": getattr(e, "source", "live"),
             }
             for e in c.store.recent_events(n)
         ]
@@ -276,7 +330,7 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
     @app.get("/api/trends", tags=["query"])
     async def api_trends(
         request: Request,
-        window: str = "1h",
+        window: str = "1day",
         user: str = Depends(require_user),
     ) -> Dict[str, Any]:
         if window not in TREND_WINDOWS:
@@ -286,7 +340,7 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
             )
         c: AppContext = request.app.state.ctx
         secs = TREND_WINDOWS[window]
-        points = c.store.query_trends(secs)
+        points = c.store.query_trend_events(secs)
         return {"window": window, "window_seconds": secs, "points": points}
 
     @app.get("/api/instances/{name}/summary", tags=["query"])
@@ -304,7 +358,7 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
         name: str,
         request: Request,
         user: str = Depends(require_user),
-        window: str = "1h",
+        window: str = "1day",
     ) -> Dict[str, Any]:
         if window not in TREND_WINDOWS:
             raise HTTPException(
@@ -315,7 +369,7 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
         if name not in c.current_instances():
             raise HTTPException(status_code=404, detail=f"实例 {name} 不存在")
         secs = TREND_WINDOWS[window]
-        points = c.store.query_trends_for_instance(name, secs)
+        points = c.store.query_trend_events(secs, instance=name)
         return {"window": window, "window_seconds": secs, "points": points}
 
     @app.get("/api/instances/{name}/events", tags=["query"])
@@ -337,6 +391,7 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
                 "model": e.model,
                 "ill_type": e.ill_type,
                 "choice_index": e.choice_index,
+                "source": getattr(e, "source", "live"),
             }
             for e in c.store.events_for(name, n)
         ]
@@ -409,6 +464,58 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
             new_list = [target if i.name == name else i for i in c.cm.last_config.instances]
             c._commit_instances(new_list)
             return c.instance_response(target)
+
+    # ------------------------------------------------------------------ #
+    # 历史数据导入（异常 pickle → 阶梯趋势事件）
+    # ------------------------------------------------------------------ #
+    @app.post("/api/import", tags=["admin"])
+    async def api_import(
+        request: Request,
+        instance: str = "",
+        user: str = Depends(require_user),
+    ) -> Dict[str, Any]:
+        c: AppContext = request.app.state.ctx
+        instance = (instance or "").strip()
+        if not instance:
+            raise HTTPException(status_code=400, detail="请指定实例名")
+        body = await request.body()
+        if not body:
+            raise HTTPException(status_code=400, detail="未收到文件内容")
+        try:
+            records, skipped = parse_anomaly_pickle(body)
+        except pickle.UnpicklingError:
+            raise HTTPException(status_code=400, detail="文件包含不允许的对象（安全拒绝）")
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        if not records:
+            raise HTTPException(status_code=400, detail="文件中未解析到有效异常记录")
+        # 构造 AnomalyEvent + TrendEvent（source=imported）
+        anomaly_events = [
+            AnomalyEvent(
+                id=c.store.alloc_event_id(),
+                ts=r["ts"], instance=instance, model=r["model"],
+                ill_type=r["ill_type"], choice_index="0", source="imported",
+            )
+            for r in records
+        ]
+        trend_events = [
+            TrendEvent(
+                ts=r["ts"], instance=instance, model=r["model"],
+                ill_type=r["ill_type"], source="imported",
+            )
+            for r in records
+        ]
+        cleared = c.store.apply_import(instance, anomaly_events, trend_events)
+        logger.info(
+            "导入历史异常: instance=%s, 导入=%d, 跳过=%d, 覆盖旧=%d",
+            instance, len(anomaly_events), skipped, cleared,
+        )
+        return {
+            "instance": instance,
+            "imported": len(anomaly_events),
+            "skipped": skipped,
+            "cleared": cleared,
+        }
 
     # ------------------------------------------------------------------ #
     # 静态前端（公开访问，登录页由前端控制）
