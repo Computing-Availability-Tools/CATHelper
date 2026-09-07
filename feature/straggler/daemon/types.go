@@ -18,6 +18,7 @@ type Config struct {
 	Interval    time.Duration // 循环周期，默认 600s
 	Port        int           // HTTP 端口，默认 8080
 	CollectWait time.Duration // dyno 触发成功后的等待秒数，默认 60s
+	Iterations  int           // dyno nputrace 采集迭代数（--profiler-iterations=，默认 1）
 	DynoBin     string        // dyno 可执行路径（build.sh 用 .deb 装到系统，启动时 PATH 解析）
 	DynologBin  string        // dynolog 可执行路径（build.sh 用 .deb 装到系统，启动时 PATH 解析）
 	Degradation float64       // 阈值参数透传（1+degradation / 1+degradation*5）
@@ -30,6 +31,7 @@ func DefaultConfig() Config {
 		Interval:    10 * time.Minute,
 		Port:        8080,
 		CollectWait: 60 * time.Second,
+		Iterations:  1,
 		Degradation: 0.3,
 	}
 }
@@ -53,20 +55,9 @@ type CycleResult struct {
 	KPI        *resource.DetectionResult `json:"-"`
 	KPIStatus  string                    `json:"kpi_status,omitempty"` // "ok" / "disabled..." / "skipped: ..." / "failed: ..."
 	Result     *utils.NodeOutput         `json:"-"`
-	Summary    CycleSummary              `json:"summary"`
+	Summary    map[string]int            `json:"summary"`
 	Report     string                    `json:"-"`
 	Error      string                    `json:"error,omitempty"`
-}
-
-// CycleSummary holds one cycle's anomaly counts, split by data dimension.
-//
-//	profiler: cal -> 卡数, comm -> 通信组数, cpu -> 节点数, npu_bubble -> 卡数
-//	kpi:      KPI 指标名 (temp/power/aicore_freq/...) -> 异常卡数
-//
-// kpi 段仅在 KPI 检测成功产出结果时存在；profiler 段恒有四个键。
-type CycleSummary struct {
-	KPI      map[string]int `json:"kpi,omitempty"`      // metric -> anomalous cards
-	Profiler map[string]int `json:"profiler,omitempty"` // cal/comm/cpu/npu_bubble -> count
 }
 
 // dynoResponse is the JSON snippet embedded in the dyno trigger command's
@@ -86,8 +77,8 @@ type DetectFunc func(inputPath string, degradation float64, debugOutput bool) (*
 // combined JSON, per-category anomaly counts, and the text report.
 type DetectResult struct {
 	NodeOutput *utils.NodeOutput
-	Summary    CycleSummary // profiler 段：cal=卡/comm=通信组/cpu=节点/npu_bubble=卡
-	Report     string       // report.GenerateReport text
+	Summary    map[string]int // cal/comm/cpu/npu_bubble -> anomaly counts
+	Report     string         // report.GenerateReport text
 }
 
 // CombinedOutput is the merged KPI + profiler result written as one JSON file
@@ -112,18 +103,36 @@ type statusResponse struct {
 // cycleSummary is the compact per-cycle entry served by /status and /history
 // (what a serialized CycleResult looks like without the heavy fields).
 type cycleSummary struct {
-	ID         int           `json:"id"`
-	StartedAt  time.Time     `json:"started_at"`
-	FinishedAt time.Time     `json:"finished_at"`
-	DurationMs int64         `json:"duration_ms"`
-	DBs        int           `json:"dbs"`
-	DumpDir    string        `json:"dump_dir"`
-	Summary    CycleSummary  `json:"summary"`
-	KPIStatus  string        `json:"kpi_status,omitempty"`
-	Error      string        `json:"error,omitempty"`
+	ID         int            `json:"id"`
+	StartedAt  time.Time      `json:"started_at"`
+	FinishedAt time.Time      `json:"finished_at"`
+	DurationMs int64          `json:"duration_ms"`
+	DBs        int            `json:"dbs"`
+	DumpDir    string         `json:"dump_dir"`
+	Summary    map[string]int `json:"summary"`
+	KPIStatus  string         `json:"kpi_status,omitempty"`
+	Error      string         `json:"error,omitempty"`
 }
 
 // historyResponse is the GET /straggler/results/history payload.
 type historyResponse struct {
 	Cycles []*cycleSummary `json:"cycles"`
+}
+
+// opMetricViewResponse is the aggregated op_metric view served by
+// /straggler/op_metric/latest and /straggler/op_metric/{id}: ranks → parsed
+// per-rank files.
+type opMetricViewResponse struct {
+	Cycle int                     `json:"cycle"`
+	Dir   string                  `json:"dir"`
+	Ranks map[string]opMetricRank `json:"ranks"`
+}
+
+// opMetricRank is one rank's three op_metric artifacts. group_info/host_info
+// are the JSON files as parsed; global_rank is the CSV turned into a JSON
+// object (single row) or array (multiple rows).
+type opMetricRank struct {
+	GroupInfo  map[string]any `json:"group_info"`
+	HostInfo   map[string]any `json:"host_info"`
+	GlobalRank any            `json:"global_rank"`
 }

@@ -71,8 +71,9 @@ func TestSpaceFreqAllNormal(t *testing.T) {
 	}
 }
 
-// Two cards downclocked to the SAME value (800 vs 1800 peers, ratio 2.25) are
-// BOTH flagged — the multi-card case the old peer-min direct method missed.
+// Two cards downclocked to the SAME value (800 vs 1800 peers, min-side
+// cluster/baseline ratio ≈ 0.444) are BOTH flagged — the multi-card case the
+// old peer-min direct method missed.
 func TestSpaceFreqMultiDownclock(t *testing.T) {
 	cfg := DefaultDetectionConfig()
 	cardIDs := freqCardIDs(8)

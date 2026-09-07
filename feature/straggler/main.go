@@ -54,6 +54,7 @@ func main() {
 	daemonPort := 8080
 	intervalSec := 600
 	collectWait := 60
+	profilerIterations := 1
 	profilerDir := ""
 	kpiDir := ""
 
@@ -93,6 +94,12 @@ func main() {
 			} else {
 				fmt.Fprintf(os.Stderr, "[SLOWNODE ALGO] WARNING: invalid --collect-wait value, using default 60\n")
 			}
+		case "--profiler-iterations":
+			if parsed, err := strconv.Atoi(val); err == nil && parsed > 0 {
+				profilerIterations = parsed
+			} else {
+				fmt.Fprintf(os.Stderr, "[SLOWNODE ALGO] WARNING: invalid --profiler-iterations value, using default 1\n")
+			}
 		case "--profiler-dir":
 			profilerDir = val
 		case "--kpi-dir":
@@ -130,7 +137,7 @@ func main() {
 	// ─────────────────────────────────────────────────────────────────
 	if daemonMode {
 		if profilerDir == "" {
-			fmt.Fprintf(os.Stderr, "Usage: slowNodeDetection --daemon --profiler-dir=/dir [--kpi-dir=/dir] [--daemon-port=8080] [--interval=600] [--collect-wait=60]\n")
+			fmt.Fprintf(os.Stderr, "Usage: slowNodeDetection --daemon --profiler-dir=/dir [--kpi-dir=/dir] [--daemon-port=8080] [--interval=600] [--collect-wait=60] [--profiler-iterations=1]\n")
 			fmt.Fprintf(os.Stderr, "ERROR: --daemon requires --profiler-dir (--kpi-dir is optional; omit to run profiler-only cycles)\n")
 			os.Exit(1)
 		}
@@ -155,6 +162,7 @@ func main() {
 		cfg.Port = daemonPort
 		cfg.Interval = time.Duration(intervalSec) * time.Second
 		cfg.CollectWait = time.Duration(collectWait) * time.Second
+		cfg.Iterations = profilerIterations
 		cfg.DynoBin = dynoBin
 		cfg.DynologBin = dynologBin
 		cfg.Degradation = degradation
@@ -358,16 +366,15 @@ func detectFromParsedData(inputPath string, degradation float64, debugOutput boo
 }
 
 // summarizeProfiler counts anomalies per profiler category for the cycle
-// summary. Units: cal = 卡, comm = 通信组, cpu = 物理节点数（同节点 rank 共享
-// host，按 hostUid 去重），npu_bubble = 卡。
-func summarizeProfiler(result config.DegradationData) daemon.CycleSummary {
-	return daemon.CycleSummary{
-		Profiler: map[string]int{
-			"cal":        len(result["cal"]),
-			"comm":       len(result["comm"]),
-			"cpu":        countCPUNodes(result["cpu"]),
-			"npu_bubble": len(result["npu_bubble"]),
-		},
+// summary (a flat map merged with per-metric KPI counts by the daemon). Units:
+// cal = 卡, comm = 通信组, cpu = 物理节点数（同节点 rank 共享 host，按 hostUid
+// 去重），npu_bubble = 卡。
+func summarizeProfiler(result config.DegradationData) map[string]int {
+	return map[string]int{
+		"cal":        len(result["cal"]),
+		"comm":       len(result["comm"]),
+		"cpu":        countCPUNodes(result["cpu"]),
+		"npu_bubble": len(result["npu_bubble"]),
 	}
 }
 

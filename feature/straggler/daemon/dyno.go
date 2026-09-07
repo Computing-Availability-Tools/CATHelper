@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -38,7 +39,7 @@ func (d *Daemon) triggerCollection() error {
 		"--certs-dir", "NO_CERTS",
 		"nputrace",
 		"--start-step", "-1",
-		"--iterations", "5",
+		"--iterations", strconv.Itoa(d.cfg.Iterations),
 		"--activities", "NPU,CPU",
 		"--profiler-level", "Level0",
 		"--msprof-tx",
