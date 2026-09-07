@@ -18,7 +18,7 @@ type Config struct {
 	Interval    time.Duration // 循环周期，默认 600s
 	Port        int           // HTTP 端口，默认 8080
 	CollectWait time.Duration // dyno 触发成功后的等待秒数，默认 60s
-	Iterations  int           // dyno nputrace 采集迭代数（--profiler-iterations=，默认 5）
+	Iterations  int           // dyno nputrace 采集迭代数（--profiler-iterations=，默认 1）
 	DynoBin     string        // dyno 可执行路径（build.sh 用 .deb 装到系统，启动时 PATH 解析）
 	DynologBin  string        // dynolog 可执行路径（build.sh 用 .deb 装到系统，启动时 PATH 解析）
 	Degradation float64       // 阈值参数透传（1+degradation / 1+degradation*5）
@@ -31,7 +31,7 @@ func DefaultConfig() Config {
 		Interval:    10 * time.Minute,
 		Port:        8080,
 		CollectWait: 60 * time.Second,
-		Iterations:  5,
+		Iterations:  1,
 		Degradation: 0.3,
 	}
 }

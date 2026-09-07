@@ -229,9 +229,11 @@ func (d *Daemon) runCycle(id int) {
 	cr.Summary = res.Summary
 	// Merge the KPI anomaly counts (per metric) into the cycle summary so
 	// history shows both dimensions; the kpi segment is absent when KPI
-	// detection produced no result.
+	// detection produced no result. Summary is a flat map: the profiler
+	// categories (cal/comm/cpu/npu_bubble) and each anomalous KPI metric's
+	// count coexist as top-level keys.
 	if cr.KPI != nil {
-		cr.Summary.KPI = kpiMetricCounts(cr.KPI, d.cfg.DebugOutput)
+		mergeSummary(cr.Summary, kpiMetricCounts(cr.KPI, d.cfg.DebugOutput))
 	}
 	cr.Report = res.Report
 
@@ -304,6 +306,13 @@ func (d *Daemon) detectKPI() (*resource.DetectionResult, string) {
 		return nil, fmt.Sprintf("failed: %v", err)
 	}
 	return res, "ok"
+}
+
+// mergeSummary copies src's key→count pairs into dst (dst wins on conflict).
+func mergeSummary(dst, src map[string]int) {
+	for k, v := range src {
+		dst[k] = v
+	}
 }
 
 // kpiMetricCounts builds the kpi sub-summary: per KPI metric, the number of

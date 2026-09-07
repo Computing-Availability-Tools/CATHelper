@@ -59,7 +59,7 @@ slowNodeDetection path=/data/dir [degradation=0.3] [--kpi-path=/dir/of/kpi_csvs 
 ```
 slowNodeDetection --daemon --profiler-dir=/dir [--kpi-dir=/dir] \
     [--daemon-port=8080] [--interval=600] [--collect-wait=60] \
-    [--profiler-iterations=5] [degradation=0.3] [--debug-output]
+    [--profiler-iterations=1] [degradation=0.3] [--debug-output]
 ```
 
 | 参数 | 类型 | 必需 | 默认 | 说明 |
@@ -70,7 +70,7 @@ slowNodeDetection --daemon --profiler-dir=/dir [--kpi-dir=/dir] \
 | `--daemon-port` | int | 否 | 8080 | HTTP 端口 |
 | `--interval` | int | 否 | 600 | 周期（秒，≥60，非法回退默认） |
 | `--collect-wait` | int | 否 | 60 | 触发后等待采集完成的秒数 |
-| `--profiler-iterations` | int | 否 | 5 | dyno nputrace 采集迭代数（传给 dyno 的 `--iterations`） |
+| `--profiler-iterations` | int | 否 | 1 | dyno nputrace 采集迭代数（传给 dyno 的 `--iterations`） |
 
 `--daemon` 未提供 `--profiler-dir` → 打印用法并退出（`--kpi-dir` 可选，缺省只跑 Profiler；见[第三章](#三守护进程模式daemon)）。
 
@@ -583,7 +583,7 @@ daemon_results/<start>/                # 每周期结果直接落盘于此（dum
 ### 3.4 采集链路与错误处理
 
 - **dynolog**：启动时 `--enable-ipc-monitor --certs-dir NO_CERTS` 拉起；IPC 已被占用 → 记日志复用现有实例（dyno 走 IPC 通信）。
-- **dyno 触发**：`nputrace --start-step -1 --iterations <N> --activities NPU,CPU --profiler-level Level0 --msprof-tx --export-type Db --log-file <profiler-dir>`（N = `--profiler-iterations`，默认 5）；从 stdout `"response = {...}"` 解析 JSON 校验。
+- **dyno 触发**：`nputrace --start-step -1 --iterations <N> --activities NPU,CPU --profiler-level Level0 --msprof-tx --export-type Db --log-file <profiler-dir>`（N = `--profiler-iterations`，默认 1）；从 stdout `"response = {...}"` 解析 JSON 校验。
 
 | 错误场景 | 周期结果 |
 |----------|----------|

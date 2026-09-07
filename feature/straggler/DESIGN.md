@@ -356,7 +356,7 @@ go run . --daemon \
     --kpi-dir=/home/nf/kpi \
     --interval=600 \
     --collect-wait=60 \
-    --profiler-iterations=5 \
+    --profiler-iterations=1 \
     --daemon-port=8080
 ```
 
@@ -368,7 +368,7 @@ go run . --daemon \
 | `--kpi-dir` | 否 | — | KPI 数据目录（CATMonitor JSONL，同 `--kpi-jsonl-dir` 语义；缺省只跑 Profiler） |
 | `--interval` | 否 | 600 | 循环周期（秒），默认 600 |
 | `--collect-wait` | 否 | 60 | dyno 触发成功后的等待秒数，默认 60 |
-| `--profiler-iterations` | 否 | 5 | dyno nputrace 采集迭代数（传给 dyno 的 `--iterations`） |
+| `--profiler-iterations` | 否 | 1 | dyno nputrace 采集迭代数（传给 dyno 的 `--iterations`） |
 | `--daemon-port` | 否 | 8080 | HTTP 监听端口 |
 
 > 注意：命令为可直接执行写法（续行 `\` 后不留注释/空格）；参数语义见上表。
@@ -388,7 +388,7 @@ profiler 数据由 dynolog（NPU 版）采集；vllm 服务进程需 `export MSM
         --start-step -1 --iterations <N> \
         --activities NPU,CPU --profiler-level Level0 \
         --msprof-tx --export-type Db --log-file <profiler-dir>
-   # N = 守护进程 CLI 的 --profiler-iterations，默认 5
+   # N = 守护进程 CLI 的 --profiler-iterations，默认 1
    # dyno 自身的参数名就是 --log-file；守护进程 CLI 用 --profiler-dir 指同一路径
 
 3. 解析 dyno stdout 中的 JSON（形如 "response = {...}"；stdout 还带前导
@@ -407,7 +407,7 @@ profiler 数据由 dynolog（NPU 版）采集；vllm 服务进程需 `export MSM
    processesMatched 为空          -> 目标进程未匹配（vllm 未运行或未设
                                       MSMONITOR_USE_DAEMON=1），周期失败并提示
 
-4. 固定等待 --collect-wait（默认 60s），让 --iterations（默认 5，--profiler-iterations 可调）个迭代完成落盘
+4. 固定等待 --collect-wait（默认 60s），让 --iterations（默认 1，--profiler-iterations 可调）个迭代完成落盘
 
 5. 数据目录 = **整个 --profiler-dir 根目录**（不是某个 rank 子目录）。dyno 在根下
    **每个 rank 写一个 master_<pid>_<ts>_ascend_pt 子目录**，所以根目录就是本轮全部

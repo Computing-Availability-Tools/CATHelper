@@ -48,7 +48,11 @@ ver_ge() {
         ib="${b%%.*}"; [ -n "$ib" ] || ib=0
         if [ "$ia" -gt "$ib" ]; then return 0; fi
         if [ "$ia" -lt "$ib" ]; then return 1; fi
-        a="${a#*.}"; b="${b#*.}"
+        # 相等：去掉已比较的第一段。注意 `${s#*.}` 对不含 "." 的串会原样
+        # 返回自身，导致最后一个分量永远去不掉而 while 死循环（如比较
+        # 1.23.4 vs 1.23.4）；此处对无 "." 的最终分量显式置空以终止循环。
+        case "$a" in *.*) a="${a#*.}" ;; *) a="" ;; esac
+        case "$b" in *.*) b="${b#*.}" ;; *) b="" ;; esac
     done
     return 0
 }
@@ -263,6 +267,13 @@ fi
 # ---------------------------------------------------------------------------
 # 5. Go toolchain: require go.mod's version, fetch from Aliyun when missing/old
 # ---------------------------------------------------------------------------
+# GOTOOLCHAIN=local: never let `go` auto-download a newer toolchain. go.mod
+# declares go 1.23.4; when the local go is older, `go version`/`go build` with
+# the default GOTOOLCHAIN=auto would block trying to fetch from
+# proxy.golang.org / golang.org (often unreachable), hanging the build. We
+# detect the version ourselves and fetch a matching toolchain from Aliyun below.
+export GOTOOLCHAIN=local
+
 GO_VERSION_REQ=$(grep -E '^go ' go.mod | awk '{print $2}' | head -n 1 || true)
 [ -z "$GO_VERSION_REQ" ] && GO_VERSION_REQ="1.23.4"
 
@@ -279,7 +290,14 @@ GO_BIN=""
 GO_INSTALLED=""
 for c in "${GO_CANDS[@]}"; do
     [ -x "$c" ] || continue
-    v=$("$c" version 2>/dev/null | grep -oE 'go[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n 1 | sed 's/^go//' || true)
+    # 抓完整输出用 bash 参数展开解析版本，避免 grep/head 管道在 pipefail 下的边界问题。
+    raw=$("$c" version 2>/dev/null || true)
+    v=${raw#go version }   # "go version go1.23.4 linux/arm64" -> "go1.23.4 linux/arm64"
+    v=${v#go}              # -> "1.23.4 linux/arm64"
+    v=${v%% *}             # -> "1.23.4"
+    case "$v" in
+        *[!0-9.]*) v="" ;;
+    esac
     if [ -n "$v" ] && ver_ge "$v" "$GO_VERSION_REQ"; then
         GO_BIN="$c"; GO_INSTALLED="$v"; break
     fi
@@ -301,7 +319,7 @@ if [ "$GO_OK" -ne 1 ]; then
     command -v wget >/dev/null 2>&1 || { echo "[build] ERROR: wget not found" >&2; exit 1; }
     GO_URL="https://mirrors.aliyun.com/golang/go${GO_VERSION_REQ}.linux-arm64.tar.gz"
     echo "[build]     downloading $GO_URL"
-    wget "${WGET_ARGS[@]}" -O "$WORK/go.tar.gz" "$GO_URL"
+    wget "${WGET_ARGS[@]}" --timeout=60 --tries=3 -O "$WORK/go.tar.gz" "$GO_URL"
 
     echo "[build]     installing Go $GO_VERSION_REQ -> $GO_ROOT"
     if [ -d "$GO_ROOT" ]; then
