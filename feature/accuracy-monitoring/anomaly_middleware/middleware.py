@@ -456,7 +456,11 @@ class AnomalyMiddleware:
         # 由 vLLM 原生处理（Bug #3 原则：中间件不做额外判断）。
         is_chat = _is_chat_path(path)
         orig = save_original_params(body, is_chat)
-        prompt = body.get("messages") if is_chat else body.get("prompt")
+        prompt = (
+            body.get("messages" if is_chat else "prompt")
+            if isinstance(body, dict)
+            else None
+        )
         new_body = inject_params(body, is_chat, self.config.top_logprobs)
         new_scope = _patch_scope_content_length(scope, len(new_body))
         request_id = uuid.uuid4().hex

@@ -269,9 +269,17 @@ def test_dingtalk_webhook_roundtrip_via_engine():
     asyncio.run(run())
 
 
-def test_email_channel_dispatch_and_failure_is_silent():
+def test_email_channel_dispatch_and_failure_is_silent(monkeypatch):
     """邮件通道：触发时调度 SMTP 发送；SMTP 失败仅记日志不影响主流程。"""
+    from webui import alerts as alerts_mod
     from webui.config import EmailConfig
+
+    # mock 掉真实 SMTP 网络发送：直接模拟"连接被拒"，
+    # 避免部分机器上防火墙/安全软件 DROP 连接导致 10s 超时 > wait_pending 的 5s
+    def fake_smtp_send(email_cfg, subject, body):
+        raise ConnectionRefusedError("mocked: connection refused")
+
+    monkeypatch.setattr(alerts_mod, "_smtp_send_sync", fake_smtp_send)
 
     async def run():
         st = Store(StoreConfig(event_capacity=100, alert_capacity=10,
@@ -281,14 +289,14 @@ def test_email_channel_dispatch_and_failure_is_silent():
             st.alerts,
             id_allocer=st.alloc_alert_id,
             email_cfg=EmailConfig(
-                enabled=True, smtp_host="127.0.0.1", smtp_port=1,
+                enabled=True, smtp_host="smtp.test.invalid", smtp_port=465,
                 from_addr="a@b.c", to_addrs=("x@y.z",),
             ),
         )
         eng.set_rules([AlertRule(name="r", ill_type=None, threshold=1, window_seconds=60)])
         eng.ingest(_evt("a", "m", "garbled", ts=1))
         await eng.wait_pending()
-        # SMTP 连接被拒 → 异常被吞，告警仍在缓冲
+        # SMTP 发送被拒（mock 抛异常）→ 异常被吞，告警仍在缓冲
         assert len(st.recent_alerts(10)) == 1
 
     asyncio.run(run())

@@ -36,7 +36,7 @@ async def _login(client):
 async def test_apis_require_auth(app_client):
     client, _, _ = app_client
     for path in ("/api/summary", "/api/instances", "/api/events", "/api/alerts",
-                 "/api/trends?window=1h"):
+                 "/api/trends?window=1day"):
         r = await client.get(path)
         assert r.status_code == 401, path
 
@@ -127,7 +127,7 @@ async def test_events_limit_clamped(app_client):
 async def test_trends_window_whitelist(app_client):
     client, _, _ = app_client
     h = await _login(client)
-    for w in ("1h", "4h", "8h", "16h", "24h"):
+    for w in ("1day", "7day", "30day"):
         r = await client.get(f"/api/trends?window={w}", headers=h)
         assert r.status_code == 200, w
     r = await client.get("/api/trends?window=3h", headers=h)
@@ -185,22 +185,33 @@ async def test_instance_trends(app_client):
     h = await _login(client)
     await client.post("/api/instances", json={"name": "x", "url": "http://x:1"}, headers=h)
     import time
+    from webui.events import AnomalyEvent, DeltaSummary
 
-    ts = time.time() - 10  # 落在 1h 窗口内的最近点
-    ctx.store.record_trend("x", "m", _trend_point(ts=ts, garbled=2))
-    r = await client.get("/api/instances/x/trends?window=1h", headers=h)
+    ts = time.time() - 10  # 落在 1day 窗口内的最近事件
+    d = DeltaSummary(requests=1)
+    d.events.append(AnomalyEvent(id=1, ts=ts, instance="x", model="m",
+                                 ill_type="garbled", choice_index="0"))
+    ctx.store.record_delta("x", d)
+    r = await client.get("/api/instances/x/trends?window=1day", headers=h)
     assert r.status_code == 200
     data = r.json()
-    assert data["window"] == "1h"
-    assert data["points"][0]["garbled"] == 2
+    assert data["window"] == "1day"
+    assert data["points"][0]["cumulative"] == 1
+    assert data["points"][0]["ill_type"] == "garbled"
+    assert data["points"][0]["model"] == "m"
     # 其他实例的数据不被混入
-    ctx.store.record_trend("other", "m", _trend_point(ts=ts, nan_value=9))
-    r = await client.get("/api/instances/x/trends?window=1h", headers=h)
-    assert r.json()["points"][0]["nan_value"] == 0
+    d2 = DeltaSummary(requests=1)
+    d2.events.append(AnomalyEvent(id=2, ts=ts, instance="other", model="m",
+                                  ill_type="nan_value", choice_index="0"))
+    ctx.store.record_delta("other", d2)
+    r = await client.get("/api/instances/x/trends?window=1day", headers=h)
+    pts = r.json()["points"]
+    assert len(pts) == 1
+    assert pts[0]["cumulative"] == 1
     # window 白名单 + 实例不存在
     r = await client.get("/api/instances/x/trends?window=3h", headers=h)
     assert r.status_code == 400
-    r = await client.get("/api/instances/nope/trends?window=1h", headers=h)
+    r = await client.get("/api/instances/nope/trends?window=1day", headers=h)
     assert r.status_code == 404
 
 
@@ -220,15 +231,6 @@ async def test_instance_events_filtered(app_client):
     assert [e["instance"] for e in items] == ["x"]
     r = await client.get("/api/instances/nope/events", headers=h)
     assert r.status_code == 404
-
-
-def _trend_point(ts, **kw):
-    from webui.store import TrendPoint
-
-    p = TrendPoint(ts=ts)
-    for t, v in kw.items():
-        p.by_type[t] = v
-    return p
 
 
 # ------------------------------------------------------------------ #
