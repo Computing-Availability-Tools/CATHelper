@@ -20,11 +20,11 @@ CATHelper 是 CAT（Computing Availability Tools）技术架构的主体部分�
 
 | 项目 | 说明 |
 |------|------|
-| CATHelper 版本 | v0.2.3（2026-08-26） |
+| CATHelper 版本 | v0.2.4（2026-09-08） |
 | 底座 CATMonitor 版本 | v0.3.3（独立 Go module，`github.com/Computing-Availability-Tools/CATMonitor`） |
 | EEP 版本 | v0.1.0（vLLM 容错框架补丁 + 外部故障管理中心） |
-| Straggler 版本 | v0.2.2（独立 Go module，`github.com/Computing-Availability-Tools/CATHelper/feature/straggler`） |
-| Accuracy-Monitoring 版本 | v0.1.0（vLLM `--middleware` ASGI 中间件，Python 包 `anomaly_middleware`） |
+| Straggler 版本 | v0.2.3（独立 Go module，`github.com/Computing-Availability-Tools/CATHelper/feature/straggler`） |
+| Accuracy-Monitoring 版本 | v0.2.0（vLLM `--middleware` ASGI 中间件，Python 包 `anomaly_middleware`） |
 | 平台支持 | Linux (x86_64) 为主，CATMonitor 兼容 Windows；EEP/straggler daemon/accuracy-monitoring 需华为昇腾 A3 服务器 |
 | 许可证 | Apache-2.0 |
 
@@ -596,7 +596,7 @@ EEP（Elastic EP）实现推理大 EP 部署的卡级弹性容错，目前仅支
 
 ## 5. 上层特性 — Straggler 慢节点检测
 
-> 本节为 straggler 特性的架构与模块设计摘要（v0.2.3/v0.2.2）。完整设计见 [feature/straggler/README.md](../feature/straggler/README.md)、[DESIGN.md](../feature/straggler/DESIGN.md)（Profiler 检测 + 守护进程）与 [DESIGN_NPU_RESOURCE.md](../feature/straggler/DESIGN_NPU_RESOURCE.md)（KPI 资源检测）。
+> 本节为 straggler 特性的架构与模块设计摘要（v0.2.4/v0.2.3）。完整设计见 [feature/straggler/README.md](../feature/straggler/README.md)、[DESIGN.md](../feature/straggler/DESIGN.md)（Profiler 检测 + 守护进程）与 [DESIGN_NPU_RESOURCE.md](../feature/straggler/DESIGN_NPU_RESOURCE.md)（KPI 资源检测）。
 
 ### 5.1 特性定位
 
@@ -610,6 +610,8 @@ straggler 是 AI 智算集群中识别性能劣化 NPU 卡的**两道防线**检
 **检测顺序**：先 KPI（轻量、无侵入）→ KPI 发现异常 → 有 `path` 时继续跑 Profiler 做交叉验证；KPI 无异常 → 自动 fallback 到 Profiler 精查；仅 KPI 无 `path` → KPI 结果即为最终输出。两道结果合并进 `straggler_output.json`（只跑哪个维度就只有哪个键）。
 
 > **v0.2.3 重要变更**：① KPI 检测移除时间维度、历史基线、检测窗口、根因定界，异常**完全由空间维度 peer 对比**判定；② 新增守护进程模式 `--daemon`；③ 移除向 faultsub 回注 `straggler_detected` 事件的逻辑与 `--faultsub-url` 参数；④ 新增 `build.sh` 一键构建与 msmonitor 子模块；⑤ KPI/Profiler 空间检测统一走共享 `clustering` 包的 kmeans 比例算法。
+
+> **v0.2.4 增量**：① daemon 新增 `POST /daemon/stop` 优雅关闭（关闭时删除全部 `daemon_results/` 归档结果）与 `--profiler-iterations` 采集迭代数参数（默认 1）；② 每周期 `op_metric/` 归档至 `daemon_results/<start>/` 并新增聚合视图接口 `/straggler/op_metric/*`；③ `clustering` score 统一为簇均值/基线均值（min 侧阈值取倒数）；④ 修复慢通信检测链路（`idToXp`/Duration 键空间错位）与并行拓扑去重失效；⑤ 移除 `--faultsub-url` 参数及 faultsub 回注（代码落地）。
 
 ### 5.2 目录结构
 
@@ -831,10 +833,14 @@ bash build.sh          # 首次构建
 | `GET /straggler/results/{id}` | 指定周期 id 的合并结果 JSON | — |
 | `GET /straggler/report/latest` | 最近一轮 Profiler 文本报告（text/plain） | — |
 | `GET /straggler/report/{id}` | 指定周期 id 的 Profiler 文本报告 | — |
+| `GET /straggler/op_metric/latest` | 最近周期 op_metric 聚合视图（rank → group_info/host_info/op_metric 摘要） | — |
+| `GET /straggler/op_metric/{id}` | 指定周期 op_metric 聚合视图 | — |
+| `GET /straggler/op_metric/{id}/{file}` | 指定周期归档的单个原始 op_metric 文件（JSON/CSV） | — |
 | `POST /daemon/start` | 恢复运行（paused → running） | — |
 | `POST /daemon/pause` | 暂停（在跑的周期跑完，不再排新的） | — |
 | `POST /daemon/interval` | 修改检测周期 | `{"interval_sec": 300}`（60–86400） |
 | `POST /daemon/trigger` | 立即补跑一轮（已有周期在跑 → 409） | — |
+| `POST /daemon/stop` | 优雅关闭守护进程（幂等）：关 HTTP server、等在跑周期结束、清理 dynolog 子进程，并**删除全部 `daemon_results/` 归档结果** | — |
 
 #### 5.6.4 数据落盘与重启
 
@@ -848,6 +854,7 @@ bash build.sh          # 首次构建
 daemon_results/<start>/           # 每轮结果直接落盘于此（归档记录；查询数据源）
 ├── straggler_output.json          # 本轮合并结果（latest/{id} 经 JSONPath 读）
 ├── daemon_meta.json               # 周期元数据（归档记录，查询不读）
+├── op_metric/                     # 本轮 op_metric 中间产物归档（周期结束删 --profiler-dir 后仍可经 /straggler/op_metric/* 查询）
 └── analysis_result/detection_report.log   # 文本报告（归档记录，report/latest 走内存）
 ```
 
@@ -863,7 +870,8 @@ slowNodeDetection [path=<profiler_dir>] [degradation=0.3] \
 
 # 守护进程模式
 slowNodeDetection --daemon --profiler-dir=<dir> [--kpi-dir=<dir>] \
-    [--daemon-port=8080] [--interval=600] [--collect-wait=60] [degradation=0.3]
+    [--daemon-port=8080] [--interval=600] [--collect-wait=60] \
+    [--profiler-iterations=1] [degradation=0.3]
 ```
 
 | 参数 | 默认 | 说明 |
@@ -880,6 +888,7 @@ slowNodeDetection --daemon --profiler-dir=<dir> [--kpi-dir=<dir>] \
 | `--daemon-port` | 8080 | HTTP 端口 |
 | `--interval` | 600 | 检测周期（秒，≥60，非法回退默认） |
 | `--collect-wait` | 60 | dyno 触发成功后的等待秒数 |
+| `--profiler-iterations` | 1 | 透传 dyno `nputrace` 的采集迭代步数 |
 
 > `--baseline-hours`/`--detection-hours`/`--faultsub-url`/`--space-method`/`--space-z-threshold`/`--time-z-threshold`/`--time-weight`/`--no-trend`/`--no-fallback`/`--always-profiling` 等旧 flag 已移除。
 
@@ -1052,6 +1061,7 @@ accuracy-monitoring/
 ### 6.9 异常监控概率与请求关联标识
 
 - **异常监控概率**（`VLLM_ANOMALY_MONITOR_RATE`，默认 1.0，范围 0-1）：每目标请求抽 `rand`；`rand < monitor_rate` 选中走完整注入/恢复/检测链路；未选中 → **纯透传**（不读 body、不注入、不恢复、不检测）。`0` 永不检测，`1.0` 全检测。
+- **运行时动态调整**：`monitor_rate` 可经动态配置端点在运行时更新（`POST /anomaly/config`，见 §6.11.1），即时生效、不持久化（重启回退 env 初始值）；其余配置仍为启动期不可变。
 - **请求关联标识**：每被拦截请求生成 `request_id = uuid.uuid4().hex`；在 `http.response.start` 追加响应头 `x-anomaly-request-id` 后再发给下游，支持端到端追踪。
 
 ### 6.10 Prometheus 指标
@@ -1068,6 +1078,7 @@ accuracy-monitoring/
 | `vllm_anomaly_last_garbled` | Gauge | `model` | 最近乱码结果（ill_type=2） |
 | `vllm_anomaly_last_repetition` | Gauge | `model` | 最近重复结果（ill_type=3） |
 | `vllm_anomaly_last_nan_value` | Gauge | `model` | 最近 NaN 结果（ill_type=4） |
+| `vllm_anomaly_monitor_rate` | Gauge | — | 当前异常监控概率（运行时经 `/anomaly/config` 可更新） |
 
 `ill_type` 取值：`0`=normal, `1`=rare_character, `2`=garbled, `3`=repetition, `4`=nan_value（normal 只增 requests，不计 detected）。`model` 标签来自请求体 `model` 字段，缺失用 `"unknown"`。
 
@@ -1083,7 +1094,7 @@ accuracy-monitoring/
 4. eager 构造 `ILLDetector(config_path)`（主进程，验证 numpy 可用 + config 解析）；成功 → 丢弃实例（仅验证用）。
 5. 构造 `DetectorRunner(config_path, max_workers, topk_n, tk2cat, vocab_size)`（含 `ProcessPoolExecutor`，initializer 注入 tk2cat）。
 
-`enabled=False` → 跳过全部 eager 初始化（纯透传，指标端点仍可达报零值）。`__call__` 分派：非 http scope 透传；`GET <metrics_path>` 内联响应；非 POST/非目标路径/`enabled=False` 透传；异常监控概率未选中纯透传；选中走读 body→注入→恢复→检测链路。
+`enabled=False` → 跳过全部 eager 初始化（纯透传，指标端点仍可达报零值）。`__call__` 分派：非 http scope 透传；`GET <metrics_path>` 内联响应；动态配置端点（`GET/POST <config_path>`，默认 `/anomaly/config`，路径 `VLLM_ANOMALY_CONFIG_PATH` 可配）内联响应——GET 返回当前 `{"monitor_rate": <float>}`，POST 校验 ∈ [0.0, 1.0] 后更新 `self._monitor_rate` 并同步 gauge（校验失败 400 且当前值不变；其他 method 透传；无认证、不持久化、`enabled=False` 仍可达）；非 POST/非目标路径/`enabled=False` 透传；异常监控概率未选中纯透传；选中走读 body→注入→恢复→检测链路。
 
 #### 6.11.2 ResponseInterceptor（响应拦截器）
 
@@ -1127,7 +1138,7 @@ accuracy-monitoring/
 
 ### 6.12 异常信息本地保存（`anomaly_store.py`）
 
-当某被检测请求的某候选检出异常时，把异常现场保存为本地 pickle 文件（dict，key=异常编号，value=`time`/`prompt`/`ill_type`/`topk_logprobs`/`tokens_ids`/`text`/`model_name`）。`VLLM_ANOMALY_SAVE_PATH` 控制：未设不落盘（异常编号仍由内存计数器累加，重启归零）；以 `.pkl` 结尾→文件模式；否则→文件夹模式（文件名=`<served_model_name>.pkl`）。启动期 fail-fast 校验目录/父目录存在性；磁盘写经 `loop.run_in_executor` offload 到线程，`asyncio.Lock` 串行化，事件循环不阻塞；保存失败 → catch + log，不影响客户端/检测/后续请求。
+当某被检测请求的某候选检出异常时，把异常现场保存为本地 pickle 文件（dict，key=异常编号，value=`time`/`prompt`/`ill_type`/`topk_logprobs`/`tokens_ids`/`text`/`model_name`/`text_tokenid`（per-choice 实际生成 token_id 序列，非流式与流式 SSE 累积均可）/`reasoning_content`（chat 思维链文本，非 chat 或无则为 null））。`VLLM_ANOMALY_SAVE_PATH` 控制：未设不落盘（异常编号仍由内存计数器累加，重启归零）；以 `.pkl` 结尾→文件模式；否则→文件夹模式（文件名=`<served_model_name>.pkl`）。启动期 fail-fast 校验目录/父目录存在性；磁盘写经 `loop.run_in_executor` offload 到线程，`asyncio.Lock` 串行化，事件循环不阻塞；保存失败 → catch + log，不影响客户端/检测/后续请求。
 
 ### 6.13 环境变量
 
@@ -1138,12 +1149,13 @@ accuracy-monitoring/
 | `VLLM_ANOMALY_TOP_LOGPROBS` | `20` | 注入的 top-logprobs 数量，1-20 |
 | `VLLM_ANOMALY_DETECTOR_WORKERS` | `4` | 检测进程池 worker 数，≥1 |
 | `VLLM_ANOMALY_METRICS_PATH` | `/anomaly/metrics` | 指标端点路径 |
+| `VLLM_ANOMALY_CONFIG_PATH` | `/anomaly/config` | 动态配置端点路径（GET 查询 / POST 更新 `monitor_rate`） |
 | `VLLM_ANOMALY_TOKENIZER_MODEL` | None | 显式 tokenizer 加载源（最高优先） |
 | `VLLM_ANOMALY_SAVE_PATH` | None | 异常详细数据本地保存路径（pkl） |
 
 ### 6.14 推理精度异常监控 Web 界面（`webui/`）
 
-独立的 Web 服务，支持多 vLLM 实例聚合可视化推理精度异常检测现象，并支持可配置的阈值告警和多渠道告警（界面告警 + Webhook（钉钉、飞书、企业微信）+ 邮箱通知）。详见 [feature/accuracy-monitoring/webui_README.md](../feature/accuracy-monitoring/webui_README.md)。
+独立的 Web 服务，支持多 vLLM 实例聚合可视化推理精度异常检测现象，并支持可配置的阈值告警和多渠道告警（界面告警 + Webhook（钉钉、飞书、企业微信）+ 邮箱通知）。v0.2.4 增强：新增历史数据导入（`POST /api/import`，将实例异常 pickle 落盘转换为阶梯趋势事件并入累计统计，可按实例清除）、趋势保留延长至 30 天（`trend_horizon_seconds` 默认 2592000）、环形缓冲默认容量调整（事件 1000 / 告警 200）。详见 [feature/accuracy-monitoring/webui_README.md](../feature/accuracy-monitoring/webui_README.md)。
 
 ### 6.15 关键设计决策
 
@@ -1451,4 +1463,4 @@ accuracy-monitoring 作为 **vLLM 进程内 ASGI 中间件**运行，**不依赖
 
 ---
 
-*文档版本：v2.0 · 对应 CATHelper v0.2.3 · 整合对象：CATMonitor v0.3.3 + Elastic EP v0.1.0 + Straggler v0.2.2 + Accuracy-Monitoring v0.1.0 · 传输：HTTP Webhook + JSON + JSONL 文件 + vLLM ASGI 中间件 · 支持跨机*
+*文档版本：v2.1 · 对应 CATHelper v0.2.4 · 整合对象：CATMonitor v0.3.3 + Elastic EP v0.1.0 + Straggler v0.2.3 + Accuracy-Monitoring v0.2.0 · 传输：HTTP Webhook + JSON + JSONL 文件 + vLLM ASGI 中间件 · 支持跨机*

@@ -4,6 +4,62 @@
 
 ---
 
+## v0.2.4
+
+| 项目 | 说明 |
+|------|------|
+| 版本号 | v0.2.4 |
+| 发布时间 | 2026-09-08 |
+| 发布人 | sunnytao |
+| 平台支持 | Linux (x86_64)；NPU 容错/检测特性需华为昇腾 A3 服务器（daemon 模式需 aarch64 + Ascend NPU + CANN） |
+| 组成 | 底座 CATMonitor v0.3.3（**版本号不变**）+ 上层特性 Elastic EP v0.1.0（**版本号不变**）+ Straggler 慢节点检测 v0.2.3 + Accuracy-Monitoring 推理精度异常检测 v0.2.0 |
+| 许可证 | Apache-2.0 |
+
+### 版本定位
+
+在 v0.2.3 基础上，合入 `straggler-detection` 与 `feature/accuracy-monitoring` 分支更新（约 29 个提交）：Straggler 守护进程运维能力增强（优雅关闭、采集步数参数、op_metric 归档与聚合查询）并修复慢通信检测链路多处缺陷；Accuracy-Monitoring 新增**运行时动态配置端点**、异常落盘增强（输出 token id + 思维链）与 WebUI 优化。**底座 CATMonitor 与 EEP 版本号不变**，Straggler 由 v0.2.2 升至 v0.2.3，Accuracy-Monitoring 由 v0.1.0 升至 v0.2.0。
+
+### 主要变更
+
+#### 上层特性 — Straggler 慢节点检测 v0.2.3
+
+- **新增 `POST /daemon/stop`**：优雅关闭守护进程（幂等，重复调用为 no-op）；关闭时删除全部 `daemon_results/` 归档落盘结果（`dump_dir`），HTTP server 关闭、在跑周期等待结束、dynolog 子进程清理。
+- **新增 `--profiler-iterations` 参数**：透传 dyno `nputrace` 采集迭代数，默认 **1**（较 v0.2.3 初版的 5 调低，缩短单周期采集耗时）。
+- **op_metric 归档与聚合查询**：每周期结束时将 `op_metric/` 中间产物复制归档至 `daemon_results/<start>/`（周期结束 `--profiler-dir` 整目录删除后仍可查），并新增聚合视图接口 `GET /straggler/op_metric/latest`、`GET /straggler/op_metric/{id}`、`GET /straggler/op_metric/{id}/{file}`。
+- **检测算法重构**：`clustering` score 统一为**簇均值/基线均值**（双方向各检一次取标记少的簇，min 侧阈值取倒数），KPI 空间检测与 Profiler 均质化聚类语义一致。
+- **移除 faultsub 回注（代码落地）**：正式移除 `--faultsub-url` 参数及向 faultsub 回注 `straggler_detected` 事件的逻辑（v0.2.3 已文档化预告，本次代码移除）。命中慢卡由 daemon HTTP 接口或结果文件消费。
+- **Bug 修复**：修复并行拓扑去重失效（tp 重复组）、`idToXp` 键空间错误致慢通信不可检测、dataparse 通信组 Duration 反向映射键空间错位、daemon `fileWriteOnce` 未按周期重置致后续周期拓扑丢失、Summary 扁平化残留旧结构体引用与降频检测断言、`build.sh` `ver_ge` 版本比较死循环（并禁用 GOTOOLCHAIN 自动下载、为 Go 下载加超时）。
+- **文档同步**：`feature/straggler/README.md` 按用户执行顺序重写（安装构建前置 + 最新接口与默认值），补充 C++/Rust 依赖与 `mindstudio_monitor` 手动编译说明。
+
+#### 上层特性 — Accuracy-Monitoring 推理精度异常检测 v0.2.0
+
+- **新增运行时动态配置端点**：`GET/POST <VLLM_ANOMALY_CONFIG_PATH>`（默认 `/anomaly/config`，路径可配）内联响应——GET 返回当前 `{"monitor_rate": <float>}`；POST 校验 ∈ [0.0, 1.0] 后即时更新请求监控概率（下一请求生效），校验失败 400 且当前值不变；不持久化（重启回退 env 初始值），无认证（同 metrics 端点），`enabled=False` 时端点仍可达。
+- **新增 Prometheus 指标**：`vllm_anomaly_monitor_rate` Gauge（当前监控概率，运行时可更新）。
+- **异常落盘增强**：落盘异常记录新增 `text_tokenid`（per-choice 实际生成 token_id 序列，非流式与流式 SSE 累积均可）与 `reasoning_content`（chat 思维链文本）字段。
+- **WebUI 优化**：多实例聚合页面与 store/前端增强；`webui.yaml` 默认容量调整（异常事件环形缓冲 10000→1000、告警 500→200、趋势保留 24h→30 天）。
+- **测试补充**：新增异常落盘、动态配置、e2e 采样指标降级等用例；测试用例修复。
+
+#### 底座 — CATMonitor / 上层特性 — EEP
+
+- **无变更**：底座 CATMonitor（v0.3.3）与 EEP（v0.1.0）代码与版本号均不变。
+
+### 测试
+
+- **CATMonitor（Go 1.23.4）**：`go test ./...` 全部通过（collectors/source/features 约 30 个包全绿）。
+- **Straggler（独立 Go module，Go 1.23.4）**：`go test ./...` 全绿（`clustering`/`resource` 包通过，其余包无测试文件）。
+- **Accuracy-Monitoring（Python 3.12，pytest）**：单元 + 集成 **374 passed / 12 skipped**；e2e 42 例标记 `nightly`/`full`，需真实 vLLM 服务与模型文件（本机未装 vllm、无模型路径），未能执行——失败/报错均为 `FileNotFoundError: 'vllm'` 环境缺失所致，非代码缺陷，待带 vLLM 环境的机器完整验证。
+- **构建注意**：两个 go.mod 均声明 `go 1.23.4`，需 Go ≥ 1.21 工具链（Go 1.20 报 "invalid go version" 无法解析，实测复现）；本机默认 `go` 为 1.20.10 时需改用 1.23.4。
+
+### 已知限制
+
+1. **daemon 模式需 aarch64 真机**（继承 v0.2.3）：依赖 Ascend NPU + CANN + `torch_npu` + `mindstudio_monitor` wheel，dyno/dynolog 须由 `build.sh` 装到系统 PATH；跨平台编译产物仅支持一次性模式。
+2. **`POST /daemon/stop` 会删除全部归档结果**：优雅关闭时清空 `daemon_results/`，需保留历史请先自行备份或另行消费。
+3. **monitor_rate 动态配置不持久化**：经 `/anomaly/config` 更新的监控概率重启后回退 env 初始值。
+4. **e2e 测试需 vLLM 环境**：42 个 e2e 用例（`nightly`/`full` 标记）依赖真实 vLLM 服务与本地模型文件，CI/本机需预装后执行。
+5. **Go 工具链要求 ≥1.21**：`go 1.23.4` 格式的 go.mod 无法被 Go 1.20 及更早版本解析。
+
+---
+
 ## v0.2.3
 
 | 项目 | 说明 |

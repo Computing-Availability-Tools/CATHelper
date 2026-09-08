@@ -6,8 +6,8 @@
 
 | 项目 | 说明 |
 |------|------|
-| 版本号 | v0.2.3 |
-| 发布时间 | 2026-08-26 |
+| 版本号 | v0.2.4 |
+| 发布时间 | 2026-09-08 |
 | 许可证 | Apache-2.0 |
 
 ## 组成
@@ -18,18 +18,22 @@ CATHelper/
 │   ├── internal/          #   采集核心 + 7 部件采集器 + 14 来源层
 │   ├── features/          #   健康度 / snapshot 统一生产 / Web 仪表盘 / 能效监控 / Prometheus 导出 / 故障订阅推送 / KPI 输出
 │   └── configs/           #   catmonitor.yaml + metrics.yaml
-    └── feature/
+└── feature/
     ├── elastic-ep/        # 上层特性：推理大EP卡级弹性容错（EEP）
     │   ├── patches/       #   vLLM + vLLM-Ascend 容错框架补丁
     │   └── examples/      #   容错服务启动脚本 + 外部故障管理中心（订阅 CATMonitor）
-    └── straggler/         # 上层特性：慢节点（慢卡）检测
-        ├── main.go        #   统一入口（一次性 + --daemon 守护进程）
-        ├── daemon/        #   守护进程：dyno/dynolog 采集 + 周期检测 + HTTP 查询/控制
-        ├── resource/      #   第一道 KPI 资源检测（空间 peer 对比 + 共享 kmeans）
-        ├── profiling/     #   第二道 Profiler 检测（读 Ascend .db）
-        ├── clustering/    #   共享 kmeans 比例检测算法
-        ├── build.sh       #   aarch64 一键构建（dyno/dynolog + Python wheel + go build）
-        └── 3rdparty/msmonitor  # msmonitor 子模块（build.sh 引用）
+    ├── straggler/         # 上层特性：慢节点（慢卡）检测
+    │   ├── main.go        #   统一入口（一次性 + --daemon 守护进程）
+    │   ├── daemon/        #   守护进程：dyno/dynolog 采集 + 周期检测 + HTTP 查询/控制
+    │   ├── resource/      #   第一道 KPI 资源检测（空间 peer 对比 + 共享 kmeans）
+    │   ├── profiling/     #   第二道 Profiler 检测（读 Ascend .db）
+    │   ├── clustering/    #   共享 kmeans 比例检测算法
+    │   ├── build.sh       #   aarch64 一键构建（dyno/dynolog + Python wheel + go build）
+    │   └── 3rdparty/msmonitor  # msmonitor 子模块（build.sh 引用）
+    └── accuracy-monitoring/  # 上层特性：推理精度异常检测（vLLM ASGI 中间件）
+        ├── anomaly_middleware/  # 中间件包：拦截注入 / 恢复抽取 / 检测调度 / Prometheus
+        ├── webui/         #   多实例聚合监控 Web（阈值告警 + 通知 + 历史数据导入）
+        └── configs/       #   detector.yaml + webui.yaml
 ```
 
 ### 底座 — [CATMonitor](CATMonitor/)
@@ -48,9 +52,13 @@ EEP 的故障信息输入已与 CATMonitor 底座有机整合：通过 `faultsub
 
 慢节点（慢卡）检测特性。两道防线：第一道（KPI 资源指标检测）基于 NPU 资源指标做**空间 peer 对比**（取最后一个聚合点，同节点卡互比，共享 kmeans 比例检测，无历史基线/检测窗口）；第二道（Profiler 检测）读 Ascend PyTorch Profiler `.db`，均质化聚类检测慢计算/慢通信/慢CPU（按物理节点 hostUid 分组）/NPU Bubble。两道结果合并输出为一份 JSON。详见 [feature/straggler/README.md](feature/straggler/README.md)。
 
-straggler 既支持一次性手动运行，也支持**常驻守护进程模式**（`--daemon`）：周期性自动完成「触发采集 → 转换 → 解析 → 检测」全链路，结果通过 HTTP 查询与运维控制（`GET /status`/`/straggler/results/*`、`POST /daemon/{start,pause,interval,trigger}`，默认端口 `:8080`），适合接入运维/调度系统持续巡检。第一道（KPI）的数据来源已与 CATMonitor 底座有机整合：CATMonitor 通过 opt-in 的 `stragglerout` 模块输出专用 KPI 时序文件（`straggler_kpi_{date}.jsonl`），straggler 读该文件检测；第二道（Profiler）保留独立。整合设计见 [straggler_combination_DESIGN.md](feature/straggler/straggler_combination_DESIGN.md)。
+straggler 既支持一次性手动运行，也支持**常驻守护进程模式**（`--daemon`）：周期性自动完成「触发采集 → 转换 → 解析 → 检测」全链路，结果通过 HTTP 查询与运维控制（`GET /status`/`/straggler/results/*`/`/straggler/op_metric/*`、`POST /daemon/{start,pause,interval,trigger,stop}`，默认端口 `:8080`，`--profiler-iterations` 控制 dyno 采集步数），适合接入运维/调度系统持续巡检。第一道（KPI）的数据来源已与 CATMonitor 底座有机整合：CATMonitor 通过 opt-in 的 `stragglerout` 模块输出专用 KPI 时序文件（`straggler_kpi_{date}.jsonl`），straggler 读该文件检测；第二道（Profiler）保留独立。整合设计见 [straggler_combination_DESIGN.md](feature/straggler/straggler_combination_DESIGN.md)。
 
 > v0.2.3 起 straggler 不再向 faultsub 回注 `straggler_detected` 事件（命中慢卡改由 daemon HTTP 接口或结果文件消费）；KPI 时间维度/历史基线/根因定界已移除。
+
+### 上层特性 — [Accuracy-Monitoring 推理精度异常检测](feature/accuracy-monitoring/README.md)
+
+基于 vLLM `--middleware` 插件部署的纯 ASGI 中间件（Python 包 `anomaly_middleware`），在**无侵入、零参照知识**条件下实时检测推理输出崩溃类故障：生僻字 / 乱码 / 重复 / NaN 四类。中间件透明拦截请求并强制注入 logprobs 采集参数（top_logprobs 跨请求恒定），响应后恢复客户端原始参数语义，后台 fire-and-forget 异常检测，经独立 Prometheus 端点（`/anomaly/metrics`）暴露结果；检出异常现场可落盘（含输出 token id 与思维链文本），监控概率运行时可经 `/anomaly/config` 动态调整。配套多实例聚合 WebUI（阈值告警 + Webhook/邮箱通知 + 历史数据导入）。**不依赖 CATMonitor 底座**，随 vLLM 进程内运行。详见 [feature/accuracy-monitoring/README.md](feature/accuracy-monitoring/README.md)。
 
 ## 路线图
 
@@ -67,6 +75,7 @@ straggler 既支持一次性手动运行，也支持**常驻守护进程模式**
 | [CATMonitor/](CATMonitor/) | 底座子项目（README / SPEC / DESIGN / 使用手册 / 指标清单） |
 | [feature/elastic-ep/](feature/elastic-ep/) | EEP 特性子项目（SPEC / DESIGN / Release_Notes / 测试报告） |
 | [feature/straggler/](feature/straggler/) | Straggler 特性子项目（README / SPEC / DESIGN / 整合设计） |
+| [feature/accuracy-monitoring/](feature/accuracy-monitoring/) | 推理精度异常检测子项目（README / spec / design / webui_README / 测试报告） |
 
 ## 快速上手
 

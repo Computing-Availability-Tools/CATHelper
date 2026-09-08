@@ -334,6 +334,7 @@ bash build.sh          # 首次：架构检查 + 装 dyno/dynolog(.deb) + Python
     --interval=600 \                       # 可选：检测周期（秒，≥60，默认 600）
     --collect-wait=60 \                    # 可选：触发成功后等待采集完成秒数
     --daemon-port=8080 \                   # 可选：HTTP 端口（默认 8080）
+    --profiler-iterations=1 \              # 可选：dyno 采集迭代数（默认 1）
     --degradation=0.3                      # 可选：灵敏度（与一次性模式同义）
 ```
 
@@ -344,8 +345,10 @@ bash build.sh          # 首次：架构检查 + 装 dyno/dynolog(.deb) + Python
 | `GET /healthz` / `GET /status` | 存活探针 / 状态总览（state/interval/cycles/last_cycle/next_run_at） |
 | `GET /straggler/results/latest` / `/history?limit=N` / `/{id}` | 最近/全部历史/指定周期合并结果 JSON |
 | `GET /straggler/report/latest` / `/{id}` | 最近/指定周期 Profiler 文本报告 |
+| `GET /straggler/op_metric/latest` / `/{id}` / `/{id}/{file}` | 最近/指定周期 op_metric 聚合视图 / 该周期归档的原始 op_metric 文件 |
 | `POST /daemon/start` / `/pause` / `/trigger` | 恢复 / 暂停 / 立即补跑一轮（已有周期在跑 → 409） |
 | `POST /daemon/interval` | 改周期（body `{"interval_sec":300}`，60–86400） |
+| `POST /daemon/stop` | 优雅关闭守护进程（关闭时删除全部 `daemon_results/` 归档结果，需保留请先消费/备份） |
 
 ### 6.3 第二道 Profiler 检测（按需，独立）
 
@@ -472,4 +475,4 @@ kill -9 <worker_pid>
 
 ---
 
-*文档版本：v2.1 · 对应 CATHelper v0.2.3*
+*文档版本：v2.2 · 对应 CATHelper v0.2.4*
