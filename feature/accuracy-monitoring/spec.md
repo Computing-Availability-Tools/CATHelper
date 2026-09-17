@@ -10,6 +10,11 @@
 适用范围：vLLM 的 `/v1/chat/completions` 与 `/v1/completions` 在线推理请求端点，
 流式与非流式在线推理请求均覆盖。
 
+本文档覆盖两种部署形态：**单机模式**（§2-§5，检测组件以 `--middleware` 插件部署于
+vLLM 进程内）与 **PD 分离模式**（§6，检测能力上移至服务化代理 load_balance_proxy
+集中部署）。两种形态的请求注入、响应恢复、异常检测、指标暴露行为保持一致，
+差异仅在部署位置与 tokenizer/词表来源。
+
 ## 2. 功能需求
 
 ### 2.1 请求拦截
@@ -408,3 +413,150 @@ pickle 文件（dict，key=异常编号，value=异常信息）。环境变量 `
 - 工作进程异常时，不影响其他进程，异常计数 +1，池自动重建。
 - 推理期检测器异常 → 计 error，客户端不受影响，异常情况详细记录至日志，后续请求正常检测。
 - 单插件部署，构造 `(app)` 无 kwargs。
+- PD 分离模式（proxy 集成）的功能规格与验收标准见 §6。
+
+## 6. PD 分离部署规格（proxy 集成）
+
+本节规定 PD 分离（Prefill/Decode Disaggregation，P 节点负责 prefill、D 节点负责 decode）
+场景下精度异常检测的功能行为与验收标准。该模式下检测能力**上移至服务化代理
+（load_balance_proxy，下称 proxy）**，作为全局唯一检测点；P/D 节点启动命令保持纯净
+（不附加 `--middleware`）。除本节特别说明外，注入、恢复、检测、指标行为均与单机模式
+（§2）保持一致。设计依据见 `design.md` §9 与 `design_pd_proxy.md`。
+
+### 6.1 部署形态与拦截范围
+
+- **全局唯一检测点**：全局一份采样配置、一个 metrics 端点、一份 pkl 落盘、一个 webui
+  数据源；多 D 节点场景不产生多份结果。
+- **P/D 节点零侵入**：P/D 节点以纯净 `vllm serve` 命令拉起（仅含 KV 传输配置），
+  不加载检测组件。P 节点响应仅用于 KV 传输协商、由 proxy 内部消费（不面向客户端、
+  不含真正的生成序列），天然不参与检测；输出 token 序列 100% 产生于 D 节点。
+- **拦截范围**：仅 `/v1/chat/completions` 与 `/v1/completions`（与 §2.1 一致）；
+  proxy 内部端点（`/v1/metaserver`、`/healthcheck`、`/reset_prefix_cache` 等）行为不变。
+
+**验收**
+- P/D 节点启动命令不含 `--middleware`；客户端仅经 proxy 访问推理服务。
+- `/v1/metaserver` 等内部端点行为与未启用检测时一致。
+- 输出流首 token（含其 top-k logprobs）进入检测数据，检测无盲区——D 节点重新生成
+  首 token，其输出流天然完整，无需 P/D 结果聚合。
+
+### 6.2 词表类别映射与 token 文本表（离线预生成）
+
+proxy 所在服务器通常无模型文件，PD 模式**不加载 tokenizer**。检测所需 tk2cat
+（`{str(token_id): category}`）与 token 文本表（`{str(token_id): surface_text}`）
+由离线工具 `tools/gen_token_category.py` 预生成：
+
+- **离线生成**：在有模型/Tokenizer 的服务器执行（仅依赖 `transformers`，无需 GPU/NPU、
+  不访问网络）：
+  ```shell
+  python gen_token_category.py --model-path <模型目录> [--model-name <名称>] [--output-dir <目录>]
+  ```
+- **产物同名成对**：
+  - `token2category/<model_name>_<vocab_size>.json`：全词表类别映射（检测器 tk2cat）；
+  - `token_text/<model_name>_<vocab_size>.json`：全词表 `decode([id])` 文本表（响应恢复用）。
+  - 文件名仅用于人工识别，运行时不解析文件名语义；`vocab_size` 由映射内容推断
+    （`max(键) + 1`）。
+- **加载**：环境变量 `VLLM_ANOMALY_TOKEN2CATEGORY` 指定具体映射文件（PD 模式启用检测时
+  必填）；文本表默认取映射文件**兄弟目录 `token_text/` 下同名文件**，可用
+  `VLLM_ANOMALY_TOKEN_TEXT` 显式覆盖。两文件均启动期一次性 eager 加载（无懒加载、
+  无运行期查找），tk2cat 经 `DetectorRunner` 建池 initializer 注入 worker（与单机版
+  注入路径一致）。
+- **fail-fast**：已配置路径时，映射/文本表文件缺失或非法（非 JSON 对象、映射为空）
+  → proxy 启动终止并提示文件路径（显式配置错误不静默降级）；文件内个别 token 键缺失
+  → 按无词表降级规则处理（同 §2.13），不终止。
+
+**验收**
+- 映射/文本表文件不存在或非法 → proxy 启动失败并提示文件路径。
+- 文本表内个别 token 文本为空 → 该 token 还原走既有 bytes/null 兜底，不终止。
+- `model` 指标标签与 pkl `model_name` 字段取请求体 `model` 字段（缺失用 `"unknown"`），
+  与单机版一致；词表文件名不参与任何运行时语义。
+
+### 6.3 请求参数注入与响应恢复
+
+注入/恢复规则与单机模式完全一致（§2.2/§2.3/§2.15）：选中检测的请求在 proxy 转发路径上
+注入 `logprobs`/`top_logprobs`/`return_tokens_as_token_ids`（注入值 = `max(客户端原值, N)`），
+响应按客户端原始参数恢复（logprobs=null / topk 截断 / token 文本还原）。
+
+- 注入作用于 proxy 发往 D 节点的推理请求；发往 P 节点的 prefill 请求因复制请求体同样
+  携带注入参数（`max_tokens=1`，top-k 计算开销可忽略），其响应仅被 proxy 消费，不做恢复。
+- 客户端响应头含 `x-anomaly-request-id`（§2.9）。
+- 未选中采样的请求原样转发：请求体不修改、响应无恢复痕迹、无 `x-anomaly-request-id`。
+- strip 文本还原经 `StaticTokenTextResolver` 查预生成文本表实现（与单机版
+  `TokenTextResolver` 接口一致，调用侧零改动）；三层兜底行为与单机版一致（§4.7）。
+
+**验收**
+- 选中请求：D 收到的推理请求含注入参数；客户端响应无 `token_id:` 泄漏、top_logprobs
+  截断到客户端原值、未请求 logprobs 时 `choice.logprobs=null`；响应头含
+  `x-anomaly-request-id`。
+- 未选中请求：请求体与响应同未启用检测时一致。
+- 多候选 `n>1`：逐 choice 注入/恢复/检测，异常结果分别上报（同 §2.5）。
+
+### 6.4 全局采样与动态配置
+
+- 采样在 proxy 单点执行，规则同 §2.8；请求仅命中一个 D 节点，
+  请求级检测概率**全局精确等于** `monitor_rate`。
+- `POST /anomaly/config` 动态更新监控概率，**一次调用全局生效**（§2.17）；`GET` 返回
+  当前值；不持久化，重启回退初始值。
+- `enabled=false` → 纯透传不检测，`/anomaly/*` 端点仍可达报零值（同 §2.11）。
+
+**验收**
+- `monitor_rate=0.3` → 请求级被检测概率为 0.3。
+- `POST /anomaly/config` 更新后，下一请求即按新概率采样。
+- `enabled=false` → 不注入不检测，端点仍可达。
+
+### 6.5 流式处理、检测调度与 recompute 一致性
+
+- 流式 SSE 跨 chunk 重组后逐事件增量转发，不缓冲整流，`[DONE]` 透传（§2.4）；
+  检测数据跨 chunk 累积，流结束后调度检测（fire-and-forget，§2.5）。
+- **recompute 重试**（D 节点返回 `stop_reason=="recomputed"`，proxy 重构请求重发）：
+  上一轮不完整流不进检测——累积器重置，仅**最终成功流**完整检测一次。
+- 检测异常/进程池崩溃的故障隔离与单机模式一致（§2.6/§2.7）。
+
+**验收**
+- 流式：跨 chunk 半事件正确重组；客户端收到恢复后增量块 + `[DONE]`。
+- recompute：中间不完整流不产生检测记录，最终成功流检测且仅检测一次。
+- 检测异常不影响客户端响应与后续检测，计 detection-error 并记录日志。
+
+### 6.6 指标与落盘单点化
+
+- 指标与异常落盘复用单机实现（§2.10/§2.16），全局唯一一份：一个 metrics 端点、
+  一个 pkl 文件（异常编号全局唯一连续，重启续接）。
+- webui 无需任何聚合改造（指标结构不变）。
+
+**验收**
+- `GET /anomaly/metrics` 全局唯一且计数正确；pkl 异常编号连续且重启续接。
+- 多 D 节点场景不出现多份 metrics/pkl。
+
+### 6.7 集成模式
+
+提供三种**互斥**集成方式（不可叠加，叠加会双重采样/注入）：
+
+| 模式 | 方式 | proxy 脚本改动 | 适用场景 |
+|---|---|---|---|
+| A. handler 挂钩 | `ProxyAnomalyController` 在 proxy 请求处理函数内挂钩 | 多处 | 深度定制/调试 |
+| B. 一行包裹 | `app = build_proxy_middleware(app)`（复用单机版 ASGI 中间件） | 1 行 | 版本升级后快速重挂 |
+| C. 独立启动器 | `tools/run_proxy_with_anomaly.py <proxy脚本> [proxy原参数] [--anomaly-*...]` | 0 行（零修改） | 不改上游脚本，随版本直接替换 |
+
+- 模式 C 的 `--anomaly-*` 参数自动映射为 `VLLM_ANOMALY_*` 环境变量，proxy 原参数原样
+  透传；未配置 `VLLM_ANOMALY_TOKEN2CATEGORY` 且未显式禁用 → 按未启用检测运行
+  （proxy 行为与原版一致）。
+- 启动器检测到 proxy 脚本已内置挂钩（`_init_anomaly`）→ 拒绝启动并提示，防止双重集成。
+
+**验收**
+- 模式 C：proxy 原参数原样透传生效；`--anomaly-*` 映射生效。
+- 未配置词表文件且未显式禁用 → proxy 以原版行为运行。
+- 已挂钩脚本经启动器启动 → 报错退出并提示不可叠加。
+
+### 6.8 启动期 fail-fast 与推理期降级
+
+与单机模式语义一致（§2.13）：
+
+- **启动期 fail-fast**（`enabled=true` 时）：env/CLI 校验失败、`configs/detector.yaml`
+  缺失、词表/文本表文件缺失或非法、ILLDetector 构造失败 → proxy 启动终止，
+  不进入降级模式。`enabled=false` → 纯透传（端点仍可达），不校验上述依赖。
+- **推理期降级**：单请求检测异常 → log + 计 `detection_errors_total`，不影响客户端与
+  后续请求；进程池崩溃（`BrokenProcessPool`）→ 重建进程池 + 计 error；检测层全部异常
+  与转发主路径隔离，流处理内部异常兜底为**原样透传字节**并记日志。
+
+**验收**
+- 启动期硬依赖失败 → proxy 启动失败并提示原因；`enabled=false` → 正常启动纯透传。
+- 检测组件任何异常均不改变客户端收到的响应内容。
