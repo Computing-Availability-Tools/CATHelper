@@ -13,6 +13,10 @@ vllm serve <model> --middleware anomaly_middleware.AnomalyMiddleware
 
 中间件对客户端**透明**：拦截推理请求、强制采集 logprobs和token_id、后台运行算法异常检测、不影响客户端请求响应状态返回、并通过独立 Prometheus 端点暴露检测结果。客户端完全感知不到中间件的存在。
 
+除单机模式外，组件还支持 **PD 分离（Prefill/Decode Disaggregation）部署形态**：检测能力
+上移至服务化代理（load_balance_proxy）集中部署，作为全局唯一检测点，P/D 节点启动命令
+保持纯净（详见 §9 与 `design_pd_proxy.md`）。
+
 ### 1.2 设计原则
 
 - **透明优先**：`enabled=True` 和异常监控概率共同作用，决定请求是否注入、响应恢复和检测。但不影响客户端看到的响应。
@@ -63,6 +67,9 @@ project_root/
 ├── tests/                   # 单元测试 + 端到端测试
 ├── webui/                   # Web 精度可视化监控
 ├── docs/                    # 设计文档 + 规格 + README
+├── tools/                       # 辅助工具脚本
+│   ├── gen_token_category.py    # 离线生成词表类别映射 + token 文本表（PD 模式，§9.3）
+│   └── run_proxy_with_anomaly.py # PD 模式独立启动器：零修改运行 proxy 脚本并附加检测（§9.3）
 └── anomaly_middleware/          # Python 包
     ├── __init__.py            # 重导出 AnomalyMiddleware / ResponseInterceptor / RequestContext
     ├── middleware.py          # 统一中间件类 + RequestContext + ResponseInterceptor + eager 初始化
@@ -74,7 +81,9 @@ project_root/
     ├── token_categorizer.py   # token 分类纯函数 + 启动期 generate_tk2cat（§3.11）
     ├── detector.py            # ILLDetector 检测器本体（set_vocabulary + topk_n 参数）
     ├── detector_runner.py     # DetectorRunner（进程池+共享内存+调度+词表注入）
-    └── anomaly_store.py       # 异常信息本地保存（编号分配 + pickle 落盘，§3.12）
+    ├── anomaly_store.py       # 异常信息本地保存（编号分配 + pickle 落盘，§3.12）
+    └── proxy_integration.py   # PD 模式 proxy 集成层（§9.3）：ProxyAnomalyMiddleware /
+                                # ProxyAnomalyController / ProxyStreamProcessor / StaticTokenTextResolver
 ```
 
 ### 2.3 职责划分
@@ -92,6 +101,15 @@ project_root/
 | `ILLDetector` | 检测器本体：`set_vocabulary` 接受启动期映射；`topk_n` 参数消除首次锁定；`get_tk2cat` 返回映射或 (None,None) 降级 |
 | `PluginConfig` | 环境变量读取与校验（含 `detector_workers`）；检测器路径固定 `configs/detector.yaml` |
 | `Metrics` | 独立 registry；计数/直方图/gauge；渲染文本暴露 |
+
+PD 分离模式（§9）新增组件：
+
+| 组件 | 职责 |
+|---|---|
+| `ProxyAnomalyMiddleware` | PD 模式 ASGI 中间件：继承单机版 `AnomalyMiddleware`，完整复用其 `__call__`；仅替换初始化——无 tokenizer，启动期加载预生成 tk2cat + 文本表文件（fail-fast） |
+| `ProxyAnomalyController` | PD 模式 handler 挂钩控制器：`before_forward`（采样+快照+注入）→ `feed_stream`（流处理+事件上抛）→ `on_recompute`（重置累积）→ `finish`（收尾+调度检测） |
+| `ProxyStreamProcessor` | PD 模式流处理器：SSE 重组 + strip 恢复 + 检测数据累积 + 解析事件上抛（复用 `SSEStreamProcessor`）；非流式字节缓冲 + 整体 extract/strip |
+| `StaticTokenTextResolver` | 预生成 token 文本表查表（与 `TokenTextResolver.resolve` 同接口，strip 调用侧零改动） |
 
 ## 3. 核心功能设计
 
@@ -891,5 +909,135 @@ pip install -e .
 
 
 启动：`vllm serve <model> --middleware anomaly_middleware.AnomalyMiddleware`。
+
+## 9. PD 分离部署设计（proxy 集成）
+
+> 本章为 PD 分离（Prefill/Decode Disaggregation）场景的设计结论与实现要点；完整论证
+> （首 token 归属源码证据链、两版 proxy 脚本差异分析、方案选型对比）见 `design_pd_proxy.md`。
+> 单机模式（§1-§8）不受本章影响；对应功能规格见 `spec.md` §6。
+
+### 9.1 背景与设计动机
+
+PD 分离下，P 节点（`kv_role=kv_producer`）与 D 节点（`kv_role=kv_consumer`）以基本相同的
+命令拉起 `vllm serve`。若沿用单机 `--middleware` 方案存在以下问题：
+
+- **检测点混乱**：P 节点只做 prefill（请求被 proxy 改写为 `max_tokens=1`，响应被 proxy
+  内部消费、不面向客户端），在其上检测无意义且会产生误报（单 token 易触发
+  nan/repetition 误判）；输出 token 序列 100% 产生于 D 节点。
+- **结果多份**：每个 D 节点各挂一份 middleware → 各自独立的 metrics 端点、各自的 pkl
+  落盘（异常编号各自从 1 开始、互相冲突），webui 需聚合多源数据。
+- **采样与动态配置全局失效**：`monitor_rate` 在各 D 节点独立采样，不同节点 env 不一致时
+  全局行为不可预期；`POST /anomaly/config` 一次只能改一个节点。
+- **资源浪费**：各 D 节点重复加载 tokenizer、构建检测进程池、生成 tk2cat 词表映射，
+  挤占推理节点资源。
+- **误配风险**：多 P 多 D 时漏配/多配 `--middleware` 均无告警，配置漂移难以审计。
+
+**设计决策：检测能力上移到 proxy**，作为全局唯一检测点——一份结果、一个 metrics 端点、
+一个 pkl 文件、一次动态配置全局生效；P/D 节点零侵入（启动命令回归纯净）；检测语义与
+单机模式完全一致。
+
+### 9.2 总体架构与数据流
+
+proxy 是所有客户端请求的唯一入口与响应流唯一出口：
+
+- **请求侧**：在转发前完成采样与参数注入（dict 级修改，无需单机版的 receive 重放与
+  Content-Length 修补，框架会重新序列化）；
+- **响应侧**：在转发前完成 strip 恢复与检测数据累积，流结束后 fire-and-forget 调度检测；
+- **P 节点不参与检测**：其响应仅用于 KV 传输协商、被 proxy 内部消费；
+- **检测数据抽取自 D 节点输出流**：D 重新生成首 token，其输出流天然完整（含首 token 及
+  其 top-k logprobs），检测无盲区、无需 P/D 结果聚合（源码证据链见
+  `design_pd_proxy.md` §3.1.1）。
+
+部署形态图（P/D 节点命令纯净，proxy 为唯一检测点）与逐请求数据流（采样 → 注入 → D 流式
+响应重组/恢复/累积 → 流结束调度检测 → Metrics/AnomalyStore）见 `design_pd_proxy.md`
+§4.1/§4.2。
+
+### 9.3 组件设计与实现要点
+
+**新增模块 `proxy_integration.py`**（纯新增，不改动既有模块）：
+
+| 组件 | 职责 |
+|---|---|
+| `ProxyAnomalyMiddleware` | PD 模式 ASGI 中间件：继承单机版 `AnomalyMiddleware`，完整复用其 `__call__`（端点/采样/ASGI 注入/恢复/调度）；仅替换初始化——无 tokenizer，启动期加载预生成 tk2cat + 文本表文件（fail-fast） |
+| `ProxyAnomalyController` | handler 挂钩控制器（进程内单例）：`before_forward`（采样+快照+注入）→ `feed_stream`（SSE 重组+恢复+累积+事件上抛，内部异常兜底为原样透传）→ `on_recompute`（重置累积）→ `finish`（收尾+调度检测） |
+| `ProxyStreamProcessor` | 流式 SSE 重组 + strip 恢复 + 检测数据累积 + 解析事件上抛（复用 `SSEStreamProcessor`）；非流式字节缓冲 + 整体 extract/strip |
+| `StaticTokenTextResolver` | 预生成 token 文本表查表：`resolve(token_id) -> Optional[str]` 与 `TokenTextResolver` 同接口（duck-typing），strip 调用侧零改动；文本为空 → None → 既有 bytes/null 兜底 |
+
+**新增工具**：
+
+- `tools/gen_token_category.py`：离线词表映射生成工具（独立可执行，仅依赖 `transformers`，
+  分类逻辑与 `token_categorizer.py` 逐行一致，保证类别体系与运行期检测算法相同）；
+- `tools/run_proxy_with_anomaly.py`：独立启动器（零修改运行任意版本 proxy 脚本）。
+
+**词表类别映射与文本还原：离线预生成文件**（替代单机版运行期 tokenizer 加载——
+proxy 服务器通常无模型文件）：
+
+1. 在有模型/Tokenizer 的服务器执行 `gen_token_category.py --model-path <模型目录>`，
+   一次遍历产出**同名成对**两文件：`token2category/<model_name>_<vocab_size>.json`
+   （`{str(token_id): category}`）与 `token_text/<model_name>_<vocab_size>.json`
+   （`{str(token_id): surface_text}`）；文件名仅人工识别用，`vocab_size` 由映射内容推断
+   （`max(键) + 1`）；
+2. proxy 侧经 `VLLM_ANOMALY_TOKEN2CATEGORY` 指定具体映射文件，启动期一次性 eager 加载
+   （无懒加载、无运行期查找）；文本表默认取映射文件**兄弟目录 `token_text/` 下同名文件**
+   （`derive_token_text_path`），可用 `VLLM_ANOMALY_TOKEN_TEXT` 覆盖；
+3. tk2cat 经 `DetectorRunner` 建池 initializer 注入 worker——注入路径与单机版完全一致；
+4. fail-fast：文件缺失/非法（非 JSON 对象、映射为空）→ proxy 启动终止（显式配置错误
+   不静默降级）；文件内个别 token 键缺失 → 按检测器无词表降级规则处理（同 §3.11）。
+
+**集成模式**（三选一，互斥——叠加会双重采样/注入）：
+
+| 模式 | 方式 | proxy 脚本改动 | 适用场景 |
+|---|---|---|---|
+| A. handler 挂钩 | `ProxyAnomalyController` 挂入 `_handle_completions`/`generate_stream`，事件消费与 recompute 感知最精细 | 多处 | 深度定制/调试 |
+| B. 一行包裹 | `app = build_proxy_middleware(app)`（未配置词表时原样返回 app，零行为差异） | 1 行 | 版本升级后快速重挂 |
+| C. 独立启动器 | `tools/run_proxy_with_anomaly.py <proxy脚本> [proxy原参数] [--anomaly-*...]`：按路径导入 proxy 模块 → 包裹 app → uvicorn 启动；`--anomaly-*` 自动映射为 `VLLM_ANOMALY_*` 环境变量 | 0 行 | 不改上游脚本，随版本直接替换 |
+
+- 模式 B/C 的可行性依据：proxy 的 recompute 为**续写语义**（重发请求 prompt 含已生成
+  token），客户端可见流本身即完整序列——ASGI 中间件无感知 recompute，SSE 累积天然覆盖
+  全部 token（含首 token），无需重置逻辑；
+- 启动器检测到 proxy 脚本已内置挂钩（`_init_anomaly`）→ 拒绝启动并提示，防止双重集成；
+- 未配置词表且未显式禁用 → 按未启用检测运行（proxy 行为与原版逐字节一致）。
+
+**recompute 一致性**（模式 A）：D 节点返回 `stop_reason=="recomputed"` 触发 proxy 重构
+请求重发时，上一轮流是不完整推理——`on_recompute` 重置累积器与重组缓冲（`orig/model/
+prompt` 保留），已积累的不完整序列不送检测；`finish` 仅在生成器最终退出时调用一次，
+检测数据以**最终成功流**为准（避免重复计数/误检）。
+
+**全局采样与动态配置**：采样在 proxy 单点执行（规则同 §3.5）；请求只命中一个 D 节点，
+请求级检测概率**全局精确等于** `monitor_rate`；`POST /anomaly/config` 一次调用全局生效
+（复用单机版端点实现）。通用版 proxy 多 uvicorn worker 时，动态配置需经既有
+`SchedulerManager` 通道广播到各 worker（layerwise 版单进程无此问题，见
+`design_pd_proxy.md` §5.5）。
+
+**指标与落盘单点化**：复用 `metrics.py` / `anomaly_store.py` 不变——一个
+`CollectorRegistry`、一份 pkl（异常编号全局唯一连续、重启续接）；`model` 标签 /
+`model_name` 取请求体 `model` 字段（缺失 `"unknown"`），与单机版一致；webui 无需
+聚合改造。
+
+**降级**（对齐 §3.9）：启动期硬依赖（env/CLI 校验、`configs/detector.yaml`、词表/文本表
+文件、ILLDetector 构造）失败 → proxy 启动终止；推理期检测异常/进程池崩溃 → log + 计
+error + 不影响客户端与后续请求；检测层全部异常与转发主路径隔离——`feed_stream`/`finish`
+内部异常兜底为**原样透传字节**并记日志。
+
+**配置项**：沿用全部 `VLLM_ANOMALY_*` 环境变量（语义不变），新增
+`VLLM_ANOMALY_TOKEN2CATEGORY`（PD 模式启用检测必填）与 `VLLM_ANOMALY_TOKEN_TEXT`
+（可选覆盖文本表路径）；`VLLM_ANOMALY_TOKENIZER_MODEL` 在 PD 模式下不再使用。
+完整 CLI 参数见 `design_pd_proxy.md` §7。
+
+### 9.4 与单机模式的差异对照
+
+| 维度 | 单机（--middleware） | PD（proxy 集成） |
+|---|---|---|
+| 部署位置 | 每个 vllm serve 进程 | 仅 proxy（1 个） |
+| 拦截机制 | ASGI 中间件（receive 重放 + CL patch） | dict 级修改 / ASGI 包裹 |
+| 采样语义 | 每实例独立 | 全局精确单点 |
+| 动态配置 | 每实例分别 POST | 一次 POST 全局生效 |
+| 结果/指标/pkl | 每实例一份（冲突风险） | 全局唯一一份 |
+| strip 恢复位置 | vllm 进程内 | proxy 转发路径 |
+| recompute | 无此场景 | 模式 A 重置累积器；模式 B/C 续写语义天然覆盖 |
+| tokenizer | env/argv/HF 缓存自动发现 | 不加载：预生成 token2category/token_text 文件 |
+| 文本还原 | `TokenTextResolver`（tokenizer.decode） | `StaticTokenTextResolver`（预生成文本表查表，同接口） |
+| 首 token 检测 | 全序列由本实例生成 | D 重新生成首 token，D 流天然完整，无需聚合 |
+| P/D 节点改动 | 需加 `--middleware`（易错） | 零改动 |
 
 
