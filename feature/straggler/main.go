@@ -49,6 +49,8 @@ func main() {
 	degradation := 0.3
 	spaceRatioThreshold := 0.0 // 0 = use the default SpaceRatioThreshold (2.0)
 	debugOutput := false       // --debug-output: include all normal+abnormal data (kpi.debug / profiler.debug) in straggler_output.json
+	commSlowRatio := 1.3       // --comm-slow-ratio: bandwidth degradation threshold for slow-domain detection
+	commMinCount := 1000       // --comm-min-count: minimum op count included in bandwidth stats
 
 	// Daemon-mode flags.
 	daemonMode := false
@@ -154,8 +156,25 @@ func main() {
 			} else {
 				fmt.Fprintf(os.Stderr, "[SLOWNODE ALGO] WARNING: invalid --space-ratio-threshold value, using default\n")
 			}
+		case "--comm-slow-ratio":
+			if parsed, err := strconv.ParseFloat(val, 64); err == nil && parsed > 1 {
+				commSlowRatio = parsed
+			} else {
+				fmt.Fprintf(os.Stderr, "[SLOWNODE ALGO] WARNING: invalid --comm-slow-ratio value (must be > 1), using default 1.3\n")
+			}
+		case "--comm-min-count":
+			if parsed, err := strconv.Atoi(val); err == nil && parsed > 0 {
+				commMinCount = parsed
+			} else {
+				fmt.Fprintf(os.Stderr, "[SLOWNODE ALGO] WARNING: invalid --comm-min-count value, using default 1000\n")
+			}
 		}
 	}
+
+	// Slow-domain bandwidth detection knobs (used by both detection and the
+	// dataparse backfill pass); set once before one-shot / daemon branching.
+	config.SlowCommRatio = commSlowRatio
+	config.SlowCommMinCount = commMinCount
 
 	// ─────────────────────────────────────────────────────────────────
 	// Daemon mode: resident service (dynolog/dyno collection + HTTP).
@@ -243,7 +262,7 @@ func main() {
 
 	// No input at all → usage error before anything runs.
 	if inputPath == "" && kpiInput == "" {
-		fmt.Fprintf(os.Stderr, "Usage: slowNodeDetection path=/your/data/dir [degradation=0.3] [--kpi-path=/dir/of/kpi_csvs | --kpi-jsonl-dir=/dir] [--space-ratio-threshold=2.0]\n")
+		fmt.Fprintf(os.Stderr, "Usage: slowNodeDetection path=/your/data/dir [degradation=0.3] [--kpi-path=/dir/of/kpi_csvs | --kpi-jsonl-dir=/dir] [--space-ratio-threshold=2.0] [--comm-slow-ratio=1.3] [--comm-min-count=1000]\n")
 		fmt.Fprintf(os.Stderr, "ERROR: Missing required parameter: path=/your/data/dir (or a KPI input)\n")
 		os.Exit(1)
 	}
@@ -313,6 +332,15 @@ func main() {
 		// Data parsing: SQLite → CSV + JSON intermediates.
 		fmt.Fprintf(os.Stderr, "[SLOWNODE ALGO] Starting data parsing...\n")
 		dataparse.DataParsing(inputPath)
+
+		// Global backfill pass: re-scan the .db files and write per-domain
+		// (opType,count) bandwidth columns into the CSVs for the bandwidth-based
+		// slow-communication detection that follows.
+		fmt.Fprintf(os.Stderr, "[SLOWNODE ALGO] Backfilling slow-domain bandwidth columns...\n")
+		if err := dataparse.BackfillSlowDomainBandwidth(inputPath); err != nil {
+			fmt.Fprintf(os.Stderr, "[SLOWNODE ALGO] WARNING: slow-domain bandwidth backfill failed: %v (continuing with Duration-based columns)\n", err)
+		}
+		fmt.Fprintf(os.Stderr, "[SLOWNODE ALGO] Backfill done.\n")
 
 		// Shared detection pipeline (steps 4-8); os.Exit on fatal conditions.
 		detectResult, derr := detectFromParsedData(inputPath, degradation, debugOutput)
@@ -447,4 +475,3 @@ func countCPUNodes(flagged map[string]float64) int {
 	}
 	return len(nodes)
 }
-

@@ -67,10 +67,10 @@ func New(cfg Config, detect DetectFunc) *Daemon {
 		cfg.Port = 8080
 	}
 	return &Daemon{
-		cfg:      cfg,
-		detect:   detect,
-		st:       newStore(),
-		logf:     func(format string, args ...any) { fmt.Fprintf(os.Stderr, "[DAEMON] "+format+"\n", args...) },
+		cfg:         cfg,
+		detect:      detect,
+		st:          newStore(),
+		logf:        func(format string, args ...any) { fmt.Fprintf(os.Stderr, "[DAEMON] "+format+"\n", args...) },
 		state:       "running",
 		interval:    cfg.Interval,
 		degradation: cfg.Degradation,
@@ -243,6 +243,17 @@ func (d *Daemon) runCycle(id int) {
 		return
 	}
 	d.progress.step("解析完成")
+
+	// 4b. Global backfill pass: re-scan the .db files (still under root — the
+	// dump is removed only at cycle end) and write per-domain bandwidth columns
+	// into the CSVs so the bandwidth-based slow-communication detection (and
+	// the op_metric archive/report below) sees them. Best-effort: a failure
+	// only drops the bandwidth dimension, not the whole cycle.
+	d.progress.step("回填慢域带宽列")
+	if err := dataparse.BackfillSlowDomainBandwidth(root); err != nil {
+		d.logf("cycle %d backfill slow-domain bandwidth: %v", cr.ID, err)
+	}
+	d.progress.step("回填完成")
 
 	// 5. KPI detection (--kpi-dir, JSONL). Status is recorded on the cycle so
 	//    whether KPI ran (and its outcome) is visible in history: "ok" means

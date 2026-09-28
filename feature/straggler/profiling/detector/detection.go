@@ -15,7 +15,7 @@ import (
 //  1. Select primary detection group.
 //  2. Detect NPU Bubble (fixed threshold).
 //  3. Detect slow compute (homogeneous clustering on primary group).
-//  4. Detect slow communication (homogeneous clustering per parallel domain).
+//  4. Detect slow communication (per-domain group bandwidth comparison).
 //  5. Detect slow CPU (homogeneous clustering with hostUid-based trim preprocessing).
 func DelimitDetection(
 	stepData map[string]map[int]float64,
@@ -45,8 +45,8 @@ func DelimitDetection(
 	// 3. Slow compute detection.
 	_ = getSlowCalculateRanks(calGroups, stepData, calGroupName, localResult)
 
-	// 4. Slow communication detection.
-	_ = detectionAllCommunicationParallel(parallels, calGroups, validRanks, stepData, localResult)
+	// 4. Slow communication detection (bandwidth comparison per domain group).
+	DetectSlowDomainByBandwidth(parallels, stepData, localResult)
 
 	// 5. Slow CPU detection.
 	if hostData, ok := stepData[zpHostDataColumn]; ok {

@@ -187,11 +187,11 @@ SQLite .db → 并行域拓扑解析 → 单步快照 → 4 类检测 → 节点
 | 类别 | 数据 | 阈值/方向 | 说明 |
 |------|------|-----------|------|
 | 慢计算 `cal` | ZP_Kernel（优先）/ ZP_Duration（降级） | `CalThreshold`(1+deg) | kmeans，方向自适应 |
-| 慢通信 `comm` | `{域}_Duration` | `CommThreshold`(1+deg×5) | 每组取通信时长最小卡为代表，按 PP stage 分桶后 kmeans |
+| 慢通信 `comm` | `{域}_<opType>_<count>`（带宽回填列） | `SlowCommRatio`(默认 1.3) | 按算子类型分类，每组取 count 最大带宽作代表（带宽=count/组内单次算子最小时间的升序前10%均值），仅保留 count ≥ 最大 count×50% 且 count > 10240 的组后做 kmeans 递归聚类（带宽小=慢）；一个组须在**所有算子类型都异常**才上报，劣化数值取各算子中的最大值 |
 | 慢CPU `cpu` | ZP_Host（hostUid 平滑） | `CPUThreshold`(1+deg×5) | 同主机卡取去 min/max 均值消除节点内差异 |
 | Bubble `npu_bubble` | ZP_Bubble | `< 5000 ns` | 固定阈值直接判定 |
 
-> cal / comm / cpu 统一走共享 `clustering` 包（kmeans 比例检测，与 3.3 的 KPI 空间 cluster 同一算法）；Bubble 走固定阈值。
+> cal / cpu 走共享 `clustering` 包（kmeans 比例检测，与 3.3 的 KPI 空间 cluster 同一算法）；慢通信走带宽比较（先回填 `{域}_<opType>_<count>` 带宽列，再按 `SlowCommRatio` 判劣化）；Bubble 走固定阈值。
 
 **中间产物（`op_metric/`）**：解析阶段在每个数据目录下生成每 rank 三件套——`group_info_{N}.json`（并行拓扑）、`host_info_{N}.json`（rank→hostUid）、`global_rank_{N}.csv`（各域通信耗时/计数 + ZP_* 指标）。守护进程会把每轮 `op_metric/` 归档到 `daemon_results/<start>/op_metric/` 供复查。
 
@@ -557,6 +557,8 @@ Bubble (npu_bubble): 无异常
 | `--kpi-path` | string | 否* | — | KPI 模式：每节点 CSV + `node_config.json` 的目录 |
 | `--kpi-jsonl-dir` | string | 否* | — | KPI 模式：CATMonitor `straggler_kpi_*.jsonl` 目录（优先于 `--kpi-path`） |
 | `--space-ratio-threshold` | float64 | 否 | 2.0 | 空间 kmeans 簇比例阈值（独立旋钮） |
+| `--comm-slow-ratio` | float64 | 否 | 1.3 | 慢通信带宽劣化阈值（max/min ≥ 该值判劣化，须 >1） |
+| `--comm-min-count` | int | 否 | 1000 | 参与带宽统计的最小 op 计数（更小视为延迟主导，不计入） |
 | `--debug-output` | bool | 否 | 假 | 结果含全部正常/异常数据便于排查（见 6.1） |
 
 \* `path` 与 KPI 输入至少提供一个；都没有则打印用法并退出。
@@ -593,7 +595,8 @@ KPI 模式:
 Profiler 模式:
   CalThreshold  = 1 + degradation                    # 慢计算阈值（默认 1.3）
   CPUThreshold  = 1 + degradation × 5                # 慢CPU 阈值（默认 2.5）
-  CommThreshold = 1 + degradation × 5                # 慢通信阈值（默认 2.5）
+  SlowCommRatio = --comm-slow-ratio                  # 慢通信带宽劣化阈值（默认 1.3，独立旋钮）
+  SlowCommMinCount = --comm-min-count                # 带宽统计最小 op 计数（默认 1000）
 ```
 
 > `degradation`（阈值基数）除了启动时用 CLI 设置初始值外，运行期还可通过守护进程/业务控制台或 API 动态调整（见[四、HTTP 接口（守护进程）](#四http-接口守护进程)与[五、中心节点模式](#五中心节点模式)），只影响后续检测，不改写历史结果。
