@@ -32,12 +32,13 @@
     unknown: '#9ca3af',
   };
   var KPI_DEFS = [
-    { key: 'anomalies', label: '总异常检出', accent: 'red' },
+    { key: 'anomalies', label: '自部署以来总异常检出', accent: 'red' },
     { key: 'rare_character', label: '生僻字检测数量' },
     { key: 'garbled', label: '乱码检出数量' },
     { key: 'repetition', label: '重复检出数量' },
     { key: 'nan_value', label: 'NaN 检出数量' },
   ];
+  var PRESET_DAYS = { '1day': 1, '7day': 7, '30day': 30 };
 
   var TOKEN_KEY = 'webui_token';
   var USER_KEY = 'webui_user';
@@ -66,6 +67,32 @@
       p(d.getMonth() + 1) + '-' + p(d.getDate()) + ' ' +
       p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds())
     );
+  }
+
+  function p2(x) {
+    return (x < 10 ? '0' : '') + x;
+  }
+
+  function toDateStr(d) {
+    return d.getFullYear() + '-' + p2(d.getMonth() + 1) + '-' + p2(d.getDate());
+  }
+
+  function fmtDateTime(ts) {
+    if (!ts) return '-';
+    var d = new Date(ts * 1000);
+    return (
+      d.getFullYear() + '/' + p2(d.getMonth() + 1) + '/' + p2(d.getDate()) + ' ' +
+      p2(d.getHours()) + ':' + p2(d.getMinutes())
+    );
+  }
+
+  // 自定义区间标题：同年省起始年（2026/09/10-09/20），跨年完整（2025/12/25-2026/01/05）
+  function fmtRangeTitle(startStr, endStr) {
+    var a = startStr.split('-');
+    var b = endStr.split('-');
+    var left = a[0] + '/' + a[1] + '/' + a[2];
+    var right = a[0] === b[0] ? b[1] + '/' + b[2] : b[0] + '/' + b[1] + '/' + b[2];
+    return left + '-' + right;
   }
 
   function fmtNum(n) {
@@ -145,7 +172,8 @@
   }
 
   function resizeCharts() {
-    [trendChart, typeChart, modelChart, detailTrendChart, detailTypeChart].forEach(function (ch) {
+    [trendChart, typeChart, windowTypeChart, modelChart,
+     detailTrendChart, detailTypeChart, detailWindowTypeChart].forEach(function (ch) {
       if (ch) ch.resize();
     });
   }
@@ -202,7 +230,8 @@
   // ------------------------------------------------------------------ //
   // 图表初始化
   // ------------------------------------------------------------------ //
-  var trendChart, typeChart, modelChart, detailTrendChart, detailTypeChart;
+  var trendChart, typeChart, windowTypeChart, modelChart,
+      detailTrendChart, detailTypeChart, detailWindowTypeChart;
 
   function initCharts() {
     if (typeof echarts === 'undefined') {
@@ -211,16 +240,12 @@
     }
     trendChart = echarts.init($('trend-chart'));
     typeChart = echarts.init($('type-chart'));
+    windowTypeChart = echarts.init($('window-type-chart'));
     modelChart = echarts.init($('model-chart'));
     detailTrendChart = echarts.init($('detail-trend-chart'));
     detailTypeChart = echarts.init($('detail-type-chart'));
-    window.addEventListener('resize', function () {
-      trendChart.resize();
-      typeChart.resize();
-      modelChart.resize();
-      detailTrendChart.resize();
-      detailTypeChart.resize();
-    });
+    detailWindowTypeChart = echarts.init($('detail-window-type-chart'));
+    window.addEventListener('resize', resizeCharts);
   }
 
   function trendOption() {
@@ -307,6 +332,103 @@
   }
 
   // ------------------------------------------------------------------ //
+  // 饼图公共：数据构建 / 配置 / 共用图例 / 窗口饼标题
+  // ------------------------------------------------------------------ //
+  function byTypePieData(byType) {
+    return ILL_TYPES.map(function (t) {
+      return { name: illLabel(t), value: (byType || {})[t] || 0 };
+    }).filter(function (d) {
+      return d.value > 0;
+    });
+  }
+
+  // 图例由两饼下方共用 HTML 图例承担，扇区上标注数量，tooltip 数量+占比
+  function pieOption(data) {
+    return {
+      tooltip: { trigger: 'item', formatter: '{b}: {c} ({d}%)' },
+      legend: { show: false },
+      series: [
+        {
+          name: '异常类型',
+          type: 'pie',
+          radius: ['45%', '70%'],
+          center: ['50%', '46%'],
+          avoidLabelOverlap: true,
+          label: { show: true, formatter: '{c}' },
+          emphasis: { label: { show: true, fontWeight: 'bold' } },
+          data: data,
+        },
+      ],
+    };
+  }
+
+  function renderPie(chart, chartEl, emptyEl, byType) {
+    var pieData = byTypePieData(byType);
+    if (pieData.length === 0 || !chart) {
+      chartEl.classList.add('hidden');
+      emptyEl.classList.remove('hidden');
+      return;
+    }
+    chartEl.classList.remove('hidden');
+    emptyEl.classList.add('hidden');
+    chart.setOption(pieOption(pieData));
+  }
+
+  function renderSharedLegend(containerId) {
+    var wrap = $(containerId);
+    if (!wrap || wrap.childElementCount > 0) return;
+    ILL_TYPES.forEach(function (t) {
+      var item = el('span', 'legend-item');
+      var dot = el('span', 'legend-dot');
+      dot.style.backgroundColor = ILL_COLORS[t];
+      item.appendChild(dot);
+      item.appendChild(el('span', 'legend-text', illLabel(t)));
+      wrap.appendChild(item);
+    });
+  }
+
+  function windowPieTitle(state) {
+    if (state.mode === 'preset') {
+      var days = PRESET_DAYS[state.window];
+      return days ? '异常类型统计（最近 ' + days + ' 天）' : '异常类型统计';
+    }
+    return '异常类型统计（' + fmtRangeTitle(state.startStr, state.endStr) + '）';
+  }
+
+  // 窗口饼图 + 动态标题 + 数据覆盖提示（prefix: ''=看板，'detail-'=详情页）
+  function setWindowPie(prefix, state, data) {
+    var titleEl = $(prefix + 'window-type-title');
+    var chartEl = $(prefix + 'window-type-chart');
+    var emptyEl = $(prefix + 'window-type-empty');
+    var noticeEl = $(prefix + 'window-type-notice');
+    var chart = prefix ? detailWindowTypeChart : windowTypeChart;
+    if (titleEl) titleEl.textContent = windowPieTitle(state);
+    if (noticeEl) {
+      if (data && data.partial && data.data_start) {
+        noticeEl.textContent =
+          '数据自 ' + fmtDateTime(data.data_start) + ' 起，更早区间无数据';
+        noticeEl.classList.remove('hidden');
+      } else {
+        noticeEl.classList.add('hidden');
+      }
+    }
+    renderPie(chart, chartEl, emptyEl, data && data.by_type);
+  }
+
+  // 趋势图下方数据覆盖提示（prefix: ''=看板，'detail-'=详情页）
+  function renderTrendNotice(prefix, data) {
+    var noticeEl = $(prefix + 'trend-notice');
+    if (!noticeEl) return;
+    if (data && data.partial && data.data_start) {
+      noticeEl.textContent =
+        '数据自 ' + fmtDateTime(data.data_start) + ' 起，更早区间无数据';
+      noticeEl.classList.remove('hidden');
+    } else {
+      noticeEl.classList.add('hidden');
+    }
+  }
+
+  // ------------------------------------------------------------------ //
   // KPI 渲染
   // ------------------------------------------------------------------ //
   function kpiValue(s, key) {
@@ -334,39 +456,10 @@
   function renderSummary(s) {
     renderKpis('kpi-', s);
 
-    // 异常类型分布饼图（累计）
-    var pieData = ILL_TYPES.map(function (t) {
-      return { name: illLabel(t), value: s.by_type[t] || 0 };
-    }).filter(function (d) {
-      return d.value > 0;
-    });
-    if (pieData.length === 0 || !typeChart) {
-      $('type-chart').classList.add('hidden');
-      $('type-empty').classList.remove('hidden');
-    } else {
-      $('type-chart').classList.remove('hidden');
-      $('type-empty').classList.add('hidden');
-      typeChart.setOption(
-        {
-          tooltip: { trigger: 'item', formatter: '{b}: {c} ({d}%)' },
-          legend: { bottom: 0 },
-          series: [
-            {
-              name: '异常类型',
-              type: 'pie',
-              radius: ['45%', '70%'],
-              center: ['50%', '46%'],
-              avoidLabelOverlap: true,
-              label: { show: false },
-              emphasis: { label: { show: true, fontWeight: 'bold' } },
-              data: pieData,
-            },
-          ],
-        }
-      );
-    }
+    // 自部署以来累计饼图（不随时间窗变化）
+    renderPie(typeChart, $('type-chart'), $('type-empty'), s.by_type);
 
-    // 按实例累计异常柱状图（固定柱宽 + 等间距自适应）
+    // 自部署以来按实例累计异常柱状图（固定柱宽 + 等间距自适应）
     var instanceEntries = Object.entries(s.by_instance || {}).sort(function (a, b) {
       return b[1] - a[1];
     });
@@ -527,7 +620,8 @@
   // 详情页：KPI + 趋势 + 类型分布
   // ------------------------------------------------------------------ //
   var currentInstance = null;
-  var detailWindow = '1day';
+  // 详情页时间窗状态：{mode:'preset', window} 或 {mode:'custom', start, end, startStr, endStr}
+  var detailWindow = { mode: 'preset', window: '1day' };
 
   function buildDetailKpis() {
     var wrap = $('detail-kpis');
@@ -536,7 +630,7 @@
       var card = el('div', 'kpi-card' + (d.accent ? ' accent-' + d.accent : ''));
       card.appendChild(el('div', 'kpi-label', d.label));
       card.appendChild(el('div', 'kpi-value', '0'));
-      card.appendChild(el('div', 'kpi-sub', '累计'));
+      card.appendChild(el('div', 'kpi-sub', '自部署以来累计'));
       wrap.appendChild(card);
     });
   }
@@ -547,16 +641,23 @@
     $('detail-instance-name').textContent = name;
     $('detail-instance-state').textContent = '';
     $('detail-current-user').textContent = $('current-user').textContent || '';
-    detailWindow = '1day';
-    var seg = $('detail-window-seg');
-    seg.querySelectorAll('.seg-btn').forEach(function (b) {
+    // 重置时间窗为预设 1 天，收起自定义区间行
+    detailWindow.mode = 'preset';
+    detailWindow.window = '1day';
+    $('detail-window-seg').querySelectorAll('.seg-btn').forEach(function (b) {
       b.classList.toggle('active', b.getAttribute('data-window') === '1day');
     });
+    $('detail-range-form').classList.add('hidden');
+    $('detail-range-err').textContent = '';
+    $('detail-window-type-title').textContent = '异常类型统计（最近 1 天）';
+    $('detail-trend-notice').classList.add('hidden');
+    $('detail-window-type-notice').classList.add('hidden');
     setView('detail');
     $('detail-import-instance-name').textContent = name;
     setTimeout(function () {
       detailTrendChart.resize();
       detailTypeChart.resize();
+      detailWindowTypeChart.resize();
     }, 0);
     refreshNow();
   }
@@ -570,38 +671,11 @@
 
   function renderDetailSummary(s) {
     renderKpis(null, s, 'detail-kpis');
-    $('detail-instance-state').textContent = stateLabel(s) + ' · 异常累计 ' + fmtNum(s.anomalies);
+    $('detail-instance-state').textContent =
+      stateLabel(s) + ' · 自部署以来异常累计 ' + fmtNum(s.anomalies);
 
-    var pieData = ILL_TYPES.map(function (t) {
-      return { name: illLabel(t), value: (s.by_type || {})[t] || 0 };
-    }).filter(function (d) {
-      return d.value > 0;
-    });
-    if (pieData.length === 0 || !detailTypeChart) {
-      $('detail-type-chart').classList.add('hidden');
-      $('detail-type-empty').classList.remove('hidden');
-    } else {
-      $('detail-type-chart').classList.remove('hidden');
-      $('detail-type-empty').classList.add('hidden');
-      detailTypeChart.setOption(
-        {
-          tooltip: { trigger: 'item', formatter: '{b}: {c} ({d}%)' },
-          legend: { bottom: 0 },
-          series: [
-            {
-              name: '异常类型',
-              type: 'pie',
-              radius: ['45%', '70%'],
-              center: ['50%', '46%'],
-              avoidLabelOverlap: true,
-              label: { show: false },
-              emphasis: { label: { show: true, fontWeight: 'bold' } },
-              data: pieData,
-            },
-          ],
-        }
-      );
-    }
+    // 自部署以来累计饼图（不随时间窗变化）
+    renderPie(detailTypeChart, $('detail-type-chart'), $('detail-type-empty'), s.by_type);
   }
 
   // ------------------------------------------------------------------ //
@@ -839,7 +913,11 @@
     }
   }
 
-  async function uploadImport(file, instance) {
+  // 导入进行中标志：防止大文件上传期间重复触发（双击/回车重放）
+  var importInFlight = false;
+
+  async function uploadImport(file, instance, ui) {
+    if (importInFlight) return;
     if (!file) {
       showToast('请选择文件', true);
       return;
@@ -848,52 +926,83 @@
       showToast('请指定实例名', true);
       return;
     }
-    var headers = authHeaders({});
-    delete headers['Content-Type'];
-    var resp;
+    importInFlight = true;
+    var confirmBtn = ui && ui.confirm;
+    var cancelBtn = ui && ui.cancel;
+    var statusEl = ui && ui.status;
+    var originalText = confirmBtn ? confirmBtn.textContent : '';
+    // 导入期间置灰确认/取消并显示进行中提示，完成后在 finally 恢复
+    if (confirmBtn) {
+      confirmBtn.disabled = true;
+      confirmBtn.textContent = '导入中…';
+    }
+    if (cancelBtn) cancelBtn.disabled = true;
+    if (statusEl) statusEl.classList.remove('hidden');
     try {
-      resp = await fetch(
-        '/api/import?instance=' + encodeURIComponent(instance),
-        { method: 'POST', headers: headers, body: file }
-      );
-    } catch (e) {
-      showToast('导入失败：网络错误', true);
-      return;
-    }
-    if (resp.status === 401) {
-      showLogin();
-      return;
-    }
-    var data = null;
-    try {
-      data = await resp.json();
-    } catch (e) {
-      data = null;
-    }
-    if (resp.ok && data) {
-      showToast(
-        '导入成功：' + data.imported + ' 条' +
-        (data.skipped ? '（跳过 ' + data.skipped + '）' : '') +
-        (data.cleared ? '，覆盖旧 ' + data.cleared + ' 条' : '')
-      );
-      refreshNow();
-    } else {
-      var msg = (data && data.detail) || '导入失败';
-      showToast(msg, true);
+      var headers = authHeaders({});
+      delete headers['Content-Type'];
+      var resp;
+      try {
+        resp = await fetch(
+          '/api/import?instance=' + encodeURIComponent(instance),
+          { method: 'POST', headers: headers, body: file }
+        );
+      } catch (e) {
+        showToast('导入失败：网络错误', true);
+        return;
+      }
+      if (resp.status === 401) {
+        showLogin();
+        return;
+      }
+      var data = null;
+      try {
+        data = await resp.json();
+      } catch (e) {
+        data = null;
+      }
+      if (resp.ok && data) {
+        showToast(
+          '导入成功：' + data.imported + ' 条' +
+          (data.skipped ? '（跳过 ' + data.skipped + '）' : '') +
+          (data.cleared ? '，覆盖旧 ' + data.cleared + ' 条' : '') +
+          (data.warning ? '；' + data.warning : '')
+        );
+        refreshNow();
+      } else {
+        var msg = (data && data.detail) || '导入失败';
+        showToast(msg, true);
+      }
+    } finally {
+      importInFlight = false;
+      if (confirmBtn) {
+        confirmBtn.disabled = false;
+        confirmBtn.textContent = originalText;
+      }
+      if (cancelBtn) cancelBtn.disabled = false;
+      if (statusEl) statusEl.classList.add('hidden');
     }
   }
 
   async function confirmImport() {
     var file = $('import-file').files[0];
     var instance = $('import-instance').value;
-    await uploadImport(file, instance);
+    await uploadImport(file, instance, {
+      confirm: $('import-confirm'),
+      cancel: $('import-cancel'),
+      status: $('import-status'),
+    });
     if (file && instance) toggleImportForm(false);
   }
 
   async function confirmDetailImport() {
     var file = $('detail-import-file').files[0];
     var instance = currentInstance;
-    await uploadImport(file, instance);
+    await uploadImport(file, instance, {
+      confirm: $('detail-import-confirm'),
+      cancel: $('detail-import-cancel'),
+      status: $('detail-import-status'),
+    });
     if (file && instance) toggleDetailImportForm(false);
   }
 
@@ -902,8 +1011,16 @@
   // ------------------------------------------------------------------ //
   var polling = false;
   var pollTimer = null;
-  var currentWindow = '1day';
+  // 看板时间窗状态：{mode:'preset', window} 或 {mode:'custom', start, end, startStr, endStr}
+  var currentWindow = { mode: 'preset', window: '1day' };
   var inFlight = false;
+
+  function windowQuery(state) {
+    if (state.mode === 'custom') {
+      return 'window=custom&start=' + state.start + '&end=' + state.end;
+    }
+    return 'window=' + state.window;
+  }
 
   function startPolling() {
     if (polling) return;
@@ -937,7 +1054,7 @@
     var summaryP = api('/api/summary');
     var instancesP = api('/api/instances');
     var alertsP = api('/api/alerts?limit=50');
-    var trendsP = api('/api/trends?window=' + currentWindow);
+    var trendsP = api('/api/trends?' + windowQuery(currentWindow));
 
     var results = await Promise.all([summaryP, instancesP, alertsP, trendsP]);
     var summary = results[0];
@@ -952,13 +1069,15 @@
     }
     if (trends.ok && trends.data) {
       renderTrend(trendChart, $('trend-chart'), $('trend-empty'), trends.data.points);
+      renderTrendNotice('', trends.data);
+      setWindowPie('', currentWindow, trends.data);
     }
   }
 
   async function pollDetail() {
     var name = encodeURIComponent(currentInstance);
     var summaryP = api('/api/instances/' + name + '/summary');
-    var trendsP = api('/api/instances/' + name + '/trends?window=' + detailWindow);
+    var trendsP = api('/api/instances/' + name + '/trends?' + windowQuery(detailWindow));
 
     var results = await Promise.all([summaryP, trendsP]);
     var summary = results[0];
@@ -967,6 +1086,8 @@
     if (summary.ok && summary.data) renderDetailSummary(summary.data);
     if (trends.ok && trends.data) {
       renderTrend(detailTrendChart, $('detail-trend-chart'), $('detail-trend-empty'), trends.data.points);
+      renderTrendNotice('detail-', trends.data);
+      setWindowPie('detail-', detailWindow, trends.data);
     }
   }
 
@@ -983,17 +1104,71 @@
   // ------------------------------------------------------------------ //
   // 初始化
   // ------------------------------------------------------------------ //
-  function bindSeg(segId, setter) {
+  // 时间窗选择器：预设按钮（1天/7天/30天）+ 自定义（日期区间 + 应用）
+  // prefix: ''=看板（range-*），'detail-'=详情页（detail-range-*）
+  function bindWindowSeg(segId, prefix, state) {
     var seg = $(segId);
+    var form = $(prefix + 'range-form');
+    var startInp = $(prefix + 'range-start');
+    var endInp = $(prefix + 'range-end');
+    var errEl = $(prefix + 'range-err');
+    var today = toDateStr(new Date());
+    startInp.max = today;
+    endInp.max = today;
+    var prefilled = false;
+
+    function setActive(key) {
+      seg.querySelectorAll('.seg-btn').forEach(function (b) {
+        b.classList.toggle('active', b.getAttribute('data-window') === key);
+      });
+    }
+
     seg.querySelectorAll('.seg-btn').forEach(function (btn) {
       btn.addEventListener('click', function () {
-        seg.querySelectorAll('.seg-btn').forEach(function (b) {
-          b.classList.remove('active');
-        });
-        btn.classList.add('active');
-        setter(btn.getAttribute('data-window'));
-        refreshNow();
+        var w = btn.getAttribute('data-window');
+        errEl.textContent = '';
+        if (w === 'custom') {
+          // 首次展开预填最近 7 天；切换不立即刷新，等「应用」
+          if (!prefilled) {
+            var weekAgo = new Date(Date.now() - 6 * 86400000);
+            startInp.value = toDateStr(weekAgo);
+            endInp.value = today;
+            prefilled = true;
+          }
+          form.classList.remove('hidden');
+          setActive('custom');
+        } else {
+          form.classList.add('hidden');
+          setActive(w);
+          state.mode = 'preset';
+          state.window = w;
+          refreshNow();
+        }
       });
+    });
+
+    $(prefix + 'range-apply').addEventListener('click', function () {
+      var s = startInp.value;
+      var e = endInp.value;
+      errEl.textContent = '';
+      if (!s || !e) {
+        errEl.textContent = '请选择开始和结束日期';
+        return;
+      }
+      var startTs = new Date(s + 'T00:00:00').getTime() / 1000;
+      var endTs = new Date(e + 'T23:59:59').getTime() / 1000;
+      var now = Date.now() / 1000;
+      if (endTs > now) endTs = Math.floor(now); // 结束日为今天时截到当前时刻
+      if (startTs >= endTs) {
+        errEl.textContent = '开始日期必须早于结束日期';
+        return;
+      }
+      state.mode = 'custom';
+      state.start = Math.floor(startTs);
+      state.end = Math.floor(endTs);
+      state.startStr = s;
+      state.endStr = e;
+      refreshNow();
     });
   }
 
@@ -1031,12 +1206,8 @@
       if (e.key === 'Enter') addInstance();
     });
 
-    bindSeg('window-seg', function (w) {
-      currentWindow = w;
-    });
-    bindSeg('detail-window-seg', function (w) {
-      detailWindow = w;
-    });
+    bindWindowSeg('window-seg', '', currentWindow);
+    bindWindowSeg('detail-window-seg', 'detail-', detailWindow);
 
     // 历史导入
     $('import-btn').addEventListener('click', function () {
@@ -1061,6 +1232,8 @@
   function boot() {
     bindEvents();
     initCharts();
+    renderSharedLegend('type-legend');
+    renderSharedLegend('detail-type-legend');
     if (getToken()) {
       // 已有 token：先尝试拉一次 summary 验证有效性
       api('/api/summary').then(function (r) {

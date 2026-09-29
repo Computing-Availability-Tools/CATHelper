@@ -12,6 +12,7 @@ import io
 import logging
 import os
 import pickle
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -44,6 +45,62 @@ TREND_WINDOWS: Dict[str, int] = {
 }
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
+
+# 自定义区间时钟容差（秒）：允许 end 略超当前时间，吸收客户端/服务端时钟偏差
+CUSTOM_RANGE_CLOCK_TOLERANCE = 60.0
+
+
+def _trend_payload(
+    c: "AppContext",
+    window: str,
+    start: Optional[str],
+    end: Optional[str],
+    instance: Optional[str] = None,
+) -> Dict[str, Any]:
+    """统一趋势查询：预设窗口（1day/7day/30day）与自定义区间（custom + start/end）。
+
+    校验失败抛 HTTPException 400 + 可读 detail；可查询范围以实际保留数据为准
+    （data_start/partial），不设固定跨度上限。
+    """
+    now = time.time()
+    if window == "custom":
+        if start is None or end is None:
+            raise HTTPException(
+                status_code=400,
+                detail="自定义区间需同时提供 start 与 end（unix 秒）",
+            )
+        try:
+            s = float(start)
+            e = float(end)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=400, detail="start/end 必须为 unix 秒数值"
+            ) from exc
+        if s < 0 or e < 0:
+            raise HTTPException(status_code=400, detail="start/end 不能为负数")
+        if s >= e:
+            raise HTTPException(status_code=400, detail="开始时间必须早于结束时间")
+        if e > now + CUSTOM_RANGE_CLOCK_TOLERANCE:
+            raise HTTPException(
+                status_code=400, detail="结束时间不能晚于当前时间"
+            )
+        result = c.store.query_trend_window(s, e, instance)
+        result["window"] = "custom"
+        result["window_seconds"] = None
+    else:
+        secs = TREND_WINDOWS.get(window)
+        if secs is None:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"非法 window: {window!r}"
+                    f"（可选 {'/'.join(TREND_WINDOWS)} 或 custom）"
+                ),
+            )
+        result = c.store.query_trend_window(now - secs, now, instance)
+        result["window"] = window
+        result["window_seconds"] = secs
+    return result
 
 
 class _SafeUnpickler(pickle.Unpickler):
@@ -233,7 +290,8 @@ class AppContext:
             )
             by_type = dict(st.by_type)
             by_model = dict(st.by_model)
-            models = sorted(by_model.keys())
+            # 模型名 = 异常事件观测 ∪ metrics 观测（零异常的在线实例也能显示模型名）
+            models = sorted(set(by_model) | st.models_seen)
         else:
             state = "paused" if inst.paused else "offline"
             last_event = None
@@ -331,17 +389,12 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
     async def api_trends(
         request: Request,
         window: str = "1day",
+        start: Optional[str] = None,
+        end: Optional[str] = None,
         user: str = Depends(require_user),
     ) -> Dict[str, Any]:
-        if window not in TREND_WINDOWS:
-            raise HTTPException(
-                status_code=400,
-                detail=f"非法 window: {window!r}（可选 {'/'.join(TREND_WINDOWS)}）",
-            )
         c: AppContext = request.app.state.ctx
-        secs = TREND_WINDOWS[window]
-        points = c.store.query_trend_events(secs)
-        return {"window": window, "window_seconds": secs, "points": points}
+        return _trend_payload(c, window, start, end)
 
     @app.get("/api/instances/{name}/summary", tags=["query"])
     async def api_instance_summary(
@@ -359,18 +412,13 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
         request: Request,
         user: str = Depends(require_user),
         window: str = "1day",
+        start: Optional[str] = None,
+        end: Optional[str] = None,
     ) -> Dict[str, Any]:
-        if window not in TREND_WINDOWS:
-            raise HTTPException(
-                status_code=400,
-                detail=f"非法 window: {window!r}（可选 {'/'.join(TREND_WINDOWS)}）",
-            )
         c: AppContext = request.app.state.ctx
         if name not in c.current_instances():
             raise HTTPException(status_code=404, detail=f"实例 {name} 不存在")
-        secs = TREND_WINDOWS[window]
-        points = c.store.query_trend_events(secs, instance=name)
-        return {"window": window, "window_seconds": secs, "points": points}
+        return _trend_payload(c, window, start, end, instance=name)
 
     @app.get("/api/instances/{name}/events", tags=["query"])
     async def api_instance_events(
@@ -478,6 +526,8 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
         instance = (instance or "").strip()
         if not instance:
             raise HTTPException(status_code=400, detail="请指定实例名")
+        if instance not in c.current_instances():
+            raise HTTPException(status_code=404, detail=f"实例 {instance} 不存在")
         body = await request.body()
         if not body:
             raise HTTPException(status_code=400, detail="未收到文件内容")
@@ -489,6 +539,29 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
             raise HTTPException(status_code=400, detail=str(exc))
         if not records:
             raise HTTPException(status_code=400, detail="文件中未解析到有效异常记录")
+        # 模型对应校验（严格子集，失败不合入）：文件 model_name 与实例观测模型
+        # 同源于拉起服务时的 served-model-name（请求体 model 字段）。观测来源 =
+        # 异常事件（by_model）∪ metrics 带 model 标签的序列（models_seen，含正常请求）。
+        file_models = sorted({r["model"] for r in records})
+        st = c.store.instance_stats(instance)
+        known_models = sorted(
+            (set(st.by_model.keys()) | st.models_seen) if st else set()
+        )
+        warning: Optional[str] = None
+        if known_models:
+            known_set = set(known_models)
+            unmatched = [m for m in file_models if m not in known_set]
+            if unmatched:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"导入文件与实例 {instance} 的模型不匹配，已拒绝合入："
+                        f"文件内模型 {file_models}，实例观测模型 {known_models}，"
+                        f"未匹配 {unmatched}"
+                    ),
+                )
+        else:
+            warning = "实例尚无观测模型，未做模型对应校验"
         # 构造 AnomalyEvent + TrendEvent（source=imported）
         anomaly_events = [
             AnomalyEvent(
@@ -515,6 +588,7 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
             "imported": len(anomaly_events),
             "skipped": skipped,
             "cleared": cleared,
+            "warning": warning,
         }
 
     # ------------------------------------------------------------------ #
