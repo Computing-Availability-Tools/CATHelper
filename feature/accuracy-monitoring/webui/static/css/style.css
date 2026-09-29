@@ -142,11 +142,35 @@ body {
 .chart { width: 100%; }
 .chart-lg { height: 340px; }
 .chart-sm { height: 280px; }
+.chart-md { height: 220px; }
 .chart-placeholder {
   height: 100%; min-height: 280px;
   display: flex; align-items: center; justify-content: center;
   color: var(--gray); font-size: 13px; letter-spacing: 1px;
 }
+
+/* 自定义时间区间（趋势卡片内，位于 header 与图表之间） */
+.range-form {
+  display: flex; gap: 10px; align-items: center; flex-wrap: wrap;
+  border-top: 1px solid var(--border); padding-top: 12px; margin-bottom: 12px;
+}
+.range-form .input-date { width: 150px; padding: 6px 10px; font-size: 13px; }
+.range-sep { font-size: 13px; color: var(--text-secondary); }
+.range-err { font-size: 12px; color: var(--red); }
+.chart-notice {
+  margin-top: 8px; padding: 6px 12px;
+  font-size: 12px; color: #7a5d00; background: var(--amber-bg, #fdf6e3);
+  border: 1px solid #f0e0b0; border-radius: 8px;
+}
+
+/* 双饼共用图例（累计饼 + 窗口饼下方，仅一份） */
+.legend-row {
+  display: flex; gap: 22px; align-items: center; justify-content: center;
+  flex-wrap: wrap; padding: 2px 0 4px;
+}
+.legend-item { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; }
+.legend-dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; flex-shrink: 0; }
+.legend-text { color: var(--text-secondary); }
 
 /* 时间窗分段选择器 */
 .seg { display: inline-flex; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
@@ -200,6 +224,14 @@ tbody tr:hover { background: #f8fafc; }
 }
 .import-form .input { min-width: 140px; max-width: 220px; }
 .import-hint { font-size: 12px; color: var(--text-secondary); }
+.import-status {
+  font-size: 12px; color: var(--primary);
+  animation: importPulse 1.2s ease-in-out infinite;
+}
+@keyframes importPulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
+}
 
 .add-instance { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; border-top: 1px solid var(--border); padding-top: 14px; }
 .add-instance .input { flex: 1; min-width: 160px; }

@@ -1,10 +1,10 @@
-<!DOCTYPE html>
+﻿<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>推理精度异常监控</title>
-  <link rel="stylesheet" href="/css/style.css?v=2">
+  <link rel="stylesheet" href="/css/style.css?v=5">
 </head>
 <body>
   <!-- ============ 登录页 ============ -->
@@ -37,32 +37,32 @@
     </header>
 
     <div class="container">
-      <!-- KPI 卡片（累计口径） -->
+      <!-- KPI 卡片（累计口径 = 自部署以来） -->
       <section class="kpis">
         <div class="kpi-card accent-red">
-          <div class="kpi-label">总异常检出</div>
+          <div class="kpi-label">自部署以来总异常检出</div>
           <div id="kpi-anomalies" class="kpi-value">0</div>
-          <div class="kpi-sub">累计</div>
+          <div class="kpi-sub">自部署以来累计</div>
         </div>
         <div class="kpi-card">
           <div class="kpi-label">生僻字检测数量</div>
           <div id="kpi-rare_character" class="kpi-value">0</div>
-          <div class="kpi-sub">累计</div>
+          <div class="kpi-sub">自部署以来累计</div>
         </div>
         <div class="kpi-card">
           <div class="kpi-label">乱码检出数量</div>
           <div id="kpi-garbled" class="kpi-value">0</div>
-          <div class="kpi-sub">累计</div>
+          <div class="kpi-sub">自部署以来累计</div>
         </div>
         <div class="kpi-card">
           <div class="kpi-label">重复检出数量</div>
           <div id="kpi-repetition" class="kpi-value">0</div>
-          <div class="kpi-sub">累计</div>
+          <div class="kpi-sub">自部署以来累计</div>
         </div>
         <div class="kpi-card">
           <div class="kpi-label">NaN 检出数量</div>
           <div id="kpi-nan_value" class="kpi-value">0</div>
-          <div class="kpi-sub">累计</div>
+          <div class="kpi-sub">自部署以来累计</div>
         </div>
       </section>
 
@@ -74,32 +74,51 @@
             <button data-window="1day" class="seg-btn active">1天</button>
             <button data-window="7day" class="seg-btn">7天</button>
             <button data-window="30day" class="seg-btn">30天</button>
+            <button data-window="custom" class="seg-btn">自定义</button>
           </div>
           <button id="import-btn" class="btn btn-xs btn-ghost">导入历史</button>
+        </div>
+        <div id="range-form" class="range-form hidden">
+          <input type="date" id="range-start" class="input input-date">
+          <span class="range-sep">至</span>
+          <input type="date" id="range-end" class="input input-date">
+          <button id="range-apply" class="btn btn-xs btn-primary">应用</button>
+          <span id="range-err" class="range-err"></span>
         </div>
         <div id="import-form" class="import-form hidden">
           <input id="import-file" type="file" accept=".pkl">
           <select id="import-instance" class="input"></select>
           <button id="import-confirm" class="btn btn-xs btn-primary">确认导入</button>
+          <span id="import-status" class="import-status hidden">数据正在导入，请稍后…</span>
           <button id="import-cancel" class="btn btn-xs btn-ghost">取消</button>
           <span class="import-hint">导入将覆盖该实例已有历史导入数据</span>
         </div>
         <div id="trend-chart" class="chart chart-lg"></div>
         <div id="trend-empty" class="chart-placeholder hidden">暂无趋势数据</div>
+        <div id="trend-notice" class="chart-notice hidden"></div>
       </section>
 
-      <!-- 异常类型分布 / 按模型累计异常 -->
+      <!-- 异常类型分布：累计饼 + 窗口饼（共用图例） -->
       <section class="grid-2">
         <div class="card">
-          <div class="card-header"><h2>异常类型分布</h2></div>
+          <div class="card-header"><h2>异常类型统计（自部署以来）</h2></div>
           <div id="type-chart" class="chart chart-sm"></div>
           <div id="type-empty" class="chart-placeholder hidden">无异常数据</div>
         </div>
         <div class="card">
-          <div class="card-header"><h2>按实例累计异常</h2></div>
-          <div id="model-chart" class="chart chart-sm"></div>
-          <div id="model-empty" class="chart-placeholder hidden">无异常数据</div>
+          <div class="card-header"><h2 id="window-type-title">异常类型统计（最近 1 天）</h2></div>
+          <div id="window-type-chart" class="chart chart-sm"></div>
+          <div id="window-type-empty" class="chart-placeholder hidden">所选时间范围内无异常数据</div>
+          <div id="window-type-notice" class="chart-notice hidden"></div>
         </div>
+      </section>
+      <div id="type-legend" class="legend-row"></div>
+
+      <!-- 按实例累计异常(自部署以来) -->
+      <section class="card">
+        <div class="card-header"><h2>按实例累计异常（自部署以来）</h2></div>
+        <div id="model-chart" class="chart chart-md"></div>
+        <div id="model-empty" class="chart-placeholder hidden">无异常数据</div>
       </section>
 
       <!-- 实例状态（表格） -->
@@ -170,25 +189,44 @@
             <button data-window="1day" class="seg-btn active">1天</button>
             <button data-window="7day" class="seg-btn">7天</button>
             <button data-window="30day" class="seg-btn">30天</button>
+            <button data-window="custom" class="seg-btn">自定义</button>
           </div>
           <button id="detail-import-btn" class="btn btn-xs btn-ghost">导入历史</button>
+        </div>
+        <div id="detail-range-form" class="range-form hidden">
+          <input type="date" id="detail-range-start" class="input input-date">
+          <span class="range-sep">至</span>
+          <input type="date" id="detail-range-end" class="input input-date">
+          <button id="detail-range-apply" class="btn btn-xs btn-primary">应用</button>
+          <span id="detail-range-err" class="range-err"></span>
         </div>
         <div id="detail-import-form" class="import-form hidden">
           <input id="detail-import-file" type="file" accept=".pkl">
           <span class="import-hint">实例：<span id="detail-import-instance-name"></span> · 导入将覆盖该实例已有历史导入数据</span>
+          <span id="detail-import-status" class="import-status hidden">数据正在导入，请稍后…</span>
           <button id="detail-import-confirm" class="btn btn-xs btn-primary">确认导入</button>
           <button id="detail-import-cancel" class="btn btn-xs btn-ghost">取消</button>
         </div>
         <div id="detail-trend-chart" class="chart chart-lg"></div>
         <div id="detail-trend-empty" class="chart-placeholder hidden">暂无趋势数据</div>
+        <div id="detail-trend-notice" class="chart-notice hidden"></div>
       </section>
 
-      <!-- 异常类型分布 -->
-      <section class="card">
-        <div class="card-header"><h2>异常类型分布</h2></div>
-        <div id="detail-type-chart" class="chart chart-sm"></div>
-        <div id="detail-type-empty" class="chart-placeholder hidden">无异常数据</div>
+      <!-- 异常类型分布：累计饼 + 窗口饼（共用图例） -->
+      <section class="grid-2">
+        <div class="card">
+          <div class="card-header"><h2>异常类型统计（自部署以来）</h2></div>
+          <div id="detail-type-chart" class="chart chart-sm"></div>
+          <div id="detail-type-empty" class="chart-placeholder hidden">无异常数据</div>
+        </div>
+        <div class="card">
+          <div class="card-header"><h2 id="detail-window-type-title">异常类型统计（最近 1 天）</h2></div>
+          <div id="detail-window-type-chart" class="chart chart-sm"></div>
+          <div id="detail-window-type-empty" class="chart-placeholder hidden">所选时间范围内无异常数据</div>
+          <div id="detail-window-type-notice" class="chart-notice hidden"></div>
+        </div>
       </section>
+      <div id="detail-type-legend" class="legend-row"></div>
     </div>
   </div>
 
@@ -206,6 +244,6 @@
   <div id="toast" class="toast hidden"></div>
 
   <script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"></script>
-  <script src="/js/app.js?v=2"></script>
+  <script src="/js/app.js?v=5"></script>
 </body>
 </html>

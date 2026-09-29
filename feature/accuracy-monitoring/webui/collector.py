@@ -286,6 +286,8 @@ class Collector:
             duration=parsed["hist_stats"],
         )
         self._store.set_state(inst.name, "online")
+        # 记录 metrics 观测到的模型名（含正常请求；供导入模型对应校验使用）
+        self._store.observe_models(inst.name, snapshot.models)
 
         delta = self._synth.process(snapshot)
         if delta is None:

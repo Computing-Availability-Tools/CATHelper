@@ -113,6 +113,9 @@ class InstanceStats:
     anomalies: int = 0
     by_type: Dict[str, int] = field(default_factory=lambda: {t: 0 for t in ILL_TYPES})
     by_model: Dict[str, int] = field(default_factory=dict)
+    # metrics 观测到的模型名（served-model-name，含正常请求；与异常无关）。
+    # 来源：/anomaly/metrics 中带 model 标签的序列（last_* gauges 对正常请求也置 0）。
+    models_seen: set = field(default_factory=set)
     last_event: Optional[Tuple[str, float]] = None  # (ill_type, ts)
     detection_duration: Optional[Dict[str, float]] = None  # mean/p50/p95
 
@@ -213,6 +216,14 @@ class Store:
     def set_url(self, name: str, url: str) -> None:
         st = self._stats_for(name)
         st.url = url
+
+    def observe_models(self, name: str, models) -> None:
+        """记录 metrics 观测到的模型名（每次成功轮询调用，与异常无关）。
+
+        供历史导入的模型对应校验使用：零异常的在线实例也能拿到 served-model-name。
+        """
+        st = self._stats_for(name)
+        st.models_seen.update(m for m in models if m)
 
     def record_delta(self, instance: str, delta, now: Optional[float] = None) -> None:
         """按 DeltaSummary 更新实例统计、事件环形缓冲与全局聚合。"""
@@ -371,23 +382,33 @@ class Store:
         self._trend_events = keep
         return before - len(self._trend_events)
 
-    def query_trend_events(
+    def query_trend_window(
         self,
-        window_seconds: int,
+        start: float,
+        end: float,
         instance: Optional[str] = None,
-        now: Optional[float] = None,
-    ) -> List[Dict[str, Any]]:
-        """查询窗口内异常事件，按 ts 升序累计计数，返回阶梯点列表。
+    ) -> Dict[str, Any]:
+        """查询 [start, end] 区间（unix 秒，闭区间）的趋势结果。
 
-        每点含 ts/cumulative/model/ill_type/instance/source。累计从 1 开始（窗口内从 0 增长）。
-        instance=None 表示所有实例（看板）；指定则过滤该实例（详情页）。
+        单次遍历 `_trend_events` 同时产出：
+        - points：阶梯点（窗口内从 0 累计，结构同 query_trend_events）；
+        - by_type：四类异常计数（与 points 同源一致）；
+        - total：窗口内异常总数；
+        - data_start：当前实际保留的最早趋势数据时间（全实例口径，空为 None）；
+        - partial：start 早于 data_start 时置 True（部分/完全超出实际数据覆盖）。
+
+        可查询范围以实际保留数据为准，不设固定跨度上限。
+        instance=None 表示所有实例；指定则仅统计该实例。
         """
-        now = now if now is not None else NOW()
-        start = now - window_seconds
-        evs = [e for e in self._trend_events if e.ts >= start]
+        evs = [e for e in self._trend_events if start <= e.ts <= end]
         if instance is not None:
             evs = [e for e in evs if e.instance == instance]
         evs.sort(key=lambda e: e.ts)
+
+        by_type: Dict[str, int] = {t: 0 for t in ILL_TYPES}
+        for e in evs:
+            by_type[e.ill_type] += 1
+
         points: List[Dict[str, Any]] = []
         cum = 0
         for e in evs:
@@ -400,7 +421,37 @@ class Store:
                 "instance": e.instance,
                 "source": e.source,
             })
-        return points
+
+        data_start: Optional[float] = None
+        partial = False
+        if self._trend_events:
+            data_start = min(e.ts for e in self._trend_events)
+            partial = start < data_start
+
+        return {
+            "start": float(start),
+            "end": float(end),
+            "points": points,
+            "by_type": by_type,
+            "total": len(evs),
+            "data_start": data_start,
+            "partial": partial,
+        }
+
+    def query_trend_events(
+        self,
+        window_seconds: int,
+        instance: Optional[str] = None,
+        now: Optional[float] = None,
+    ) -> List[Dict[str, Any]]:
+        """查询窗口内异常事件，按 ts 升序累计计数，返回阶梯点列表。
+
+        每点含 ts/cumulative/model/ill_type/instance/source。累计从 1 开始（窗口内从 0 增长）。
+        instance=None 表示所有实例（看板）；指定则过滤该实例（详情页）。
+        薄封装：预设窗口 = 区间 [now-window, now]，复用 query_trend_window。
+        """
+        now = now if now is not None else NOW()
+        return self.query_trend_window(now - window_seconds, now, instance)["points"]
 
     # ------------------------------------------------------------------ #
     # 历史导入：同步到事件/统计/趋势/全局 KPI（覆盖语义）

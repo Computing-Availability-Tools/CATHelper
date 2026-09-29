@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "anomaly_middleware"
-version = "0.1.0"
+version = "0.2.0"
 description = "vLLM 推理精度异常检测 ASGI 中间件（透明拦截 + 后台检测 + Prometheus 指标）"
 readme = "docs/README.md"
 requires-python = ">=3.8"
