@@ -16,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Computing-Availability-Tools/CATHelper/feature/straggler/config"
 	"github.com/Computing-Availability-Tools/CATHelper/feature/straggler/profiling/dataparse"
 	"github.com/Computing-Availability-Tools/CATHelper/feature/straggler/resource"
 	"github.com/Computing-Availability-Tools/CATHelper/feature/straggler/utils"
@@ -30,11 +31,11 @@ type Daemon struct {
 	logf   func(format string, args ...any)
 
 	mu            sync.Mutex
-	state         string        // "running" | "paused" | "managed"
-	interval      time.Duration // current cycle period (POST /daemon/interval updates it)
-	degradation   float64       // current sensitivity (CLI initial, POST /daemon/degradation updates it)
-	nextRun       time.Time     // when the next cycle starts (zero when paused)
-	cycleID       int           // per-process id, starting from 1
+	state         string            // "running" | "paused" | "managed"
+	interval      time.Duration     // current cycle period (POST /daemon/interval updates it)
+	thresholds    config.Thresholds // current detection thresholds (CLI initial, POST /daemon/thresholds updates them)
+	nextRun       time.Time         // when the next cycle starts (zero when paused)
+	cycleID       int               // per-process id, starting from 1
 	cycleInFlight bool
 	timer         *time.Timer   // cycle timer; stopped while paused, re-armed by Start/Trigger
 	dynolog       *exec.Cmd     // dynolog child, left running on shutdown (nil = reusing existing)
@@ -66,16 +67,25 @@ func New(cfg Config, detect DetectFunc) *Daemon {
 	if cfg.Port <= 0 {
 		cfg.Port = 8080
 	}
+	// Resolve --profiler-dir to an absolute path so the daemon's analyse/scan
+	// (its own cwd) and the profiler writer (the training process / dynolog,
+	// which resolves ACTIVITIES_LOG_FILE against ITS cwd) always refer to the
+	// same directory. A relative path otherwise reads a different (empty) dir.
+	if cfg.ProfilerDir != "" {
+		if abs, err := filepath.Abs(cfg.ProfilerDir); err == nil {
+			cfg.ProfilerDir = abs
+		}
+	}
 	return &Daemon{
-		cfg:         cfg,
-		detect:      detect,
-		st:          newStore(),
-		logf:        func(format string, args ...any) { fmt.Fprintf(os.Stderr, "[DAEMON] "+format+"\n", args...) },
-		state:       "running",
-		interval:    cfg.Interval,
-		degradation: cfg.Degradation,
-		stopCh:      make(chan struct{}),
-		progress:    newProgressLog(),
+		cfg:        cfg,
+		detect:     detect,
+		st:         newStore(),
+		logf:       func(format string, args ...any) { fmt.Fprintf(os.Stderr, "[DAEMON] "+format+"\n", args...) },
+		state:      "running",
+		interval:   cfg.Interval,
+		thresholds: cfg.Thresholds,
+		stopCh:     make(chan struct{}),
+		progress:   newProgressLog(),
 	}
 }
 
@@ -200,8 +210,11 @@ func (d *Daemon) runCycle(id int) {
 		}
 		d.progress.finish()
 		_ = d.progress.save(filepath.Join(archive, "progress.json"))
-		d.cleanupDump(cr)
+		// Log the cycle outcome BEFORE cleanup so the detected error (if any) is
+		// printed ahead of the "cleaned" line — otherwise it looks like the dump
+		// was removed before it was scanned.
 		d.finishCycle(cr)
+		d.cleanupDump(cr)
 	}()
 
 	// 1. Collect: dyno trigger -> verify commandStatus -> wait for the dump.
@@ -263,13 +276,14 @@ func (d *Daemon) runCycle(id int) {
 	d.progress.step("KPI 检测完成 (%s)", cr.KPIStatus)
 
 	// 6. Profiler detection (shared pipeline; sets config.FilePath internally).
-	// degradation is runtime-adjustable via POST /daemon/degradation; snapshot it
-	// under the lock so a concurrent update cannot race the cycle.
+	// Thresholds are runtime-adjustable via POST /daemon/thresholds; snapshot
+	// them under the lock and apply to the global config before detecting.
 	d.mu.Lock()
-	deg := d.degradation
+	th := d.thresholds
 	d.mu.Unlock()
-	d.progress.step("Profiler 检测 (阈值基数 %.2f)", deg)
-	res, derr := d.detect(root, deg, d.cfg.DebugOutput)
+	config.Apply(th)
+	d.progress.step("Profiler 检测 (阈值 cal=%.2f cpu=%.2f)", th.Cal, th.CPU)
+	res, derr := d.detect(root, d.cfg.DebugOutput)
 	if derr != nil {
 		cr.Error = fmt.Sprintf("profiler detection: %v", derr)
 		return
@@ -299,7 +313,7 @@ func (d *Daemon) runCycle(id int) {
 		return
 	}
 	jsonPath := filepath.Join(archive, "straggler_output.json")
-	if err := WriteCombinedJSON(cr.KPI, cr.Result, jsonPath); err != nil {
+	if err := WriteCombinedJSON(cr.ID, cr.StartedAt.Format(time.RFC3339), cr.KPI, cr.Result, jsonPath); err != nil {
 		cr.Error = fmt.Sprintf("write result JSON: %v", err)
 		return
 	}
@@ -506,23 +520,19 @@ func (d *Daemon) Start() {
 	}
 }
 
-// Degradation returns the current sensitivity (CalThreshold = 1 + degradation).
-func (d *Daemon) Degradation() float64 {
+// Thresholds returns the current detection thresholds.
+func (d *Daemon) Thresholds() config.Thresholds {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	return d.degradation
+	return d.thresholds
 }
 
-// SetDegradation updates the sensitivity for subsequent cycles, validating
-// [0, 1). It does not touch already-completed results.
-func (d *Daemon) SetDegradation(v float64) error {
-	if v < 0 || v >= 1 {
-		return fmt.Errorf("degradation out of range [0, 1)")
-	}
+// SetThresholds updates the detection thresholds for subsequent cycles
+// (normalizing unset values). It does not touch already-completed results.
+func (d *Daemon) SetThresholds(t config.Thresholds) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	d.degradation = v
-	return nil
+	d.thresholds = t.Normalized()
 }
 
 // SetInterval updates the cycle period, validating [60, 86400] seconds. The
@@ -759,9 +769,12 @@ func (d *Daemon) resetTimer() {
 // ---------------------------------------------------------------------------
 
 // WriteCombinedJSON marshals the KPI + profiler result into one JSON file at
-// path — the shared straggler_output.json shape ({"kpi": ..., "profiler": ...}).
-func WriteCombinedJSON(kpi *resource.DetectionResult, profiler *utils.NodeOutput, path string) error {
-	out := CombinedOutput{KPI: kpi, Profiler: profiler}
+// path — the shared straggler_output.json shape
+// ({"id": ..., "started_at": ..., "kpi": ..., "profiler": ...}). id/startedAt
+// are the cycle id and start time (RFC3339) in daemon mode; pass 0/"" in
+// one-shot mode to omit them.
+func WriteCombinedJSON(id int, startedAt string, kpi *resource.DetectionResult, profiler *utils.NodeOutput, path string) error {
+	out := CombinedOutput{ID: id, StartedAt: startedAt, KPI: kpi, Profiler: profiler}
 	data, err := json.MarshalIndent(out, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshal combined output: %w", err)
@@ -825,6 +838,9 @@ func copyDir(src, dst string) error {
 // untouched; RemoveAll on a missing root is a no-op, so this is safe even when
 // the trigger never created a dump. Failures are logged, never fatal.
 func (d *Daemon) cleanupDump(cr *CycleResult) {
+	if _, err := os.Stat(d.cfg.ProfilerDir); err != nil {
+		return // nothing was written this cycle; nothing to clean
+	}
 	if err := os.RemoveAll(d.cfg.ProfilerDir); err != nil {
 		d.logf("cycle %d cleanup failed: %v", cr.ID, err)
 		return

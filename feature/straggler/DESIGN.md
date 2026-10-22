@@ -5,10 +5,19 @@
 ### config
 ```go
 var FilePath string                                  // CLI path= 设置
-var CalThreshold float64                             // = 1 + degradation（默认 1.3）
-var CPUThreshold float64                             // = 1 + degradation × 5（默认 2.5）
-var SlowCommRatio float64                            // 慢通信带宽劣化阈值（--comm-slow-ratio，默认 1.3）
+var CalThreshold float64                             // 慢计算阈值（--cal-threshold，默认 1.3）
+var CPUThreshold float64                             // 慢CPU 阈值（--cpu-threshold，默认 2.5）
+var BubbleThresholdNs float64                        // NPU Bubble 绝对阈值（--bubble-threshold-ns，默认 5000）
+var CommThreshold float64                            // 慢通信带宽劣化阈值（--comm-threshold，默认 1.3）
 var SlowCommMinCount int                             // 带宽统计最小 op 计数（--comm-min-count，默认 1000）
+var SlowCommCountFloor int                           // 代表 count 下限（--comm-count-floor，默认 10240）
+var SlowCommFlat bool                                // 带宽分母改用全体 rank 扁平池前10%均值（--comm-flat，默认 false）
+
+type Thresholds struct { Cal, CPU, BubbleNs, CommThreshold float64; CommMinCount, CommCountFloor int }
+func DefaultThresholds() Thresholds
+func (t Thresholds) Normalized() Thresholds
+func Apply(t Thresholds)     // 设置上面这些全局「生效阈值」
+func Current() Thresholds    // 读取当前生效阈值
 
 type DegradationData map[string]map[string]float64   // 类别 → (key → 劣化分数)
 func NewDegradationData() DegradationData
@@ -70,7 +79,7 @@ func CalculateMidMeanPair(stats []OpStat) (meanDuration, meanCount int, err erro
 - COMMUNICATION_OP.groupName 是 STRING_IDS 中组名字符串的 id；`parallel_group_info` 的**顶层 key**（长名，如 `"group_name_3"`）即 STRING_IDS 里的组名字符串，而每项的 `group_name` 字段是**短名**（如 `"tp"`）
 - `xpToGroupName` 以短名为键、长名为值；`idToXp` 反向映射为 **STRING_IDS id → 短名**，CSV 的域列以短名命名（`tp_Duration, tp_Count`），与 detector 的域常量一致
 - 某域在 STRING_IDS/COMMUNICATION_OP 中无算子 → 该域无列（正常，无数据可测）
-- **慢通信带宽回填列（`{domain}_<opType>_<count>`）**：解析完成后的全局回填 pass（`BackfillSlowDomainBandwidth`）重新扫 `.db` 对齐集合通信 op、按组内最短时长算带宽后追加写入 CSV；仅集合通信域产生，`pp` / `Send` / `Recv` 跳过，op 计数 < `SlowCommMinCount` 时不写。
+- **慢通信带宽回填列（`{domain}_<opType>_<count>`）**：解析完成后的全局回填 pass（`BackfillSlowDomainBandwidth`）重新扫 `.db`、对集合通信 op 计算带宽后追加写入 CSV；默认按 wall-clock 重叠跨 rank 对齐、取组内最短时长再前 10% 均值，传 `--comm-flat`（`SlowCommFlat`）时改为不匹配、用全体 rank 的扁平算子时长池取前 10% 均值；仅集合通信域产生，`pp` / `Send` / `Recv` 跳过，op 计数 < `SlowCommMinCount` 时不写。
 
 **三种数据缺失场景**：
 - `xpToGroupName` 为空 → 全部填充 -99999，ZP_Kernel/DataLoader 独立查询
@@ -97,7 +106,7 @@ func GetHostUidMapping(jobPath string, ranks []int) map[int]string    // 读取 
 func DelimitDetection(StepData map[string]map[int]float64, parallels map[string][][]int, validRanks []int) config.DegradationData
 func GetCalDetectionGroup(parallels map[string][][]int, curNpus []int) (string, [][]int)
 func DebugRankScores(stepData map[string]map[int]float64, validRanks []int) map[int]map[string]float64   // --debug-output 用
-func DebugCommScores(stepData map[string]map[int]float64, parallels map[string][][]int) map[string]map[string]float64
+（DebugCommScores 已随 Duration 聚类通信检测一并移除）
 ```
 
 **GetCurDetectionInfo**：遍历 `op_metric/group_info_*.json`，收集所有 rank ID 和域名称（`group_name` 字段，短名），对每个域调用 `getDetectionJobParallelInfo` 提取组，过滤 < 2 卡的组，返回 parallels 映射和排序 validRanks。**无 group_info 文件（组名未注册）时**：回退从 `global_rank_*.csv` 文件名收集 rank（该文件无条件写），返回空 parallels → 主流程降级 cal-only。
@@ -124,15 +133,17 @@ func DebugCommScores(stepData map[string]map[int]float64, parallels map[string][
 #### 慢通信（DetectSlowDomainByBandwidth，带宽 kmeans 递归聚类）
 ```
 前置：dataparse.BackfillSlowDomainBandwidth 回填带宽列
-  重新扫 .db、重建拓扑，按 (opType, count) 对齐集合通信 op（跳过 pp / Send / Recv），
-  带宽 = count /（组内单次算子最小时间升序排序后前 10% 的均值时间），
-  写入 CSV 动态列 {domain}_<opType>_<count>（仅 count ≥ SlowCommMinCount 的 op 参与）。
+  重新扫 .db、重建拓扑，跳过 pp / Send / Recv（仅 count ≥ SlowCommMinCount 的算子参与），
+  带宽 = count /（前 10% 均值时间），写入 CSV 动态列 {domain}_<opType>_<count>：
+    默认：跨 rank 按 wall-clock 重叠对齐，每个 occurrence 取组内各 rank 最短时长，
+          收集后升序取前 10% 均值（组内最短时长代表真实传输）
+    --comm-flat：不做跨 rank 匹配，把全体 rank 的算子时长汇成扁平池，直接取前 10% 均值
 
 检测（对每个非 PP/非 embd 域，组数 < 2 跳过）：
   先按算子类型 opType 分类；对每个 opType：
     每组取该 opType 下 count 最大的带宽作代表（大数据量更能体现真实带宽）
     所有组代表 count 取最大值，仅保留 count ≥ 最大值 ×50% 且 count > 10240 的组
-    剩余组代表带宽 → clustering.Detect(bws, SlowCommRatio, min) 递归聚类
+    剩余组代表带宽 → clustering.Detect(bws, CommThreshold, min) 递归聚类
       → 劣化组 + Ratio；劣化程度 = 1/Ratio（= 基线带宽/该组带宽，>1 越大越慢）
   一个组须在该域**所有 opType 都异常**才上报；劣化数值 = 该组各 opType 劣化指数中的最大值
     → AddGroup("comm", group, maxDeg)
@@ -140,7 +151,7 @@ func DebugCommScores(stepData map[string]map[int]float64, parallels map[string][
 - 带宽采用**方向 min**（带宽越小越慢）；匹配按算子类型分类后，组内取 count 最大代表，无 count 严格匹配。
 - **筛选**：count ≥ 最大 count×50% 且 count > 10240（`slowCommCountFloor`）。
 - **上报条件**：一个组必须在所有算子类型都异常（降低误报）；可同时上报多个满足条件的组。
-- 比较粒度仍是卡组；`SlowCommRatio` 默认 1.3、`SlowCommMinCount` 默认 1000（均 CLI 可调）。
+- 比较粒度仍是卡组；`CommThreshold` 默认 1.3、`SlowCommMinCount` 默认 1000、`SlowCommFlat` 默认 false（均 CLI 可调）。
 
 #### 慢CPU（getSlowHostRanksByHomogenize）
 ```
@@ -211,8 +222,8 @@ func ReadFile(filePath string) ([]byte, error)
 
 ### report
 ```go
-func WriteReport(stepData, parallels, validRanks, outputDir, detectionResult, inputPath, degradation) string
-func GenerateReport(stepData, parallels, validRanks, detectionResult, inputPath, degradation) string
+func WriteReport(stepData, parallels, validRanks, outputDir, detectionResult, inputPath) string
+func GenerateReport(stepData, parallels, validRanks, detectionResult, inputPath) string
 ```
 
 **报告章节**：头部 → 并行域拓扑 → 检测摘要表 → ZP_Kernel 柱状图（Top 30 + Bottom 5，跨 rank）→ ZP_Host 节点对比（≥2 物理节点才显示，跨节点聚合）→ 各域通信分组对比（min/mean/max + 柱状图）。通信以通信组为单位比较，不输出逐 rank 的总通信时间排序。
@@ -359,7 +370,7 @@ WHERE message = ? AND startNs >= ? AND endNs <= ? LIMIT 1
 
 ```bash
 # 一次性模式（现状，不变）
-go run . path=/data/dir [degradation=0.3] ...
+go run . path=/data/dir [--cal-threshold=1.3] [--cpu-threshold=2.5] ...
 
 # 守护进程模式（无需 path=，数据目录来自每周期采集）
 go run . --daemon \
@@ -384,7 +395,7 @@ go run . --daemon \
 
 > 注意：命令为可直接执行写法（续行 `\` 后不留注释/空格）；参数语义见上表。
 
-`--daemon` 进入常驻模式：从 PATH 解析 dyno/dynolog 并拉起 dynolog、启动 HTTP 服务，随后等待一个 interval 再开始周期循环（首个周期不在启动时立即执行）。`degradation` 等其余参数语义不变；每周期**同时检测 profiler 与 KPI**，二者结果合并为一份 JSON 落盘。
+`--daemon` 进入常驻模式：从 PATH 解析 dyno/dynolog 并拉起 dynolog、启动 HTTP 服务，随后等待一个 interval 再开始周期循环（首个周期不在启动时立即执行）。各阈值参数语义不变；每周期**同时检测 profiler 与 KPI**，二者结果合并为一份 JSON 落盘。
 
 ### 采集链路（dynolog / dyno）
 
@@ -481,7 +492,7 @@ master_<pid>_<ts>_ascend_pt），周期之间互不共享状态：
    删除不依赖结果写入是否成功
 ```
 
-`config.FilePath` / `CalThreshold` / `CPUThreshold` / `SlowCommRatio` / `SlowCommMinCount` 全局量按周期设置（FilePath 每周期 = --profiler-dir 根目录）；`SlowCommRatio` / `SlowCommMinCount` 在启动时由 CLI 解析后设置一次。
+`config.FilePath` 每周期设置为 --profiler-dir 根目录；一组检测阈值通过 `config.Apply(Thresholds)` 生效——一次性模式启动时应用一次，守护进程每周期应用自身 `Thresholds`，中心节点每业务应用其持久化的 `Thresholds`（检测串行化以避免进程级全局量竞态）。
 
 ### 与一次性模式的代码复用（main.go 重构点）
 
@@ -492,7 +503,7 @@ main.go 第 3-8 步抽取为共用函数，一次性模式与 daemon 调用同�
 // （原 main.go 步骤 4-8：拓扑 -> step data -> 检测 -> 节点聚合 -> 报告）。
 // 解析阶段（步骤 3）不在此函数内：一次性模式调 DataParsing（全量+os.Exit），
 // daemon 调 StartProcess（错误返回，不退出进程）。
-func detectFromParsedData(inputPath string, degradation float64, debugOutput bool) (*utils.NodeOutput, error)
+func detectFromParsedData(inputPath string, debugOutput bool) (*utils.NodeOutput, error)
 ```
 
 错误处理差异：一次性模式检测失败 -> `os.Exit(1)`；daemon 检测失败 -> 周期错误记入历史，**守护进程继续运行**。
@@ -520,7 +531,7 @@ POST /daemon/stop   -> 关闭 stopCh -> Run 走 shutdown（停 HTTP + 等周期�
 
 ### HTTP API
 
-路径不带 `/api/v1` 版本前缀（内网诊断工具，按资源直白命名）。JSON 响应，无鉴权（内网工具，绑定地址即边界）。控制接口均为幂等。
+JSON 响应，无鉴权（内网工具，绑定地址即边界）。控制接口均为幂等。
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
@@ -598,7 +609,7 @@ type DaemonConfig struct {
     CollectWait time.Duration // dyno 触发成功后的等待秒数，默认 60s
     DynoBin     string        // dyno 可执行路径（build.sh 用 .deb 装到系统，启动时 PATH 解析）
     DynologBin  string        // dynolog 可执行路径（build.sh 用 .deb 装到系统，启动时 PATH 解析）
-    Degradation float64       // 阈值参数透传
+    Thresholds  config.Thresholds // 每守护进程一组检测阈值（运行时可调）
     DebugOutput bool
 }
 

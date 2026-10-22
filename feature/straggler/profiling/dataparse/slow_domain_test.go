@@ -38,18 +38,6 @@ func TestPureCommKind(t *testing.T) {
 	}
 }
 
-func TestOpSeqB(t *testing.T) {
-	if got := opSeqB("hcom_allReduce__503_96_4"); got != 96 {
-		t.Errorf("opSeqB = %d, want 96", got)
-	}
-	if got := opSeqB("hcom_allReduce__0_0_0"); got != 0 {
-		t.Errorf("opSeqB = %d, want 0", got)
-	}
-	if got := opSeqB("HcclAllreduce"); got != -1 {
-		t.Errorf("opSeqB = %d, want -1 (no sequence marker)", got)
-	}
-}
-
 // TestComputeBandwidthFromOps checks alignment, shortest-duration selection,
 // and (opType,count) grouping with two ranks whose clocks overlap (wall-clock
 // matching). Rank 1 is strictly slower (larger durations), so the shortest
@@ -87,32 +75,60 @@ func TestComputeBandwidthFromOps(t *testing.T) {
 	}
 }
 
-// TestComputeBandwidthFromOpsSeqAlignment verifies the sequence-B fallback:
-// when a rank's clock does not overlap the base rank's at all, it is matched by
-// op-name sequence index instead.
-func TestComputeBandwidthFromOpsSeqAlignment(t *testing.T) {
+// TestComputeBandwidthFromOpsNoOverlapSkipped verifies that wall-clock overlap
+// is required: a rank whose timestamps do not overlap the base rank's at all
+// yields no combo (there is no sequence-number fallback).
+func TestComputeBandwidthFromOpsNoOverlapSkipped(t *testing.T) {
 	// Rank 1's timestamps share no overlap with rank 0 (different time base).
 	members := map[int][]bwOp{
 		0: {
-			{opType: "allReduce", seqB: 7, count: 1000, start: 1000000000, end: 1000000100},
-			{opType: "allReduce", seqB: 8, count: 1000, start: 1000001000, end: 1000001200},
+			{opType: "allReduce", count: 1000, start: 1000000000, end: 1000000100},
+			{opType: "allReduce", count: 1000, start: 1000001000, end: 1000001200},
 		},
 		1: {
-			{opType: "allReduce", seqB: 7, count: 1000, start: 9000000000000, end: 9000000000200},
-			{opType: "allReduce", seqB: 8, count: 1000, start: 9000001000000, end: 9000001000500},
+			{opType: "allReduce", count: 1000, start: 9000000000000, end: 9000000000200},
+			{opType: "allReduce", count: 1000, start: 9000001000000, end: 9000001000500},
 		},
 	}
 	ranks := []int{0, 1}
 
 	res := computeBandwidthFromOps(members, ranks)
-	if len(res) != 1 {
-		t.Fatalf("expected 1 combo, got %d", len(res))
+	if len(res) != 0 {
+		t.Fatalf("expected no combo (no wall-clock overlap), got %v", res)
 	}
-	// Two aligned occurrences: fastest 10% of [100,200] = [100] -> bw = 10.
-	got := res[bucketKey{"allReduce", 1000}]
-	want := 10.0
+}
+
+// TestComputeBandwidthFromOpsFlat verifies the flat-pool mode: no cross-rank
+// alignment; every rank's op durations are pooled per (opType,count), and the
+// fastest 10% mean is the denominator. Non-overlapping clocks still produce a
+// bandwidth (unlike the aligned mode).
+func TestComputeBandwidthFromOpsFlat(t *testing.T) {
+	members := map[int][]bwOp{
+		0: {
+			{opType: "allGather", count: 2048, start: 0, end: 100},
+			{opType: "allGather", count: 2048, start: 1000, end: 1200},
+		},
+		1: {
+			{opType: "allGather", count: 2048, start: 10000000000, end: 10000000300},
+			{opType: "allGather", count: 2048, start: 10000001000, end: 10000001500},
+		},
+	}
+	ranks := []int{0, 1}
+
+	res := computeBandwidthFromOpsFlat(members, ranks)
+	if len(res) != 1 {
+		t.Fatalf("expected 1 combo, got %v", res)
+	}
+	// Pooled durations [100,200,300,500]; fastest 10% = [100] -> bw = 2048/100.
+	got := res[bucketKey{"allGather", 2048}]
+	want := float64(2048) / 100.0
 	if math.Abs(got-want) > 1e-9 {
-		t.Errorf("bandwidth = %v, want %v", got, want)
+		t.Errorf("flat bandwidth = %v, want %v", got, want)
+	}
+
+	// Sanity: the aligned variant yields nothing for non-overlapping clocks.
+	if aligned := computeBandwidthFromOps(members, ranks); len(aligned) != 0 {
+		t.Errorf("aligned mode should yield nothing for non-overlapping clocks, got %v", aligned)
 	}
 }
 

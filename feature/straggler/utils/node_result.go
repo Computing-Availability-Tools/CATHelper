@@ -34,8 +34,8 @@ type NpuResult struct {
 // NodeResult aggregates anomalies of one physical node. CPU is node-level;
 // npu lists only the NPUs with anomalies.
 type NodeResult struct {
-	Hostname string      `json:"hostname"`
-	Npu      []NpuResult `json:"npu"`
+	Hostname string       `json:"hostname"`
+	Npu      []NpuResult  `json:"npu"`
 	CPU      *ScoreResult `json:"cpu,omitempty"`
 }
 
@@ -57,7 +57,6 @@ type NodeOutput struct {
 type DebugInfo struct {
 	ValidRanks []int
 	RankScores map[int]map[string]float64 // rank → {cal, cpu, npu_bubble}
-	CommScores map[string]map[string]float64 // domain → {groupKey: ratio}
 }
 
 // nodeAccumulator builds up one node's entries while scanning results.
@@ -191,21 +190,6 @@ func buildNodeResult(finalResult map[string]map[string]float64, parallels map[st
 			commDomains[domain] = make(map[string]float64)
 		}
 		commDomains[domain][groupKey] = score
-	}
-
-	// Debug: merge all communication groups' ratios (anomalous scores above take
-	// precedence) so normal groups show their score too.
-	if includeAll && debug.CommScores != nil {
-		for domain, groups := range debug.CommScores {
-			if commDomains[domain] == nil {
-				commDomains[domain] = make(map[string]float64)
-			}
-			for groupKey, score := range groups {
-				if _, exists := commDomains[domain][groupKey]; !exists {
-					commDomains[domain][groupKey] = score
-				}
-			}
-		}
 	}
 
 	// Build node_result (sorted by hostname, npu by id for determinism).

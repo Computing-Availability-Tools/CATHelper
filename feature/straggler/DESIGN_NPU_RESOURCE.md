@@ -376,14 +376,13 @@ func main() {
     // ── 第二道防线：Profiler 慢节点检测 ──
     if inputPath != "" {
         config.FilePath = inputPath
-        config.CalThreshold = 1 + degradation
-        config.CommThreshold = 1 + degradation*5
+        config.Apply(thresholds)                                // 一组独立阈值（cal/cpu/bubble/comm…）
         dataparse.DataParsing(inputPath)                        // SQLite → 中间文件
         parallels, validRanks := detector.GetCurDetectionInfo(inputPath)
         stepData := detector.GetCurJobLastStepData(validRanks)
         result := detector.DelimitDetection(stepData, parallels, validRanks)
         profilerOut, _ := utils.BuildNodeResult(result, parallels, debugInfo)
-        report.WriteReport(stepData, parallels, validRanks, inputPath, result, inputPath, degradation)
+        report.WriteReport(stepData, parallels, validRanks, inputPath, result, inputPath)
     }
 
     // ── 合并输出 ──

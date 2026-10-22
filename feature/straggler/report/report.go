@@ -42,9 +42,8 @@ func WriteReport(
 	outputDir string,
 	detectionResult map[string]map[string]float64,
 	inputPath string,
-	degradation float64,
 ) string {
-	report := GenerateReport(stepData, parallels, validRanks, detectionResult, inputPath, degradation)
+	report := GenerateReport(stepData, parallels, validRanks, detectionResult, inputPath)
 
 	outDir := filepath.Join(outputDir, "analysis_result")
 	os.MkdirAll(outDir, 0755)
@@ -64,7 +63,6 @@ func GenerateReport(
 	validRanks []int,
 	detectionResult map[string]map[string]float64,
 	inputPath string,
-	degradation float64,
 ) string {
 	var sb strings.Builder
 
@@ -92,7 +90,7 @@ func GenerateReport(
 
 	// Detection summary.
 	sb.WriteString(sepLine("检测结果摘要", reportSep))
-	sb.WriteString(detectionSummary(detectionResult, validRanks, degradation, calOnly))
+	sb.WriteString(detectionSummary(detectionResult, validRanks, calOnly))
 	sb.WriteString("\n")
 
 	// ZP_Kernel section.
@@ -320,9 +318,9 @@ func hostSection(data map[int]float64, ranks []int) string {
 	}
 
 	type nodeStat struct {
-		name       string
-		min, mean  float64
-		max        float64
+		name      string
+		min, mean float64
+		max       float64
 	}
 	hosts := make([]string, 0, len(nodeVals))
 	for h := range nodeVals {
@@ -363,12 +361,13 @@ func hostSection(data map[int]float64, ranks []int) string {
 func detectionSummary(
 	detectionResult map[string]map[string]float64,
 	validRanks []int,
-	degradation float64,
 	calOnly bool,
 ) string {
 	var sb strings.Builder
 
-	sb.WriteString(fmt.Sprintf("  计算类阈值: %.2f, 通信类阈值: %.2f\n\n", 1+degradation, 1+degradation*5))
+	th := config.Current()
+	sb.WriteString(fmt.Sprintf("  慢计算阈值: %.2f, 慢CPU阈值: %.2f, Bubble阈值: %.0fns, 慢通信阈值: %.2f\n\n",
+		th.Cal, th.CPU, th.BubbleNs, th.CommThreshold))
 
 	sb.WriteString("  " + padEnd("检测类型", 22) + "  " + padEnd("状态", 10) + "  " + padEnd("异常数", 10) + "  异常详情\n")
 	sb.WriteString("  " + strings.Repeat("-", 22) + "  " + strings.Repeat("-", 10) + "  " + strings.Repeat("-", 10) + "  " + strings.Repeat("-", 30) + "\n")

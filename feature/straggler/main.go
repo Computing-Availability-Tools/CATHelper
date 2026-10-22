@@ -8,7 +8,7 @@
 // anomaly detection before the heavy Profiler analysis.
 //
 // Two modes:
-//   - one-shot:  go run . path=/data/dir [degradation=0.3] [--kpi-path=/dir/of/kpi_csvs]
+//   - one-shot:  go run . path=/data/dir [--cal-threshold=1.3] [--cpu-threshold=2.5] [--kpi-path=/dir/of/kpi_csvs]
 //   - daemon:    go run . --daemon --profiler-dir=/dir --kpi-dir=/dir [...]
 //     The daemon periodically triggers profiler collection (dynolog/dyno),
 //     converts and analyses the data, and exposes results + control over HTTP.
@@ -46,11 +46,10 @@ func main() {
 	var inputPath string
 	var kpiPath string
 	var kpiJSONLDir string
-	degradation := 0.3
-	spaceRatioThreshold := 0.0 // 0 = use the default SpaceRatioThreshold (2.0)
-	debugOutput := false       // --debug-output: include all normal+abnormal data (kpi.debug / profiler.debug) in straggler_output.json
-	commSlowRatio := 1.3       // --comm-slow-ratio: bandwidth degradation threshold for slow-domain detection
-	commMinCount := 1000       // --comm-min-count: minimum op count included in bandwidth stats
+	thresholds := config.DefaultThresholds() // independent detection thresholds (see config.Thresholds)
+	spaceRatioThreshold := 0.0               // 0 = use the default SpaceRatioThreshold (2.0)
+	debugOutput := false                     // --debug-output: include all normal+abnormal data (kpi.debug / profiler.debug) in straggler_output.json
+	commFlat := false                        // --comm-flat: compute bandwidth from all ranks' op durations (no cross-rank alignment)
 
 	// Daemon-mode flags.
 	daemonMode := false
@@ -71,6 +70,10 @@ func main() {
 		// Bare boolean flag (no "=value").
 		if arg == "--debug-output" {
 			debugOutput = true
+			continue
+		}
+		if arg == "--comm-flat" {
+			commFlat = true
 			continue
 		}
 		if arg == "--daemon" {
@@ -133,18 +136,23 @@ func main() {
 			}
 		case "path":
 			inputPath = val
-		case "degradation":
-			if parsed, err := strconv.ParseFloat(val, 64); err == nil {
-				if parsed < 0 {
-					fmt.Fprintf(os.Stderr, "[SLOWNODE ALGO] WARNING: degradation < 0, using default 0.3\n")
-				} else {
-					if parsed > 1 {
-						fmt.Fprintf(os.Stderr, "[SLOWNODE ALGO] WARNING: degradation > 1 may produce unexpected results\n")
-					}
-					degradation = parsed
-				}
+		case "--cal-threshold":
+			if v, err := strconv.ParseFloat(val, 64); err == nil && v > 0 {
+				thresholds.Cal = v
 			} else {
-				fmt.Fprintf(os.Stderr, "[SLOWNODE ALGO] WARNING: invalid degradation value, using default 0.3\n")
+				fmt.Fprintf(os.Stderr, "[SLOWNODE ALGO] WARNING: invalid --cal-threshold value, using default\n")
+			}
+		case "--cpu-threshold":
+			if v, err := strconv.ParseFloat(val, 64); err == nil && v > 0 {
+				thresholds.CPU = v
+			} else {
+				fmt.Fprintf(os.Stderr, "[SLOWNODE ALGO] WARNING: invalid --cpu-threshold value, using default\n")
+			}
+		case "--bubble-threshold-ns":
+			if v, err := strconv.ParseFloat(val, 64); err == nil && v > 0 {
+				thresholds.BubbleNs = v
+			} else {
+				fmt.Fprintf(os.Stderr, "[SLOWNODE ALGO] WARNING: invalid --bubble-threshold-ns value, using default\n")
 			}
 		case "--kpi-path":
 			kpiPath = val
@@ -156,25 +164,31 @@ func main() {
 			} else {
 				fmt.Fprintf(os.Stderr, "[SLOWNODE ALGO] WARNING: invalid --space-ratio-threshold value, using default\n")
 			}
-		case "--comm-slow-ratio":
+		case "--comm-threshold":
 			if parsed, err := strconv.ParseFloat(val, 64); err == nil && parsed > 1 {
-				commSlowRatio = parsed
+				thresholds.CommThreshold = parsed
 			} else {
-				fmt.Fprintf(os.Stderr, "[SLOWNODE ALGO] WARNING: invalid --comm-slow-ratio value (must be > 1), using default 1.3\n")
+				fmt.Fprintf(os.Stderr, "[SLOWNODE ALGO] WARNING: invalid --comm-threshold value (must be > 1), using default 1.3\n")
 			}
 		case "--comm-min-count":
 			if parsed, err := strconv.Atoi(val); err == nil && parsed > 0 {
-				commMinCount = parsed
+				thresholds.CommMinCount = parsed
 			} else {
 				fmt.Fprintf(os.Stderr, "[SLOWNODE ALGO] WARNING: invalid --comm-min-count value, using default 1000\n")
+			}
+		case "--comm-count-floor":
+			if parsed, err := strconv.Atoi(val); err == nil && parsed > 0 {
+				thresholds.CommCountFloor = parsed
+			} else {
+				fmt.Fprintf(os.Stderr, "[SLOWNODE ALGO] WARNING: invalid --comm-count-floor value, using default 10240\n")
 			}
 		}
 	}
 
-	// Slow-domain bandwidth detection knobs (used by both detection and the
-	// dataparse backfill pass); set once before one-shot / daemon branching.
-	config.SlowCommRatio = commSlowRatio
-	config.SlowCommMinCount = commMinCount
+	// Slow-domain bandwidth mode + apply the active thresholds globally (one-shot
+	// reads them directly; daemon/center re-apply their own per-scope values).
+	config.SlowCommFlat = commFlat
+	config.Apply(thresholds)
 
 	// ─────────────────────────────────────────────────────────────────
 	// Daemon mode: resident service (dynolog/dyno collection + HTTP).
@@ -209,7 +223,7 @@ func main() {
 		cfg.Iterations = profilerIterations
 		cfg.DynoBin = dynoBin
 		cfg.DynologBin = dynologBin
-		cfg.Degradation = degradation
+		cfg.Thresholds = thresholds
 		cfg.DebugOutput = debugOutput
 
 		d := daemon.New(cfg, detectFromParsedData)
@@ -237,7 +251,7 @@ func main() {
 		cfg.Port = centerPort
 		cfg.DataDir = centerDataDir
 		cfg.Interval = time.Duration(centerIntervalSec) * time.Second
-		cfg.Degradation = degradation
+		cfg.Thresholds = thresholds
 
 		c := center.New(cfg)
 		fmt.Fprintf(os.Stderr, "[SLOWNODE ALGO] === Center Mode (port=%d data=%s) ===\n", centerPort, centerDataDir)
@@ -262,7 +276,7 @@ func main() {
 
 	// No input at all → usage error before anything runs.
 	if inputPath == "" && kpiInput == "" {
-		fmt.Fprintf(os.Stderr, "Usage: slowNodeDetection path=/your/data/dir [degradation=0.3] [--kpi-path=/dir/of/kpi_csvs | --kpi-jsonl-dir=/dir] [--space-ratio-threshold=2.0] [--comm-slow-ratio=1.3] [--comm-min-count=1000]\n")
+		fmt.Fprintf(os.Stderr, "Usage: slowNodeDetection path=/your/data/dir [--kpi-path=/dir/of/kpi_csvs | --kpi-jsonl-dir=/dir] [--cal-threshold=1.3] [--cpu-threshold=2.5] [--bubble-threshold-ns=5000] [--space-ratio-threshold=2.0] [--comm-threshold=1.3] [--comm-min-count=1000] [--comm-count-floor=10240] [--comm-flat]\n")
 		fmt.Fprintf(os.Stderr, "ERROR: Missing required parameter: path=/your/data/dir (or a KPI input)\n")
 		os.Exit(1)
 	}
@@ -327,7 +341,8 @@ func main() {
 		}
 
 		fmt.Fprintf(os.Stderr, "[SLOWNODE ALGO] Input path: %s\n", inputPath)
-		fmt.Fprintf(os.Stderr, "[SLOWNODE ALGO] Degradation: %.2f\n", degradation)
+		fmt.Fprintf(os.Stderr, "[SLOWNODE ALGO] Thresholds: cal=%.2f cpu=%.2f bubble=%.0fns commRatio=%.2f commMinCount=%d commCountFloor=%d flat=%v\n",
+			thresholds.Cal, thresholds.CPU, thresholds.BubbleNs, thresholds.CommThreshold, thresholds.CommMinCount, thresholds.CommCountFloor, commFlat)
 
 		// Data parsing: SQLite → CSV + JSON intermediates.
 		fmt.Fprintf(os.Stderr, "[SLOWNODE ALGO] Starting data parsing...\n")
@@ -343,7 +358,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "[SLOWNODE ALGO] Backfill done.\n")
 
 		// Shared detection pipeline (steps 4-8); os.Exit on fatal conditions.
-		detectResult, derr := detectFromParsedData(inputPath, degradation, debugOutput)
+		detectResult, derr := detectFromParsedData(inputPath, debugOutput)
 		if derr != nil {
 			fmt.Fprintf(os.Stderr, "[SLOWNODE ALGO] FATAL: %v\n", derr)
 			os.Exit(1)
@@ -360,7 +375,7 @@ func main() {
 	// ─────────────────────────────────────────────────────────────────
 	if kpiResult != nil || profilerOut != nil {
 		const combinedPath = "straggler_output.json"
-		if err := daemon.WriteCombinedJSON(kpiResult, profilerOut, combinedPath); err != nil {
+		if err := daemon.WriteCombinedJSON(0, "", kpiResult, profilerOut, combinedPath); err != nil {
 			fmt.Fprintf(os.Stderr, "[SLOWNODE ALGO] Failed to write combined output: %v\n", err)
 		} else {
 			fmt.Fprintf(os.Stderr, "[SLOWNODE ALGO] Result written to %s\n", combinedPath)
@@ -378,20 +393,19 @@ func main() {
 
 // detectFromParsedData runs the detection stage after the op_metric
 // intermediates are ready (the one-shot mode's steps 4-8): parallel topology →
-// step data snapshot → detection → node aggregation → text report. It sets the
-// config globals (FilePath / CalThreshold / CommThreshold) and returns the
-// node output, per-category anomaly counts, and the report text.
+// step data snapshot → detection → node aggregation → text report. The caller
+// is responsible for having applied the active thresholds (config.Apply); this
+// function only sets config.FilePath and returns the node output, per-category
+// anomaly counts, and the report text.
 //
 // The parsing stage (step 3) is NOT inside this function: one-shot calls
 // dataparse.DataParsing (full rescan, os.Exit on zero files), while the daemon
 // calls dataparse.StartProcess (error return, survives a bad dump).
-func detectFromParsedData(inputPath string, degradation float64, debugOutput bool) (*daemon.DetectResult, error) {
+func detectFromParsedData(inputPath string, debugOutput bool) (*daemon.DetectResult, error) {
 	config.FilePath = inputPath
-	config.CalThreshold = 1 + degradation
-	config.CPUThreshold = 1 + degradation*5
-	config.CommThreshold = 1 + degradation*5
-	fmt.Fprintf(os.Stderr, "[SLOWNODE ALGO] CalThreshold: %.2f, CPUThreshold: %.2f, CommThreshold: %.2f\n",
-		config.CalThreshold, config.CPUThreshold, config.CommThreshold)
+	th := config.Current()
+	fmt.Fprintf(os.Stderr, "[SLOWNODE ALGO] Thresholds: cal=%.2f cpu=%.2f bubble=%.0fns commRatio=%.2f commMinCount=%d commCountFloor=%d\n",
+		th.Cal, th.CPU, th.BubbleNs, th.CommThreshold, th.CommMinCount, th.CommCountFloor)
 
 	// 4. Get parallel topology from group_info JSON files.
 	parallels, validRanks := detector.GetCurDetectionInfo(inputPath)
@@ -422,7 +436,6 @@ func detectFromParsedData(inputPath string, degradation float64, debugOutput boo
 		debug := &utils.DebugInfo{
 			ValidRanks: validRanks,
 			RankScores: detector.DebugRankScores(stepData, validRanks),
-			CommScores: detector.DebugCommScores(stepData, parallels),
 		}
 		profilerOut, _ = utils.BuildNodeResult(result, parallels, debug)
 	} else {
@@ -431,8 +444,8 @@ func detectFromParsedData(inputPath string, degradation float64, debugOutput boo
 
 	// 8. Text report (written to <inputPath>/analysis_result/detection_report.log;
 	//    the text is also returned so the daemon can serve it over HTTP).
-	report.WriteReport(stepData, parallels, validRanks, inputPath, result, inputPath, degradation)
-	reportText := report.GenerateReport(stepData, parallels, validRanks, result, inputPath, degradation)
+	report.WriteReport(stepData, parallels, validRanks, inputPath, result, inputPath)
+	reportText := report.GenerateReport(stepData, parallels, validRanks, result, inputPath)
 
 	return &daemon.DetectResult{
 		NodeOutput: profilerOut,

@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Computing-Availability-Tools/CATHelper/feature/straggler/config"
 	"github.com/Computing-Availability-Tools/CATHelper/feature/straggler/profiling/detector"
 )
 
@@ -38,7 +39,7 @@ func (c *Center) httpServer() *http.Server {
 	mux.HandleFunc("POST /center/business/{name}/pause", c.handleBusinessPause)
 	mux.HandleFunc("POST /center/business/{name}/start", c.handleBusinessStart)
 	mux.HandleFunc("POST /center/business/{name}/interval", c.handleBusinessInterval)
-	mux.HandleFunc("POST /center/business/{name}/degradation", c.handleBusinessDegradation)
+	mux.HandleFunc("POST /center/business/{name}/thresholds", c.handleBusinessThresholds)
 	mux.HandleFunc("POST /center/business/{name}/vllm", c.handleSetVLLMMetrics)
 	mux.HandleFunc("DELETE /center/business/{name}/vllm", c.handleUnsetVLLMMetrics)
 	mux.HandleFunc("GET /center/business/{name}/metrics", c.handleBusinessMetrics)
@@ -67,16 +68,17 @@ type daemonStatus struct {
 
 // businessStatus is the web-visible view of one business.
 type businessStatus struct {
-	Name         string         `json:"name"`
-	IntervalSec  int64          `json:"interval_sec"`
-	Paused       bool           `json:"paused"`
-	CyclesTotal  int            `json:"cycles_total"`
-	CyclesFailed int            `json:"cycles_failed"`
-	NextTrigger  string         `json:"next_trigger,omitempty"`
-	CollectWait  int64          `json:"collect_wait"`           // max across the business's daemons
-	VLLMMetrics  string         `json:"vllm_metrics,omitempty"` // vllm /metrics endpoint URL
-	Degradation  float64        `json:"degradation,omitempty"`  // merged-detection sensitivity
-	Daemons      []daemonStatus `json:"daemons"`
+	Name              string            `json:"name"`
+	IntervalSec       int64             `json:"interval_sec"`
+	Paused            bool              `json:"paused"`
+	CyclesTotal       int               `json:"cycles_total"`
+	CyclesFailed      int               `json:"cycles_failed"`
+	NextTrigger       string            `json:"next_trigger,omitempty"`
+	CollectWait       int64             `json:"collect_wait"`           // max across the business's daemons
+	VLLMMetrics       string            `json:"vllm_metrics,omitempty"` // vllm /metrics endpoint URL
+	Thresholds        config.Thresholds `json:"thresholds"`             // merged-detection thresholds
+	DefaultThresholds config.Thresholds `json:"default_thresholds"`     // factory defaults, for "restore defaults"
+	Daemons           []daemonStatus    `json:"daemons"`
 }
 
 func daemonState(d *Daemon) string {
@@ -109,14 +111,15 @@ func (c *Center) statusViewLocked() []businessStatus {
 // (never exposing the daemons' match keys).
 func businessStatusOfLocked(b *Business) businessStatus {
 	bs := businessStatus{
-		Name:         b.Name,
-		IntervalSec:  b.IntervalSec,
-		Paused:       b.Paused,
-		CyclesTotal:  b.CyclesTotal,
-		CyclesFailed: b.CyclesFailed,
-		VLLMMetrics:  b.VLLMMetrics,
-		Degradation:  b.Degradation,
-		Daemons:      make([]daemonStatus, 0, len(b.Daemons)),
+		Name:              b.Name,
+		IntervalSec:       b.IntervalSec,
+		Paused:            b.Paused,
+		CyclesTotal:       b.CyclesTotal,
+		CyclesFailed:      b.CyclesFailed,
+		VLLMMetrics:       b.VLLMMetrics,
+		Thresholds:        b.Thresholds,
+		DefaultThresholds: config.DefaultThresholds(),
+		Daemons:           make([]daemonStatus, 0, len(b.Daemons)),
 	}
 	if !b.nextTrigger.IsZero() {
 		bs.NextTrigger = b.nextTrigger.Format(time.RFC3339)
@@ -153,8 +156,10 @@ func (c *Center) handleAddBusiness(w http.ResponseWriter, r *http.Request) {
 	if b.Daemons == nil {
 		b.Daemons = []*Daemon{}
 	}
-	if b.Degradation <= 0 {
-		b.Degradation = c.cfg.Degradation
+	if b.Thresholds == (config.Thresholds{}) {
+		b.Thresholds = c.cfg.Thresholds
+	} else {
+		b.Thresholds = b.Thresholds.Normalized()
 	}
 	b.progress = newProgressLog()
 	c.biz[req.Name] = b
@@ -518,14 +523,12 @@ func (c *Center) handleBusinessInterval(w http.ResponseWriter, r *http.Request) 
 	writeJSON(w, map[string]any{"interval_sec": req.IntervalSec})
 }
 
-// handleBusinessDegradation updates a business's merged-detection sensitivity.
+// handleBusinessThresholds updates a business's merged-detection thresholds.
 // Only affects future detection rounds; past results are untouched.
-func (c *Center) handleBusinessDegradation(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		Degradation float64 `json:"degradation"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Degradation < 0 || req.Degradation >= 1 {
-		http.Error(w, `invalid body: {"degradation": 0.3}`, http.StatusBadRequest)
+func (c *Center) handleBusinessThresholds(w http.ResponseWriter, r *http.Request) {
+	var req config.Thresholds
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, `invalid body: {"cal","cpu","bubble_ns","comm_threshold","comm_min_count","comm_count_floor"}`, http.StatusBadRequest)
 		return
 	}
 	c.mu.Lock()
@@ -535,9 +538,9 @@ func (c *Center) handleBusinessDegradation(w http.ResponseWriter, r *http.Reques
 		http.Error(w, "business not found", http.StatusNotFound)
 		return
 	}
-	b.Degradation = req.Degradation
+	b.Thresholds = req.Normalized()
 	c.save()
-	writeJSON(w, map[string]any{"degradation": req.Degradation})
+	writeJSON(w, b.Thresholds)
 }
 
 // handleSetVLLMMetrics attaches a vllm /metrics endpoint URL to a business.

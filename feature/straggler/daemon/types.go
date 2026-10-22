@@ -7,22 +7,23 @@ package daemon
 import (
 	"time"
 
+	"github.com/Computing-Availability-Tools/CATHelper/feature/straggler/config"
 	"github.com/Computing-Availability-Tools/CATHelper/feature/straggler/resource"
 	"github.com/Computing-Availability-Tools/CATHelper/feature/straggler/utils"
 )
 
 // Config holds the daemon's run-time configuration (the --daemon CLI flags).
 type Config struct {
-	ProfilerDir string        // profiler 采集落盘根目录（--profiler-dir=，必填；传给 dyno 的 --log-file）
-	KpiDir      string        // KPI 数据目录（--kpi-dir=，可选；空 = 每轮只跑 Profiler 检测）
-	Interval    time.Duration // 循环周期，默认 600s
-	Port        int           // HTTP 端口，默认 8080
-	CollectWait time.Duration // dyno 触发成功后的等待秒数，默认 60s
-	Iterations  int           // dyno nputrace 采集迭代数（--profiler-iterations=，默认 1）
-	DynoBin     string        // dyno 可执行路径（build.sh 用 .deb 装到系统，启动时 PATH 解析）
-	DynologBin  string        // dynolog 可执行路径（build.sh 用 .deb 装到系统，启动时 PATH 解析）
-	Degradation float64       // 阈值参数透传（1+degradation / 1+degradation*5）
-	DebugOutput bool          // --debug-output：结果含所有正常卡的诊断分
+	ProfilerDir string            // profiler 采集落盘根目录（--profiler-dir=，必填；传给 dyno 的 --log-file）
+	KpiDir      string            // KPI 数据目录（--kpi-dir=，可选；空 = 每轮只跑 Profiler 检测）
+	Interval    time.Duration     // 循环周期，默认 600s
+	Port        int               // HTTP 端口，默认 8080
+	CollectWait time.Duration     // dyno 触发成功后的等待秒数，默认 60s
+	Iterations  int               // dyno nputrace 采集迭代数（--profiler-iterations=，默认 1）
+	DynoBin     string            // dyno 可执行路径（build.sh 用 .deb 装到系统，启动时 PATH 解析）
+	DynologBin  string            // dynolog 可执行路径（build.sh 用 .deb 装到系统，启动时 PATH 解析）
+	Thresholds  config.Thresholds // independent detection thresholds (per-daemon, adjustable at runtime)
+	DebugOutput bool              // --debug-output：结果含所有正常卡的诊断分
 }
 
 // DefaultConfig returns a Config with sensible defaults (CLI overrides).
@@ -32,7 +33,7 @@ func DefaultConfig() Config {
 		Port:        8080,
 		CollectWait: 60 * time.Second,
 		Iterations:  1,
-		Degradation: 0.3,
+		Thresholds:  config.DefaultThresholds(),
 	}
 }
 
@@ -71,7 +72,7 @@ type dynoResponse struct {
 
 // DetectFunc is the shared profiler detection pipeline (main.detectFromParsedData),
 // injected into the daemon so both modes call one implementation.
-type DetectFunc func(inputPath string, degradation float64, debugOutput bool) (*DetectResult, error)
+type DetectFunc func(inputPath string, debugOutput bool) (*DetectResult, error)
 
 // DetectResult is the outcome of the profiler pipeline: the node output for the
 // combined JSON, per-category anomaly counts, and the text report.
@@ -84,24 +85,27 @@ type DetectResult struct {
 // CombinedOutput is the merged KPI + profiler result written as one JSON file
 // (the "straggler_output.json" shape shared with one-shot mode).
 type CombinedOutput struct {
-	KPI      *resource.DetectionResult `json:"kpi,omitempty"`
-	Profiler *utils.NodeOutput         `json:"profiler,omitempty"`
+	ID        int                       `json:"id,omitempty"`         // cycle id (daemon mode; omitted in one-shot)
+	StartedAt string                    `json:"started_at,omitempty"` // cycle start time RFC3339 (daemon mode; omitted in one-shot)
+	KPI       *resource.DetectionResult `json:"kpi,omitempty"`
+	Profiler  *utils.NodeOutput         `json:"profiler,omitempty"`
 }
 
 // statusResponse is the GET /status payload.
 type statusResponse struct {
-	State        string        `json:"state"`
-	IntervalSec  int64         `json:"interval_sec"`
-	CollectWait  int64         `json:"collect_wait"`
-	Degradation  float64       `json:"degradation"`
-	Managed      bool          `json:"managed"`
-	CenterAddr   string        `json:"center_addr,omitempty"`
-	ProfilerDir  string        `json:"profiler_dir"`
-	KpiDir       string        `json:"kpi_dir"`
-	CyclesTotal  int           `json:"cycles_total"`
-	CyclesFailed int           `json:"cycles_failed"`
-	LastCycle    *cycleSummary `json:"last_cycle,omitempty"`
-	NextRunAt    *time.Time    `json:"next_run_at,omitempty"`
+	State             string            `json:"state"`
+	IntervalSec       int64             `json:"interval_sec"`
+	CollectWait       int64             `json:"collect_wait"`
+	Thresholds        config.Thresholds `json:"thresholds"`
+	DefaultThresholds config.Thresholds `json:"default_thresholds"`
+	Managed           bool              `json:"managed"`
+	CenterAddr        string            `json:"center_addr,omitempty"`
+	ProfilerDir       string            `json:"profiler_dir"`
+	KpiDir            string            `json:"kpi_dir"`
+	CyclesTotal       int               `json:"cycles_total"`
+	CyclesFailed      int               `json:"cycles_failed"`
+	LastCycle         *cycleSummary     `json:"last_cycle,omitempty"`
+	NextRunAt         *time.Time        `json:"next_run_at,omitempty"`
 }
 
 // cycleSummary is the compact per-cycle entry served by /status and /history

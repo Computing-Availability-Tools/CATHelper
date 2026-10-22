@@ -7,8 +7,7 @@ import (
 )
 
 func resetSlowCommConfig() {
-	config.SlowCommRatio = 1.3
-	config.SlowCommMinCount = 1000
+	config.Apply(config.DefaultThresholds())
 }
 
 // TestParseBandwidthCol verifies dynamic column-name parsing.

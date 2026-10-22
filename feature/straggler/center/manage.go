@@ -21,9 +21,9 @@ import (
 )
 
 const (
-	probeInterval    = 5 * time.Second
-	probeFailLimit   = 3               // consecutive healthz failures → 断连
-	reportBufferSec  = 60              // fixed buffer added to max collect-wait
+	probeInterval   = 5 * time.Second
+	probeFailLimit  = 3  // consecutive healthz failures → 断连
+	reportBufferSec = 60 // fixed buffer added to max collect-wait
 )
 
 // heartbeatLoop probes every daemon (healthz + match_status) forever.
@@ -362,6 +362,11 @@ func (c *Center) mergeOpMetric(b *Business) detector.OpMetric {
 // file-backed detection path, so host-level (slow-CPU / cross-node) detection
 // and the report's cross-node sections work exactly as in a daemon.
 func (c *Center) detectAndStore(b *Business, op detector.OpMetric, startedAt time.Time, durationMs int64) error {
+	// Detection uses process-wide config globals (FilePath + thresholds), so
+	// serialize it across businesses to avoid cross-business races.
+	c.detectMu.Lock()
+	defer c.detectMu.Unlock()
+
 	tmp, err := restoreOpMetric(op)
 	if err != nil {
 		return fmt.Errorf("restore op_metric: %w", err)
@@ -369,9 +374,7 @@ func (c *Center) detectAndStore(b *Business, op detector.OpMetric, startedAt tim
 	defer os.RemoveAll(tmp)
 
 	config.FilePath = tmp
-	config.CalThreshold = 1 + b.Degradation
-	config.CPUThreshold = 1 + b.Degradation*5
-	config.CommThreshold = 1 + b.Degradation*5
+	config.Apply(b.Thresholds)
 
 	parallels, validRanks := detector.GetCurDetectionInfo(tmp)
 	if len(validRanks) == 0 {
@@ -390,7 +393,7 @@ func (c *Center) detectAndStore(b *Business, op detector.OpMetric, startedAt tim
 	}
 	c.mu.Unlock()
 	source := strings.Join(addrs, ",")
-	reportText := report.GenerateReport(stepData, parallels, validRanks, result, source, b.Degradation)
+	reportText := report.GenerateReport(stepData, parallels, validRanks, result, source)
 
 	summary := map[string]int{
 		"cal":        len(result["cal"]),

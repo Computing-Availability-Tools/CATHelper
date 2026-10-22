@@ -58,16 +58,14 @@ func detCalForOneGroup(alignedData map[string]map[int]float64, npuGroup []int) (
 // NPU Bubble detection
 // ---------------------------------------------------------------------------
 
-// detectionZpBubbleData applies a fixed threshold (< 5000 ns) to flag ranks
-// with insufficient NPU idle time.
+// detectionZpBubbleData flags ranks whose NPU bubble time is below the
+// configured absolute threshold (config.BubbleThresholdNs, default 5000 ns).
 func detectionZpBubbleData(npuData map[int]float64, localResult config.DegradationData) {
-	const bubbleThreshold = 5000.0 // 5 µs
-
 	for npuID, value := range npuData {
 		if value <= 0 {
 			continue
 		}
-		if value < bubbleThreshold {
+		if value < config.BubbleThresholdNs {
 			localResult.AddSingle("npu_bubble", npuID, value)
 		}
 	}

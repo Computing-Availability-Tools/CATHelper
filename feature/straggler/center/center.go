@@ -10,16 +10,19 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
+
+	"github.com/Computing-Availability-Tools/CATHelper/feature/straggler/config"
 )
 
 // Center is the center-node service: business CRUD + persistence, plus (in
 // later stages) daemon matching, health probing, and merged detection.
 type Center struct {
-	cfg     Config
-	mu      sync.Mutex
-	biz     map[string]*Business // name → business (persisted)
-	metrics *metricsStore        // vllm TTFT/TPOT time series (in-memory)
-	logf    func(format string, args ...any)
+	cfg      Config
+	mu       sync.Mutex
+	detectMu sync.Mutex           // serializes detection (process-wide config globals)
+	biz      map[string]*Business // name → business (persisted)
+	metrics  *metricsStore        // vllm TTFT/TPOT time series (in-memory)
+	logf     func(format string, args ...any)
 }
 
 // New creates a Center, loading persisted state from cfg.DataDir.
@@ -93,8 +96,10 @@ func (c *Center) load() {
 	}
 	for _, b := range st.Businesses {
 		if b.Name != "" {
-			if b.Degradation <= 0 {
-				b.Degradation = c.cfg.Degradation
+			if b.Thresholds == (config.Thresholds{}) {
+				b.Thresholds = c.cfg.Thresholds
+			} else {
+				b.Thresholds = b.Thresholds.Normalized()
 			}
 			b.progress = newProgressLog()
 			c.biz[b.Name] = b

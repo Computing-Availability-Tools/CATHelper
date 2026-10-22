@@ -1,10 +1,7 @@
 package detector
 
 import (
-	"math"
 	"sort"
-	"strconv"
-	"strings"
 
 	"github.com/Computing-Availability-Tools/CATHelper/feature/straggler/clustering"
 	"github.com/Computing-Availability-Tools/CATHelper/feature/straggler/config"
@@ -67,69 +64,4 @@ func rankRatios(data map[int]float64, threshold float64, highIsAnomaly bool) map
 		out[ranks[e.Index]] = e.Ratio
 	}
 	return out
-}
-
-// DebugCommScores returns, for every non-PP/embd communication domain, each
-// group's top-level kmeans ratio (the representative = minimum-time card),
-// flagged and normal groups alike, for --debug-output. Key = sorted
-// comma-joined ranks ("0,1,2"), matching the anomalous comm_domain_result keys.
-func DebugCommScores(stepData map[string]map[int]float64, parallels map[string][][]int) map[string]map[string]float64 {
-	result := make(map[string]map[string]float64)
-	for domain, groups := range parallels {
-		if domain == ppParallelDomainName || domain == "embd" {
-			continue
-		}
-		colName := domain + "_Duration"
-		data, ok := stepData[colName]
-		if !ok {
-			continue
-		}
-
-		// Minimum-time card per group as the representative.
-		var reps []int
-		groupOf := make(map[int][]int)
-		for _, group := range groups {
-			minCard, minVal := -1, math.MaxFloat64
-			for _, card := range group {
-				if v, ok := data[card]; ok && v < minVal {
-					minVal, minCard = v, card
-				}
-			}
-			if minCard >= 0 {
-				reps = append(reps, minCard)
-				groupOf[minCard] = group
-			}
-		}
-		if len(reps) == 0 {
-			continue
-		}
-
-		vals := make([]float64, len(reps))
-		for i, card := range reps {
-			vals[i] = data[card]
-		}
-		entries := clustering.Diagnose(vals, config.CommThreshold, true)
-		domainRes := make(map[string]float64)
-		for _, e := range entries {
-			if group, ok := groupOf[reps[e.Index]]; ok {
-				domainRes[joinSortedInts(group)] = e.Ratio
-			}
-		}
-		if len(domainRes) > 0 {
-			result[domain] = domainRes
-		}
-	}
-	return result
-}
-
-// joinSortedInts formats a rank group as the groupKey "a,b,c" (sorted).
-func joinSortedInts(ranks []int) string {
-	sorted := make([]int, len(ranks))
-	copy(sorted, ranks)
-	sort.Ints(sorted)
-	parts := make([]string, len(sorted))
-	for i, r := range sorted {
-		parts[i] = strconv.Itoa(r)
-	}
-	return strings.Join(parts, ",")
 }

@@ -7,7 +7,6 @@ import (
 	"math"
 	"os"
 	"path/filepath"
-	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -37,9 +36,6 @@ const (
 	embdDomainName       = "embd"
 	wallclockToleranceNs = 5e6 // 5 ms: widen the overlap-match window for tiny phase differences (overlap is still required)
 )
-
-// seqBRe extracts the sequence index "B" from an op name ("hcom_xxx__A_B_C").
-var seqBRe = regexp.MustCompile(`__\d+_(\d+)_\d+$`)
 
 // pureCommTypes is the PURE_COMM_TYPES whitelist: only these pure-collective
 // operator families participate in slow-communication bandwidth detection.
@@ -92,18 +88,6 @@ func leadingLetters(s string) string {
 	return s[:i]
 }
 
-// opSeqB extracts the sequence index "B" from an op name
-// ("hcom_xxx__A_B_C" -> B), used to align ops when two ranks' clocks are not
-// comparable. Returns -1 when the name carries no sequence marker.
-func opSeqB(nm string) int {
-	m := seqBRe.FindStringSubmatch(nm)
-	if m == nil {
-		return -1
-	}
-	n, _ := strconv.Atoi(m[1])
-	return n
-}
-
 // ---------------------------------------------------------------------------
 // Alignment structures
 // ---------------------------------------------------------------------------
@@ -117,14 +101,13 @@ type bucketKey struct {
 // bwOp is one communication operator's parsed data used for bandwidth stats.
 type bwOp struct {
 	opType string
-	seqB   int
 	count  int
 	start  int
 	end    int
 }
 
 // bwIndex buckets a rank's collective ops by (opType, count) and sorts each
-// bucket by startNs so both wall-clock and sequence matching stay efficient.
+// bucket by startNs so wall-clock (overlap) matching stays efficient.
 type bwIndex struct {
 	ops     []bwOp
 	buckets map[bucketKey][]int
@@ -186,29 +169,16 @@ func (b *bwIndex) wallclock(op bwOp, tol int) int {
 	return -1
 }
 
-// seq matches a reference op by its opName sequence index B (used when a rank's
-// clock is not comparable to the group's). Returns the ops index or -1.
-func (b *bwIndex) seq(op bwOp) int {
-	if op.seqB < 0 {
-		return -1
-	}
-	for _, idx := range b.buckets[bucketKey{op.opType, op.count}] {
-		if b.ops[idx].seqB == op.seqB {
-			return idx
-		}
-	}
-	return -1
-}
-
 // ---------------------------------------------------------------------------
 // Bandwidth computation (DB-independent core, unit-testable)
 // ---------------------------------------------------------------------------
 
-// computeBandwidthFromOps aligns ops across the group's ranks and returns a
-// per-(opType,count) bandwidth (G elements/s) map. Each combo's bandwidth uses
-// the mean of the fastest 10% of per-occurrence shortest durations as the
-// denominator (the slow rank doesn't wait, so the fastest occurrences are
-// closest to the real transfer time).
+// computeBandwidthFromOps aligns ops across the group's ranks (by wall-clock
+// time overlap only; an op with no overlapping op on any rank is skipped) and
+// returns a per-(opType,count) bandwidth (G elements/s) map. Each combo's
+// bandwidth uses the mean of the fastest 10% of per-occurrence shortest
+// durations as the denominator (the slow rank doesn't wait, so the fastest
+// occurrences are closest to the real transfer time).
 func computeBandwidthFromOps(members map[int][]bwOp, ranks []int) map[bucketKey]float64 {
 	if len(ranks) == 0 {
 		return nil
@@ -223,32 +193,14 @@ func computeBandwidthFromOps(members map[int][]bwOp, ranks []int) map[bucketKey]
 		idxs[r] = newBWIndex(members[r])
 	}
 
-	// Per other rank, decide whether its clock is comparable to the base rank's:
-	// if it has any wall-clock match on the base ops it is comparable (use
-	// wall-clock); if it has none (e.g. different worker time base) fall back to
-	// sequence matching.
-	useSeq := make(map[int]bool)
-	for _, r := range ranks[1:] {
-		wc := 0
-		for _, op := range baseOps {
-			if idxs[r].wallclock(op, wallclockToleranceNs) >= 0 {
-				wc++
-			}
-		}
-		useSeq[r] = wc == 0
-	}
-
 	combos := make(map[bucketKey][]int) // (opType,count) -> shortest durations
 	for _, base := range baseOps {
 		dur := []int{base.end - base.start}
 		ok := true
 		for _, r := range ranks[1:] {
-			var j int
-			if useSeq[r] {
-				j = idxs[r].seq(base)
-			} else {
-				j = idxs[r].wallclock(base, wallclockToleranceNs)
-			}
+			// Wall-clock time overlap only: a rank with no overlapping op for
+			// this occurrence makes the whole occurrence ineligible.
+			j := idxs[r].wallclock(base, wallclockToleranceNs)
 			if j < 0 {
 				ok = false
 				break
@@ -263,6 +215,29 @@ func computeBandwidthFromOps(members map[int][]bwOp, ranks []int) map[bucketKey]
 		combos[k] = append(combos[k], minIntSlice(dur))
 	}
 
+	return fastest10MeanBandwidth(combos)
+}
+
+// computeBandwidthFromOpsFlat pools every rank's qualifying op durations per
+// (opType,count) — with NO cross-rank alignment — and uses the mean of the
+// fastest 10% of that flat pool as the denominator.
+func computeBandwidthFromOpsFlat(members map[int][]bwOp, ranks []int) map[bucketKey]float64 {
+	combos := make(map[bucketKey][]int)
+	for _, r := range ranks {
+		for _, op := range members[r] {
+			d := op.end - op.start
+			if d > 0 {
+				k := bucketKey{op.opType, op.count}
+				combos[k] = append(combos[k], d)
+			}
+		}
+	}
+	return fastest10MeanBandwidth(combos)
+}
+
+// fastest10MeanBandwidth turns per-(opType,count) duration slices into
+// bandwidths: count / (mean of the fastest 10% of positive durations).
+func fastest10MeanBandwidth(combos map[bucketKey][]int) map[bucketKey]float64 {
 	res := make(map[bucketKey]float64)
 	for k, durs := range combos {
 		// Keep positive durations, sort ascending (fastest first), and take the
@@ -364,7 +339,7 @@ func loadDomainOps(db *sql.DB, pgi map[string]interface{}, typ string, step Step
 		if op.Count < minCount {
 			continue
 		}
-		out = append(out, bwOp{opType: k, seqB: opSeqB(nm), count: op.Count, start: op.StartNs, end: op.EndNs})
+		out = append(out, bwOp{opType: k, count: op.Count, start: op.StartNs, end: op.EndNs})
 	}
 	return out
 }
@@ -527,7 +502,13 @@ func BackfillSlowDomainBandwidth(inputPath string) error {
 			continue
 		}
 
-		res := computeBandwidthFromOps(members, g.ranks)
+		var res map[bucketKey]float64
+		if config.SlowCommFlat {
+			// Flat pool: every rank's qualifying op durations, no alignment.
+			res = computeBandwidthFromOpsFlat(members, g.ranks)
+		} else {
+			res = computeBandwidthFromOps(members, g.ranks)
+		}
 		if len(res) == 0 {
 			continue
 		}

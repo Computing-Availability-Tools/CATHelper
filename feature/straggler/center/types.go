@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/Computing-Availability-Tools/CATHelper/feature/straggler/config"
 	"github.com/Computing-Availability-Tools/CATHelper/feature/straggler/profiling/detector"
 )
 
@@ -40,14 +41,14 @@ func (d *Daemon) BaseURL() string { return fmt.Sprintf("http://%s:%d", d.IP, d.P
 // ranks across them). Paused / cycle counters are persisted; nextTrigger is
 // runtime-only.
 type Business struct {
-	Name         string    `json:"name"`
-	IntervalSec  int64     `json:"interval_sec"`
-	Daemons      []*Daemon `json:"daemons"`
-	Paused       bool      `json:"paused,omitempty"`
-	CyclesTotal  int       `json:"cycles_total"`
-	CyclesFailed int       `json:"cycles_failed"`
-	VLLMMetrics  string    `json:"vllm_metrics,omitempty"`  // vllm /metrics endpoint URL (one per business)
-	Degradation  float64   `json:"degradation,omitempty"`   // merged-detection sensitivity (0 = inherit center default)
+	Name         string            `json:"name"`
+	IntervalSec  int64             `json:"interval_sec"`
+	Daemons      []*Daemon         `json:"daemons"`
+	Paused       bool              `json:"paused,omitempty"`
+	CyclesTotal  int               `json:"cycles_total"`
+	CyclesFailed int               `json:"cycles_failed"`
+	VLLMMetrics  string            `json:"vllm_metrics,omitempty"` // vllm /metrics endpoint URL (one per business)
+	Thresholds   config.Thresholds `json:"thresholds"`             // merged-detection thresholds (zero = inherit center default)
 
 	nextTrigger time.Time    // next scheduled trigger (in-memory)
 	triggering  bool         // a trigger round is currently in flight (in-memory, single-flight)
@@ -56,19 +57,19 @@ type Business struct {
 
 // Config holds the center's runtime configuration (--center CLI flags).
 type Config struct {
-	Port        int           // HTTP listen port
-	DataDir     string        // persistence root (businesses.json + per-business results)
-	Interval    time.Duration // default trigger period for new businesses
-	Degradation float64       // merged-detection sensitivity (CalThreshold = 1 + degradation)
+	Port       int               // HTTP listen port
+	DataDir    string            // persistence root (businesses.json + per-business results)
+	Interval   time.Duration     // default trigger period for new businesses
+	Thresholds config.Thresholds // default merged-detection thresholds for new businesses
 }
 
 // DefaultConfig returns sensible defaults.
 func DefaultConfig() Config {
 	return Config{
-		Port:        8080,
-		DataDir:     "center_data",
-		Interval:    10 * time.Minute,
-		Degradation: 0.3,
+		Port:       8080,
+		DataDir:    "center_data",
+		Interval:   10 * time.Minute,
+		Thresholds: config.DefaultThresholds(),
 	}
 }
 

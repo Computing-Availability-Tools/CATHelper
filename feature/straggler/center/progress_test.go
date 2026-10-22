@@ -11,7 +11,7 @@ import (
 
 func TestBusinessProgressEndpoint(t *testing.T) {
 	c := New(Config{DataDir: t.TempDir(), Port: 1})
-	b := &Business{Name: "biz", Degradation: 0.3, progress: newProgressLog()}
+	b := &Business{Name: "biz", progress: newProgressLog()}
 	b.progress.begin(1, time.Now())
 	b.progress.step("hello %d", 42)
 	c.mu.Lock()
@@ -53,7 +53,7 @@ func TestBusinessProgressEndpoint(t *testing.T) {
 func TestBusinessProgressByTs(t *testing.T) {
 	dir := t.TempDir()
 	c := New(Config{DataDir: dir, Port: 1})
-	b := &Business{Name: "biz", Degradation: 0.3, progress: newProgressLog()}
+	b := &Business{Name: "biz", progress: newProgressLog()}
 	started := time.Now()
 	b.progress.begin(7, started)
 	b.progress.step("第 7 轮")
