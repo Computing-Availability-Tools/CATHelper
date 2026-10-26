@@ -35,7 +35,7 @@ Slow Node Detection 算法，用于检测 AI 训练/推理集群中的慢节点�
 
 ### 正确运行目录
 
-所有命令都应在**本 skill 的 `scripts/` 目录**（含 `main.py` 的目录）内执行：`cd "C:\Users\admin\Desktop\Projects\CATHelper\.agents\skills\straggler-detection\scripts"`。
+所有命令都应在**本 skill 的 `scripts/` 目录**（含 `main.py` 的目录）内执行：`cd "<本 skill 目录>/scripts"`。
 
 ### 命令行执行
 

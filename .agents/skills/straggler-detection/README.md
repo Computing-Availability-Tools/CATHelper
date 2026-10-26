@@ -175,3 +175,30 @@ utils.py                  # 结果写入、清理、交互询问
 ## 四、依赖
 
 Python 3.8+，仅标准库（`sqlite3`、`csv`、`json`、`os`、`logging`、`math`、`random`）。
+
+---
+
+## 五、通过 npm / npx 安装（可选）
+
+本 skill 同时是一个 npm 包，可一条命令装到本地 skills 目录。安装器只拷贝
+`SKILL.md`、`README.md`、`SPEC.md`、`scripts/`，不影响目标目录里已有的其它 skill。
+
+```bash
+# 默认：装到 ~/.agents/skills/straggler-detection（OpenCode 与 Claude 系均可发现）
+npx @nifeng15423/straggler-detection
+
+# 只装给 OpenCode：~/.config/opencode/skills
+npx @nifeng15423/straggler-detection --opencode
+
+# 装到当前项目的 .agents/skills（随项目走）
+npx @nifeng15423/straggler-detection --project
+
+# 自定义 skills 根目录 / 只预览不改动
+npx @nifeng15423/straggler-detection --dir /opt/team-skills
+npx @nifeng15423/straggler-detection --dry-run
+```
+
+- npm 包名 `@nifeng15423/straggler-detection`（scope = npm 用户名 `nifeng15423`）。
+- 发布（在 `<本 skill 目录>` 下执行）：`npm login && npm publish --access public`。
+- 安装后无需其它配置：OpenCode 会自动发现（ID = `straggler-detection`），也可用 `@straggler-detection` 直接加载。
+- 检测脚本需要目标机有 Python 3.8+（仅标准库），npm/npx 只负责搬送 skill 文件。
