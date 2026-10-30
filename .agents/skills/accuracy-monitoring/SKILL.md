@@ -18,7 +18,9 @@ compatibility: >-
   tokenizer 解码需 transformers，缺失时报告仍生成分布，明细无法解码）；
   控制节点仅跑 merge_reports.py 合并（纯 stdlib）。
 metadata:
-  role: monitoring-operations
+   author: Computing-Availability-Tools
+   upstream: https://github.com/Computing-Availability-Tools/CATHelper/tree/main/feature/accuracy-monitoring
+   role: accuracy-monitoring
 ---
 
 # vLLM 推理精度异常监控
