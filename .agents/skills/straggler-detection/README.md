@@ -11,7 +11,7 @@ npx @nifeng15423/straggler-detection --project    # → 当前项目 ./.agents/s
 npx @nifeng15423/straggler-detection --dir <路径> # 自定义 skills 根目录
 ```
 
-安装器只拷贝本 skill 自己的文件（`SKILL.md`、`README.md`、`SPEC.md`、`LICENSE`、`scripts/`、`references/`），不影响目标目录里的其它 skill。
+安装器只拷贝本 skill 自己的文件（`SKILL.md`、`README.md`、`LICENSE`、`scripts/`、`references/`），不影响目标目录里的其它 skill。
 
 ## 使用
 
@@ -21,7 +21,7 @@ python scripts/main.py path=/path/to/data compute=1.3 io=2.5 comm=1.3 pp_comm=5 
 
 - 运行环境：Python 3.8+，**仅标准库**，无第三方依赖、无需编译。
 - 完整说明（触发条件、四组阈值、执行前询问流程、结论输出规范）见 **`SKILL.md`**。
-- 算法细节见 **`references/detection.md`** 与 `SPEC.md`。
+- 算法细节见 **`references/detection.md`**。
 
 ## 许可
 
