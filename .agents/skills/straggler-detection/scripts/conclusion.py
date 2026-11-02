@@ -12,17 +12,15 @@ _CATEGORY_CN = {
     "memcpy_async": "MEMCPY_ASYNC类算子",
     "comm": "comm（通信组带宽）",
     "cpu": "cpu（主机侧 ZP_Host）",
-    "npu_bubble": "npu_bubble（NPU 气泡 ZP_Bubble）",
     "pp_comm": "pp_comm（PP 流水线等待）",
 }
 _ORDER = ("KERNEL_AICORE", "kernel_aivec", "memcpy_async", "comm",
-          "cpu", "npu_bubble", "pp_comm")
+          "cpu", "pp_comm")
 _COLUMN = {
     "KERNEL_AICORE": "KERNEL_AICORE",
     "kernel_aivec": "KERNEL_AIVEC",
     "memcpy_async": "MEMCPY_ASYNC",
     "cpu": "ZP_Host",
-    "npu_bubble": "ZP_Bubble",
 }
 _DETAIL_CATS = ("KERNEL_AICORE", "kernel_aivec", "memcpy_async")
 _LEVEL_NOTE = {
@@ -378,7 +376,6 @@ _CATEGORY_GROUPS = (
     ("IO类异常", ("memcpy_async",)),
     ("通信类异常", ("comm", "pp_comm")),
     ("Host异常", ("cpu",)),
-    ("NPU空泡异常", ("npu_bubble",)),
 )
 
 def _body(text: str) -> str:
@@ -473,10 +470,6 @@ def _pp_line(items: List[Dict]) -> str:
         parts.append(f"{label} 的点对点等待时间占会话时长约 {pct:.2f}%")
     return f"{_CATEGORY_CN.get('pp_comm')}：" + "、".join(parts) + f"，超过阈值 {_pp_percent()}%"
 
-def _bubble_line(items: List[Dict]) -> str:
-    keys = "、".join(_ranks_text(i.get("display_key")) for i in items)
-    return f"{_CATEGORY_CN.get('npu_bubble')}：{keys} 的算子启动间隔低于固定阈值 5000 ns"
-
 def _threshold_text(level: str, thresholds) -> str:
     """只列出该数据级别实际用到的阈值。"""
     compute, io, comm = thresholds[0], thresholds[1], thresholds[2]
@@ -527,8 +520,6 @@ def render(detection: Dict, level: str, thresholds, metric_dir: str = "",
                 rows.extend(_comm_rows(items, data_dir, level))
             elif cat == "pp_comm":
                 rows.append(("PP点对点通信等待占比", _body(_pp_line(items))))
-            elif cat == "npu_bubble":
-                rows.append(("npu_bubble", _body(_bubble_line(items))))
             else:
                 detail = "、".join(
                     f"{_ranks_text(i.get('display_key'))} 约 {float(i.get('metric_value') or 0):.2f} 倍"

@@ -10,7 +10,6 @@ CATEGORY_DISPLAY = {
     "comm": "comm",
     "pp_comm": "pp_comm",
     "cpu": "cpu",
-    "npu_bubble": "npu_bubble",
 }
 
 def _disp_len(text: str) -> int:
@@ -150,7 +149,7 @@ def build_summary_table(result: dict, parallels: dict = None, step_data: dict = 
     headers = ["类别", "异常卡", "劣化指数", "劣化阈值"]
     ordered_categories = [
         "KERNEL_AICORE", "kernel_aivec", "memcpy_async",
-        "comm", "pp_comm", "cpu", "npu_bubble",
+        "comm", "pp_comm", "cpu",
     ]
     known = set(ordered_categories)
     dynamic = [c for c in result.keys() if c not in known]
@@ -160,16 +159,13 @@ def build_summary_table(result: dict, parallels: dict = None, step_data: dict = 
         "compute": config.get_compute_threshold(),
         "io": config.get_io_threshold(),
         "comm": config.get_comm_threshold(),
-        "bubble": config.BUBBLE_THRESHOLD_NS,
     }
     for category in all_categories:
         items = result.get(category) or {}
         if not items:
             continue
         cards_str, deg_str, _devices = _summary_cells(category, items, parallels)
-        if category == "npu_bubble":
-            th_str = f"<{threshold['bubble']}ns"
-        elif category == "pp_comm":
+        if category == "pp_comm":
             th_str = f">{config.PP_WAIT_RATIO_THRESHOLD * 100:g}%"
         elif category == "comm":
             th_str = f"{threshold['comm']:g}x"

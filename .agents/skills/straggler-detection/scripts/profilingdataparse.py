@@ -51,7 +51,6 @@ class PerformanceMetrics:
     zp_device: int = 0
     zp_duration: int = 0
     zp_host: int = 0
-    zp_bubble: int = 0
     zp_count: int = 0
     zp_kernel: int = 0
     memcpy_async: int = 0
@@ -380,7 +379,6 @@ def time_diff_for_step(
             metrics.zp_kernel = kernel_duration
         metrics.zp_device = INVALID_MARKER
         metrics.zp_duration = INVALID_MARKER
-        metrics.zp_bubble = INVALID_MARKER
         return metrics
     device_ops = get_device_op_list(conn, group_name_ids, step_time)
     if not device_ops:
@@ -394,13 +392,11 @@ def time_diff_for_step(
             metrics.zp_kernel = kernel_duration
         metrics.zp_device = INVALID_MARKER
         metrics.zp_duration = INVALID_MARKER
-        metrics.zp_bubble = INVALID_MARKER
         return metrics
     connection_id_set = set(op.connection_id for op in device_ops)
     cann_map = get_host_op_from_table(conn, "CANN_API", list(connection_id_set))
     mstx_map = get_host_op_from_table(conn, "MSTX_EVENTS", list(connection_id_set))
     host_durations = []
-    bubble_durations = []
     comm_intervals = []
     ops_by_xp: Dict[str, List[CommunicationOp]] = {}
     for op in device_ops:
@@ -415,9 +411,6 @@ def time_diff_for_step(
             op.h_end_ns = host_op.end_ns
         if op.h_start_ns > 0 and op.h_end_ns >= op.h_start_ns:
             host_durations.append(op.h_end_ns - op.h_start_ns)
-            bubble = op.start_ns - op.h_end_ns
-            if bubble > 0:
-                bubble_durations.append(bubble)
         comm_intervals.append((op.start_ns, op.end_ns))
         if op.domain_id in id_to_xp:
             xp = id_to_xp[op.domain_id]
@@ -427,7 +420,6 @@ def time_diff_for_step(
     kernel_host_durations = get_kernel_host_durations(conn, step_time)
     all_host_durations = host_durations + kernel_host_durations
     metrics.zp_host = calculate_mean(all_host_durations)
-    metrics.zp_bubble = calculate_mean(bubble_durations)
     metrics.host_duration = calculate_mean(host_durations)
     total_comm_duration = merge_intervals_simple(comm_intervals)
     step_duration = step_time.end_ns - step_time.start_ns
@@ -693,7 +685,7 @@ def write_results_to_csv(output_file: str, pms: List[PerformanceMetrics]):
     sorted_xp_keys = sorted(xp_keys)
     headers = [
         "StepIndex", "StepDuration", "ZP_Device", "ZP_Duration",
-        "ZP_Host", "ZP_Bubble", "ZP_Count", "KERNEL_AICORE",
+        "ZP_Host", "ZP_Count", "KERNEL_AICORE",
         "MEMCPY_ASYNC", "KERNEL_AIVEC", "HostDuration",
         "DataLoader"
     ]
@@ -710,7 +702,6 @@ def write_results_to_csv(output_file: str, pms: List[PerformanceMetrics]):
                 str(pm.zp_device),
                 str(pm.zp_duration),
                 str(pm.zp_host),
-                str(pm.zp_bubble),
                 str(pm.zp_count),
                 str(pm.zp_kernel),
                 str(pm.memcpy_async),

@@ -1,13 +1,13 @@
 ---
 name: straggler-detection
-description: Detect slow nodes (stragglers) in AI training/inference clusters from Ascend PyTorch Profiler .db files. Use when the user wants to run slow-node/亚健康 detection, parse ascend_pytorch_profiler_*.db files, identify slow computing cards (KERNEL_AICORE), slow communication domains (comm), slow CPU cards (cpu), NPU bubbles, or analyze compute/IO/communication metric breakdown across ranks. Performs KMeans + Z-score + elbow general anomaly detection over metric classes and produces a joint failure analysis report.
+description: Detect slow nodes (stragglers) in AI training/inference clusters from Ascend PyTorch Profiler .db files. Use when the user wants to run slow-node/亚健康 detection, parse ascend_pytorch_profiler_*.db files, identify slow computing cards (KERNEL_AICORE), slow communication domains (comm), slow CPU cards (cpu), or analyze compute/IO/communication metric breakdown across ranks. Performs KMeans + Z-score + elbow general anomaly detection over metric classes and produces a joint failure analysis report.
 ---
 
 # straggler-detection
 
 Slow Node Detection 算法，用于检测 AI 训练/推理集群中的慢节点（亚健康检测）。
 
-本 skill 自带完整可运行代码包（`scripts/` 下的 `*.py`）：**Python 3.8+，仅标准库**
+本 skill 自带完整可运行代码包（本目录下的 `*.py`）：**Python 3.8+，仅标准库**
 （`sqlite3` / `csv` / `json` / `os` / `logging` / `math` / `random`），无第三方依赖、不需要编译。
 
 ## 触发条件
@@ -37,7 +37,7 @@ Slow Node Detection 算法，用于检测 AI 训练/推理集群中的慢节点�
   （跨 rank 对齐取组内最短时长 / no-align 取前 10% 均值），**不要说成"未评估"或"没有带宽数据"**。
   控制台怎么输出，你就怎么说；它没写的，不要补。
 
-## 检测的 7 类指标
+## 检测的 6 类指标
 
 | 类别 | 指标列 | 检测方式 |
 |---|---|---|
@@ -46,18 +46,17 @@ Slow Node Detection 算法，用于检测 AI 训练/推理集群中的慢节点�
 | `KERNEL_AICORE` | `KERNEL_AICORE` | 检测组内 + 通用算法 |
 | `kernel_aivec` | `KERNEL_AIVEC` | 检测组内 + 通用算法 |
 | `memcpy_async` | `MEMCPY_ASYNC` | 检测组内 + 通用算法 |
-| `npu_bubble` | `ZP_Bubble` | 单阈值 < 5000ns |
 | `cpu` | `ZP_Host` | 节点对齐 + 通用算法 |
 
-> 数据级别影响检测范围：`level0`/`level1` 做全部 7 类；`levelnone`（TASK 仅 `MsTx`，无计算/搬运算子）跳过 `KERNEL_AICORE`/`kernel_aivec`/`memcpy_async`；`cluster` 单文件仅 `comm`。
+> 数据级别影响检测范围：`level0`/`level1` 做全部 6 类；`levelnone`（TASK 仅 `MsTx`，无计算/搬运算子）跳过 `KERNEL_AICORE`/`kernel_aivec`/`memcpy_async`；`cluster` 单文件仅 `comm`。
 
 **数据级别**（自动识别，决定 `comm` 的口径与检测范围）：
 
 | 级别 | 触发条件 | 检测范围 |
 |------|----------|----------|
-| `level0` | 目录；`ascend_pytorch_profiler_*.db` 的 `TASK.taskType` 含 `KERNEL_AICORE`/`KERNEL_AIVEC`/`MEMCPY_ASYNC` | 全部 7 类 |
+| `level0` | 目录；`ascend_pytorch_profiler_*.db` 的 `TASK.taskType` 含 `KERNEL_AICORE`/`KERNEL_AIVEC`/`MEMCPY_ASYNC` | 全部 6 类 |
 | `levelnone` | 目录；`TASK.taskType` 仅 `MsTx`（无计算/搬运算子） | 跳过 `KERNEL_AICORE`/`kernel_aivec`/`memcpy_async`；其余照跑 |
-| `level1` | profiler db 同目录有 `analysis.db` 且含 `CommAnalyzerBandwidth` 带宽 | 7 类，但 `comm` 用新两级带宽口径，且跳过 `pp_comm` |
+| `level1` | profiler db 同目录有 `analysis.db` 且含 `CommAnalyzerBandwidth` 带宽 | 6 类，但 `comm` 用新两级带宽口径，且跳过 `pp_comm` |
 | `cluster` | `path` 是单文件 db，含 `CommunicationGroupMapping` 与 `ClusterCommunicationBandwidth` | 仅 `comm`（新两级带宽口径） |
 
 ## 使用方法
@@ -91,7 +90,7 @@ python scripts/main.py path=/path/to/data compute=1.3 io=2.5 comm=1.3 pp_comm=5 
 | `clean` | `yes`/`no`/`ask`：是否清理中间数据并重新解析 | `ask` |
 | `no-align` | 关闭慢通信带宽的跨 rank 对齐（裸参，或 `no-align=true`） | 关（跨 rank 对齐） |
 
-（`npu_bubble` 为固定硬阈值 `< 5000ns`，不询问；`pp_comm` 仅在 `levelnone` / `level0` 询问。）
+（`pp_comm` 仅在 `levelnone` / `level0` 询问。）
 
 ### 作为 Python 模块调用
 
@@ -112,7 +111,6 @@ result = main.run_detection("/path/to/data", compute=1.3, io=2.5, comm=1.3, clea
    - 集合通信阈值 `comm`（**只作用于 comm，不含 pp_comm**），固定候选：`1.3`（默认）
    - PP 点对点通信等待占比阈值 `pp_comm`（作用于 pp_comm，单位是百分比），固定候选：
      `5`（默认）/ `10` / `15`
-   - `npu_bubble` 固定硬阈值 `< 5000ns`，不询问。
    - **候选项必须恒定**：同一阈值每次询问展示的候选项完全一致，不要临时增删变化。
    - **不要自行添加「其他」选项**：询问工具自带「输入其他内容」，自定义值走它即可。
    - 用户给出数值后，命令中加 `compute=<值> io=<值> comm=<值> pp_comm=<百分比>`。
@@ -189,7 +187,7 @@ verl 混合部署时，一次采集会在同一节点产出**多组 worker*_asce
 - **禁止创建 `_db` / 软链接中转目录**：不要为了分类或去重创建任何中转目录；直接以原始数据目录作为输入。
 - **输入与输出目录分离**：纯结果目录只放检测产物，绝不混入 db 原始数据。
 - **空 / master db 处理**：部分 `master_*` 目录下有空的 master db（无 `STEP_TIME`/`PYTORCH_API`/`TASK` 表），应跳过，仅用含核心表的 rank db。
-- **无通信域名时（情况 A，group_name 全空）的检测退化**：按 `HOST_INFO.hostUid` 物理节点分组（相同 hostUid 的 rank 为一组）作为检测组，检测计算/IO/通信单卡类指标；通信域组间指标（`comm`，`HasNamedDomain=False` 时）**直接跳过**（无域名无法解释对应 tp/ep）。Host 维持节点间拉齐，Bubble 维持固定阈值。
+- **无通信域名时（情况 A，group_name 全空）的检测退化**：按 `HOST_INFO.hostUid` 物理节点分组（相同 hostUid 的 rank 为一组）作为检测组，检测计算/IO/通信单卡类指标；通信域组间指标（`comm`，`HasNamedDomain=False` 时）**直接跳过**（无域名无法解释对应 tp/ep）。Host 维持节点间拉齐。
 - **有命名域但未命中检测优先级（情况 B）**：检测组同样退化到物理节点分组，但通信域组间指标**仍然检测**（`HasNamedDomain=True`），检出慢通信组时可带域名。
 
 ## 输出
@@ -202,6 +200,6 @@ verl 混合部署时，一次采集会在同一节点产出**多组 worker*_asce
 
 ## 算法说明
 
-检测核心为 `scripts/kmeans_detector.py` 的 `general_anomaly_detection`（KMeans + Z-score + 肘部法 + 异常簇递归细分）。阈值分组：计算类（KERNEL_AICORE / kernel_aivec）= `compute`（默认 1.3），IO/CPU 类（cpu / memcpy_async）= `io`（默认 2.5），通信类（comm / pp_comm）= `comm`（默认 1.3）；`npu_bubble` 固定 `< 5000ns`。
+检测核心为 `scripts/kmeans_detector.py` 的 `general_anomaly_detection`（KMeans + Z-score + 肘部法 + 异常簇递归细分）。阈值分组：计算类（KERNEL_AICORE / kernel_aivec）= `compute`（默认 1.3），IO/CPU 类（cpu / memcpy_async）= `io`（默认 2.5），通信类（comm / pp_comm）= `comm`（默认 1.3）；。
 
 **需要解释「为什么这么判」时，按需加载 `references/detection.md`**：七类指标总览、通用异常算法逐步流程、检测组优先级、`comm` 两套口径的完整公式、`cpu` 节点拉齐机制、`pp_comm` 的 `PP_WaitGap` 定义与比较域、实现文件一览。

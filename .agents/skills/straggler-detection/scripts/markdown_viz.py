@@ -19,7 +19,6 @@ CATEGORY_METRIC = {
     "kernel_aivec": "KERNEL_AIVEC",
     "memcpy_async": "MEMCPY_ASYNC",
     "cpu": "ZP_Host",
-    "npu_bubble": "ZP_Bubble",
 }
 
 def _fmt_ns(value: float) -> str:
@@ -395,8 +394,6 @@ def _comm_bandwidth_overview(
     return "\n".join(lines)
 
 def _category_threshold(category: str) -> str:
-    if category == "npu_bubble":
-        return f"<{config.BUBBLE_THRESHOLD_NS}ns"
     if category == "pp_comm":
         return f">{config.PP_WAIT_RATIO_THRESHOLD * 100:g}%"
     return f"{config.get_threshold_for_category(category):g}x"
@@ -407,7 +404,6 @@ CATEGORY_DESC = {
     "comm": "各通信域 {domain}_{opType}_{count} 带宽聚类",
     "pp_comm": "PP 点对点结束→下一次集合通信结束的间隔，按比较域逐 rank 比较（占会话比例），按 PP 通信组上报",
     "cpu": "ZP_Host：通信算子与 KERNEL_AICORE 的 Host 耗时均值",
-    "npu_bubble": "ZP_Bubble：通信算子启动间隔，小于 5000ns 记异常",
 }
 
 def _detection_summary(
@@ -417,7 +413,7 @@ def _detection_summary(
 ) -> str:
     headers = ["类别", "状态", "劣化阈值", "异常卡", "劣化指数", "物理设备"]
     ordered = ["KERNEL_AICORE", "kernel_aivec", "memcpy_async",
-               "comm", "pp_comm", "cpu", "npu_bubble"]
+               "comm", "pp_comm", "cpu"]
     known = set(ordered)
     dynamic = [c for c in detection_result.keys() if c not in known]
     all_categories = ordered + sorted(dynamic)

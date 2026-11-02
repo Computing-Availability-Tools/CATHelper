@@ -57,7 +57,7 @@ def group_representative_bandwidth(
 
 def write_result(final_result: Dict[str, Dict[str, float]], parallels: Dict[str, List[List[int]]] = None):
     output_data = {}
-    known_cats = ["KERNEL_AICORE", "comm", "pp_comm", "cpu", "npu_bubble", "memcpy_async", "kernel_aivec"]
+    known_cats = ["KERNEL_AICORE", "comm", "pp_comm", "cpu", "memcpy_async", "kernel_aivec"]
     all_cats = known_cats + [c for c in final_result.keys() if c not in known_cats]
     for default_cat in all_cats:
         output_data[default_cat] = []
@@ -65,12 +65,8 @@ def write_result(final_result: Dict[str, Dict[str, float]], parallels: Dict[str,
         if not items:
             continue
         kvs = [(k, v) for k, v in items.items()]
-        is_bubble = (category == "npu_bubble")
         is_group_category = category in ("comm", "pp_comm")
-        if is_bubble:
-            kvs.sort(key=lambda x: x[1])
-        else:
-            kvs.sort(key=lambda x: x[1], reverse=True)
+        kvs.sort(key=lambda x: x[1], reverse=True)
         rank_set_to_domain = {}
         if is_group_category and parallels:
             for domain_name, domain_groups in parallels.items():
@@ -94,9 +90,7 @@ def write_result(final_result: Dict[str, Dict[str, float]], parallels: Dict[str,
                     display_key = "[" + ", ".join(ranks) + "]"
             else:
                 display_key = key
-            if is_bubble:
-                print(f"  {i+1}. {display_key} → bubble = {value:.3f}")
-            elif category == "pp_comm":
+            if category == "pp_comm":
                 print(f"  {i+1}. {display_key} → 等待占比 = {value * 100:.2f}%")
             else:
                 print(f"  {i+1}. {display_key} → 劣化指数 = {value:.3f}")

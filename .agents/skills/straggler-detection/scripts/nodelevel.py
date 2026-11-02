@@ -17,7 +17,6 @@ zpDeviceColumn = "ZP_Device"
 zpKernelColumn = "KERNEL_AICORE"
 zpDurationColumn = "ZP_Duration"
 zpHostDataColumn = "ZP_Host"
-zpBubbleColumn = "ZP_Bubble"
 dataLoaderDataColumn = "DataLoader"
 ppParallelDomainName = "pp"
 memcpyAsyncColumn = "MEMCPY_ASYNC"
@@ -46,7 +45,6 @@ def delimit_detection(
     if not cal_detection_group or (cal_detection_group_name is None and cal_detection_group != []):
         logger.warning("获取检测组失败")
         return {}
-    detection_zp_bubble_data(step_data.get(zpBubbleColumn, {}), local_result)
     if config.get_profiling_level() == "levelnone":
         logger.info("[SKIP] levelnone（TASK 仅 MsTx）：跳过 KERNEL_AICORE / KERNEL_AIVEC / MEMCPY_ASYNC 检测")
     else:
@@ -159,17 +157,6 @@ def get_slow_metric_ranks(
             degradation = rank_deg_severitys[i]
             local_result.add_single(category, rank, degradation)
     return True
-
-def detection_zp_bubble_data(npu_data: Dict[int, float], local_result: config.DegradationData):
-    if not npu_data:
-        return
-    for npu_id, value in npu_data.items():
-        if value == -99999:
-            continue
-        if value <= 0:
-            continue
-        if value < config.BUBBLE_THRESHOLD_NS:
-            local_result.add_single("npu_bubble", npu_id, value)
 
 def _trimmed_mean(group_data: List[float]) -> float:
     if len(group_data) > 2:

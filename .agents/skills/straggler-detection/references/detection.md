@@ -15,7 +15,6 @@
 | `kernel_aivec` | KERNEL_AIVEC 算子平均耗时 | 检测组内通用算法（**偏大**异常） |
 | `memcpy_async` | MEMCPY_ASYNC 算子平均耗时 | 检测组内通用算法（**偏大**异常） |
 | `cpu` | `ZP_Host`（通信 + Kernel 的 Host 耗时均值） | 按物理节点拉齐后通用算法（异常项 = 节点 `hostName`） |
-| `npu_bubble` | `ZP_Bubble`（通信算子启动间隔） | 固定硬阈值 `< 5000ns`（不询问） |
 | `comm` | 集合通信带宽 | 带宽聚类（**min 方向**），两套口径见 §4 |
 | `pp_comm` | `PP_WaitGap`（点对点结束 → 下一次集合通信结束的间隔） | 比较域内逐 rank 比较，按 PP 通信组上报 |
 
@@ -26,7 +25,6 @@
 | 计算类（`KERNEL_AICORE` / `kernel_aivec`） | `COMPUTE_THRESHOLD` | 1.3 |
 | IO/CPU 类（`cpu` / `memcpy_async`） | `IO_THRESHOLD` | 2.5 |
 | 通信类（`comm` / `pp_comm`） | `COMM_THRESHOLD` / `PP_WAIT_RATIO_THRESHOLD` | 1.3 / 5% |
-| `npu_bubble` | `BUBBLE_THRESHOLD_NS` | 5000ns（固定，不询问） |
 
 ---
 
@@ -87,7 +85,6 @@ tp → exp → ep → tp_exp → cp → cp2 → cp_ulysses → cp_ring
 **`cpu`（`ZP_Host`）**
 先按物理节点（`hostUid`）分组、组内**去首尾求均值拉齐**，再对整组做通用算法。同节点卡值被拉平，故异常落在**整个节点**上，异常项用节点显示名（`hostName`）而不是 rank。
 
-**`npu_bubble`（`ZP_Bubble`）**
 通信算子启动间隔 `< 5000ns` 记为异常（**小值**异常），固定阈值、不询问。
 
 **`comm`（慢通信域）——两套口径**
