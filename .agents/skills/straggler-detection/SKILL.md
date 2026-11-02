@@ -3,7 +3,7 @@ name: straggler-detection
 description: Detect slow nodes (stragglers) in AI training/inference clusters from Ascend PyTorch Profiler .db files. Use when the user wants to run slow-node/亚健康 detection, parse ascend_pytorch_profiler_*.db files, identify slow computing cards (KERNEL_AICORE), slow communication domains (comm), slow CPU cards (cpu), NPU bubbles, or analyze compute/IO/communication metric breakdown across ranks. Performs KMeans + Z-score + elbow general anomaly detection over metric classes and produces a joint failure analysis report.
 ---
 
-# straggler-detector
+# straggler-detection
 
 Slow Node Detection 算法，用于检测 AI 训练/推理集群中的慢节点（亚健康检测）。
 
