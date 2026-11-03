@@ -1018,12 +1018,21 @@ def backfill_slow_domain_bandwidth(input_path: str, db_files: Optional[List[str]
             key = f"{typ}|{','.join(map(str, grp))}"
             if key not in group_map:
                 group_map[key] = {"typ": typ, "ranks": grp}
-    for g in group_map.values():
-        g["ranks"] = [r for r in g["ranks"] if r in rank_to_info]
+    # level0 / levelnone 的旧带宽口径要求「组内 rank 齐全」：只要缺任意一张卡，
+    # 该组的带宽不可信，直接跳过（不计算、不参与组间比较）；其余齐全的组照常处理。
+    # level1 / cluster 不受此限制（它们的带宽来自 analysis.db / cluster db）。
+    strict_full_group = config.get_profiling_level() in ("level0", "levelnone")
     for g in group_map.values():
         typ = g["typ"]
-        ranks = g["ranks"]
         if typ == PP_DOMAIN_NAME or typ == EMBD_DOMAIN_NAME:
+            continue
+        expected = list(g["ranks"])
+        ranks = [r for r in expected if r in rank_to_info]
+        if strict_full_group and len(ranks) != len(expected):
+            missing = sorted(set(expected) - set(ranks))
+            logger.warning(
+                f"[SLOW-DOMAIN] {typ} 组 {expected} 缺 rank {missing}，"
+                f"跳过该组带宽回填（不参与检测）")
             continue
         if len(ranks) < 2:
             continue

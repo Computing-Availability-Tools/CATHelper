@@ -91,6 +91,7 @@ tp → exp → ep → tp_exp → cp → cp2 → cp_ulysses → cp_ring
 
 - **旧口径（`levelnone` / `level0`）**，数据来自带宽回填写入 CSV 的动态列 `<domain>_<opType>_<count>`：
   1. **带宽回填**：默认按 wall-clock 时间窗把每次 occurrence 跨 rank 对齐、取组内最短时长，再对全部 occurrence 的最短时长取**前 10% 均值**（`ceil(n × 0.10)`）作分母，`带宽 = count / 该均值`；开 `no-align` 则不做对齐，改用**全体 rank 算子时长的扁平池**取前 10% 均值。回填时只统计 `count ≥ SLOW_COMM_MIN_COUNT(=1000)` 的集合通信算子。
+     **前置条件（仅本口径）**：组内 rank 必须**齐全**——只要缺任意一张卡，该组直接跳过（不计算带宽、不参与组间比较，日志会提示缺哪几张），其余齐全的组照常回填。`level1` / `cluster` 不受此限制。
   2. **检测**（需该域 **≥2 个组**）：每个 `opType` 上，每组取 **count 最大**的条目作代表；保留 `count ≥ 组间最大 × 0.5` **且** `> SLOW_COMM_COUNT_FLOOR(=10240)` 的组；对代表带宽用通用算法（**min 方向**，带宽越小越慢）聚类。
   3. **只有在该域所有 `opType` 上都异常的组**才上报，劣化指数取各 `opType` 的最大值。
 
